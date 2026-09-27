@@ -1,5 +1,6 @@
 const canvas = document.getElementById("room");
 const ctx = canvas.getContext("2d");
+const stage = document.getElementById("stage");
 const rosterEl = document.getElementById("roster");
 const countEl = document.getElementById("count");
 const tabsEl = document.getElementById("tabs");
@@ -22,6 +23,114 @@ let invites = new Map();         // room_id -> {topic, from}
 let pendingKnocks = new Set();   // room_ids I knocked on
 let transcriptEvents = [];
 
+// --- camera: world (1000x620) -> screen ---
+// The room is drawn in world coordinates; the camera maps it onto the
+// canvas, which always fills its container (backing store synced via
+// ResizeObserver, DPR-aware). Auto-fit frames all agents on load/switch.
+const WORLD = { w: 1000, h: 620 };
+const ZMIN = 0.25, ZMAX = 3;
+const cam = { x: WORLD.w / 2, y: WORLD.h / 2, zoom: 1 };
+let needFit = true;
+let dpr = 1, viewW = 1, viewH = 1;
+
+function clampCam() {
+  cam.zoom = Math.min(ZMAX, Math.max(ZMIN, cam.zoom));
+  // Keep the room from getting lost: the view must always overlap the
+  // world (expanded by a margin) by at least `ov` world px per axis.
+  // When zoomed out past the world, just center on it.
+  const m = 240, ov = 320;
+  const hw = viewW / 2 / cam.zoom, hh = viewH / 2 / cam.zoom;
+  let lo = -m - hw + Math.min(ov, 2 * hw), hi = WORLD.w + m + hw - Math.min(ov, 2 * hw);
+  cam.x = lo > hi ? WORLD.w / 2 : Math.min(hi, Math.max(lo, cam.x));
+  lo = -m - hh + Math.min(ov, 2 * hh); hi = WORLD.h + m + hh - Math.min(ov, 2 * hh);
+  cam.y = lo > hi ? WORLD.h / 2 : Math.min(hi, Math.max(lo, cam.y));
+}
+
+function fitView() {
+  // Frame all agents (padded); empty rooms frame the whole world.
+  let x0 = 0, y0 = 0, x1 = WORLD.w, y1 = WORLD.h;
+  if (agents.length) {
+    x0 = 1e9; y0 = 1e9; x1 = -1e9; y1 = -1e9;
+    for (const a of agents) {
+      x0 = Math.min(x0, a.x); y0 = Math.min(y0, a.y);
+      x1 = Math.max(x1, a.x); y1 = Math.max(y1, a.y);
+    }
+    const pad = 120;
+    x0 -= pad; y0 -= pad; x1 += pad; y1 += pad;
+  }
+  const zw = viewW / Math.max(1, x1 - x0), zh = viewH / Math.max(1, y1 - y0);
+  cam.zoom = Math.min(ZMAX, Math.max(ZMIN, Math.min(zw, zh)));
+  // Never zoom out past showing the whole room for agent fits.
+  if (agents.length) {
+    const worldZoom = Math.min(viewW / WORLD.w, viewH / WORLD.h);
+    cam.zoom = Math.max(cam.zoom, Math.min(worldZoom, ZMAX));
+  }
+  cam.x = (x0 + x1) / 2;
+  cam.y = (y0 + y1) / 2;
+  clampCam();
+}
+
+function resize() {
+  const r = stage.getBoundingClientRect();
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  viewW = Math.max(1, r.width);
+  viewH = Math.max(1, r.height);
+  canvas.width = Math.round(viewW * dpr);
+  canvas.height = Math.round(viewH * dpr);
+  clampCam();
+}
+new ResizeObserver(resize).observe(stage);
+resize();
+
+// --- camera controls: wheel zoom to cursor, drag pan, buttons, keys ---
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const wx = cam.x + (mx - viewW / 2) / cam.zoom;
+  const wy = cam.y + (my - viewH / 2) / cam.zoom;
+  const nz = Math.min(ZMAX, Math.max(ZMIN, cam.zoom * Math.exp(-e.deltaY * 0.0015)));
+  cam.x = wx - (mx - viewW / 2) / nz;
+  cam.y = wy - (my - viewH / 2) / nz;
+  cam.zoom = nz;
+  clampCam();
+}, { passive: false });
+
+let drag = null;
+canvas.addEventListener("pointerdown", (e) => {
+  drag = { x: e.clientX, y: e.clientY, cx: cam.x, cy: cam.y };
+  canvas.setPointerCapture(e.pointerId);
+  canvas.classList.add("dragging");
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (!drag) return;
+  cam.x = drag.cx - (e.clientX - drag.x) / cam.zoom;
+  cam.y = drag.cy - (e.clientY - drag.y) / cam.zoom;
+  clampCam();
+});
+const endDrag = () => { drag = null; canvas.classList.remove("dragging"); };
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+
+const zoomIn = () => { cam.zoom = Math.min(ZMAX, cam.zoom * 1.25); clampCam(); };
+const zoomOut = () => { cam.zoom = Math.max(ZMIN, cam.zoom / 1.25); clampCam(); };
+document.getElementById("zin").onclick = zoomIn;
+document.getElementById("zout").onclick = zoomOut;
+document.getElementById("zfit").onclick = () => fitView();
+window.addEventListener("keydown", (e) => {
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "INPUT" || tag === "TEXTAREA") return;
+  if (e.key === "+" || e.key === "=") zoomIn();
+  else if (e.key === "-" || e.key === "_") zoomOut();
+  else if (e.key === "0") fitView();
+});
+
+// Render loop: draws every frame so pan/zoom/resize stay live.
+function frame(t) {
+  draw(t);
+  requestAnimationFrame(frame);
+}
+
 function showErr(msg) {
   errEl.textContent = msg;
   errEl.style.display = "block";
@@ -37,7 +146,7 @@ ws.onmessage = (ev) => {
     if (m.room_id !== currentRoom) return; // scoped per room by the server
     agents = m.agents;
     if (m.room_id === "plaza" && m.rooms) publicRooms = m.rooms;
-    draw(m.t);
+    if (needFit) { needFit = false; fitView(); } // auto-frame on load / room switch
     renderRoster();
     renderTabs();
     renderSide();
@@ -78,6 +187,8 @@ function switchRoom(roomId, topic) {
   else currentTopic = myRooms.get(roomId) || roomId;
   agents = [];
   transcriptEvents = [];
+  needFit = true; // re-frame the camera on the new room's agents
+  fitView(); // frame the world immediately (agents arrive with the next state)
   renderRecent();
   ws.send(JSON.stringify({ type: "hello", kind: "viewer", room: roomId }));
 }
@@ -363,11 +474,24 @@ function lamp(x, y, t) {
 }
 
 function draw(t) {
+  // Reset for DPR, clear the visible area, then move into world space.
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#0d1119";
+  ctx.fillRect(0, 0, viewW, viewH);
+  ctx.translate(viewW / 2, viewH / 2);
+  ctx.scale(cam.zoom, cam.zoom);
+  ctx.translate(-cam.x, -cam.y);
+
   const g = ctx.createLinearGradient(0, 0, 0, 620);
   g.addColorStop(0, "#1c2333");
   g.addColorStop(1, "#141a28");
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, 1000, 620);
+
+  // subtle room bounds so the world edge reads at any zoom
+  ctx.strokeStyle = "rgba(255,255,255,.06)";
+  ctx.lineWidth = 2 / cam.zoom;
+  ctx.strokeRect(0, 0, 1000, 620);
 
   // rug
   ctx.fillStyle = "#232c44";
@@ -482,3 +606,6 @@ function drawBubble(a, cy) {
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
 }
+
+// start the render loop (defined above in the camera section)
+requestAnimationFrame(frame);
