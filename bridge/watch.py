@@ -11,6 +11,13 @@ wanders the room and other Muses walk up to it when they write.
 Inbox files look like data/muse-inbox/<ticket>.json. The bridge only reads;
 it never writes to the queue.
 
+The bridge survives lobby restarts: if the WebSocket drops (or the lobby
+isn't up yet), it backs off and reconnects, re-sending `hello` each time.
+Liveness is proven with protocol ping/pong rather than trusting `send`,
+because a send on a half-open socket can silently vanish.
+Inbox files are only marked seen after their `talk` event is sent, so
+nothing is lost across a reconnect.
+
 Avatar convention: a muse-protocol manifest may carry an `avatar_url`
 pointing at the Muse's portrait (https URL or path). Pass it with
 --manifest-url and the bridge picks up name/serves/avatar automatically.
@@ -27,11 +34,21 @@ import argparse
 import asyncio
 import json
 import os
+import time
 import urllib.request
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 SEEN_SUFFIX = ".json"
+INITIAL_BACKOFF = 1.0
+MAX_BACKOFF = 60.0
+# A session that stayed up this long resets the reconnect backoff.
+HEALTHY_SESSION_S = 30.0
+# Protocol-level ping cadence/timeout. A TCP send on a half-open socket can
+# silently "succeed", so liveness is proven with ping/pong, not with sends.
+PING_INTERVAL_S = 10.0
+PING_TIMEOUT_S = 5.0
 
 
 def fetch_manifest(url):
@@ -40,16 +57,101 @@ def fetch_manifest(url):
         return json.load(resp)
 
 
-async def heartbeat(ws, agent_id, stop):
+async def ping_ok(ws):
+    """True if the lobby answers a protocol ping within the timeout.
+
+    A bare `send` on a half-open socket can silently discard data, so this
+    is the real liveness check. The lobby's WS stack auto-replies to pings.
+    Note: `await ws.ping()` only waits for the ping to be *sent*; the pong
+    itself must be awaited separately.
+    """
+    try:
+        pong_waiter = await ws.ping()
+        await asyncio.wait_for(pong_waiter, timeout=PING_TIMEOUT_S)
+        return True
+    except Exception:  # noqa: BLE001 - TimeoutError, ConnectionClosed, OSError
+        return False
+
+
+async def heartbeat(ws, dead, name):
+    """Ping the lobby on a cadence; trip `dead` the moment it stops answering."""
     n = 0
-    while not stop.is_set():
-        await asyncio.sleep(15)
+    while not dead.is_set():
+        await asyncio.sleep(PING_INTERVAL_S)
         n += 1
+        if not await ping_ok(ws):
+            print(f"heartbeat {n}: lobby not answering ping — reconnecting", flush=True)
+            dead.set()
+            return
         try:
             await ws.send(json.dumps({"type": "heartbeat"}))
         except Exception as e:  # noqa: BLE001
-            print(f"heartbeat {n} failed: {e!r}", flush=True)
-            break
+            print(f"heartbeat {n} send failed: {e!r} — reconnecting", flush=True)
+            dead.set()
+            return
+
+
+async def run_session(args, name, serves, avatar_url, seen):
+    """One connected session. Returns uptime seconds. Raises on disconnect."""
+    started = time.monotonic()
+    dead = asyncio.Event()
+    async with websockets.connect(
+        args.lobby, ping_interval=PING_INTERVAL_S, ping_timeout=PING_TIMEOUT_S
+    ) as ws:
+        hello = {"type": "hello", "name": name, "kind": "agent"}
+        if serves:
+            hello["serves"] = serves
+        if avatar_url:
+            hello["avatar"] = {"image": avatar_url}
+        await ws.send(json.dumps(hello))
+        print(f"{name} joined the lobby", flush=True)
+
+        hb = asyncio.ensure_future(heartbeat(ws, dead, name))
+        try:
+            while not dead.is_set():
+                for fname in sorted(os.listdir(args.inbox)):
+                    if not fname.endswith(SEEN_SUFFIX) or fname in seen:
+                        continue
+                    try:
+                        with open(os.path.join(args.inbox, fname)) as fh:
+                            env = json.load(fh)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"skip {fname}: {e}", flush=True)
+                        seen.add(fname)
+                        continue
+                    frm = (env.get("from") or {}).get("name", "stranger")
+                    payload = env.get("payload") or {}
+                    if "sealed" in env:
+                        text = "[sealed message]"
+                    else:
+                        text = payload.get("message") or f"[{env.get('type', 'message')}]"
+                    # Prove the lobby is alive before sending: a send on a
+                    # half-open socket can silently vanish. If the ping
+                    # fails, leave the file unseen so it retries next session.
+                    if not await ping_ok(ws):
+                        print("lobby not answering ping before send — reconnecting",
+                              flush=True)
+                        dead.set()
+                        break
+                    try:
+                        await ws.send(json.dumps({
+                            "type": "talk",
+                            "from": frm,
+                            "to": name,
+                            "text": str(text)[:280],
+                        }))
+                    except (ConnectionClosed, OSError) as e:
+                        print(f"connection lost while sending: {e!r} — reconnecting",
+                              flush=True)
+                        dead.set()
+                        break
+                    seen.add(fname)
+                    print(f"talk: {frm} -> {name}", flush=True)
+                await asyncio.sleep(args.poll)
+        finally:
+            dead.set()
+            hb.cancel()
+    return time.monotonic() - started
 
 
 async def main():
@@ -76,52 +178,23 @@ async def main():
         except Exception as e:  # noqa: BLE001
             print(f"manifest fetch failed ({e}), using flags")
 
+    os.makedirs(args.inbox, exist_ok=True)
     seen = {f for f in os.listdir(args.inbox) if f.endswith(SEEN_SUFFIX)}
     print(f"bridge watching {args.inbox} ({len(seen)} existing files ignored)")
 
-    async with websockets.connect(args.lobby) as ws:
-        hello = {"type": "hello", "name": name, "kind": "agent"}
-        if serves:
-            hello["serves"] = serves
-        if avatar_url:
-            hello["avatar"] = {"image": avatar_url}
-        await ws.send(json.dumps(hello))
-        print(f"{name} joined the lobby")
-
-        stop = asyncio.Event()
-        hb = asyncio.ensure_future(heartbeat(ws, name, stop))
+    backoff = INITIAL_BACKOFF
+    while True:
         try:
-            while True:
-                try:
-                    for fname in sorted(os.listdir(args.inbox)):
-                        if not fname.endswith(SEEN_SUFFIX) or fname in seen:
-                            continue
-                        seen.add(fname)
-                        try:
-                            with open(os.path.join(args.inbox, fname)) as fh:
-                                env = json.load(fh)
-                        except Exception as e:  # noqa: BLE001
-                            print(f"skip {fname}: {e}")
-                            continue
-                        frm = (env.get("from") or {}).get("name", "stranger")
-                        payload = env.get("payload") or {}
-                        if "sealed" in env:
-                            text = "[sealed message]"
-                        else:
-                            text = payload.get("message") or f"[{env.get('type', 'message')}]"
-                        await ws.send(json.dumps({
-                            "type": "talk",
-                            "from": frm,
-                            "to": name,
-                            "text": str(text)[:280],
-                        }))
-                        print(f"talk: {frm} -> {name}")
-                except Exception as e:  # noqa: BLE001
-                    print(f"watch error: {e}")
-                await asyncio.sleep(args.poll)
-        finally:
-            stop.set()
-            hb.cancel()
+            uptime = await run_session(args, name, serves, avatar_url, seen)
+            print(f"session ended after {uptime:.0f}s, reconnecting...", flush=True)
+            if uptime >= HEALTHY_SESSION_S:
+                backoff = INITIAL_BACKOFF
+        except (ConnectionClosed, OSError) as e:
+            print(f"lobby unreachable ({e!r}), retrying in {backoff:.0f}s", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"session failed ({e!r}), retrying in {backoff:.0f}s", flush=True)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, MAX_BACKOFF)
 
 
 if __name__ == "__main__":
