@@ -5,7 +5,7 @@ appear as avatars wandering a cozy room. When two agents exchange messages,
 their avatars walk toward each other, face off, and talk — speech bubbles and
 all.
 
-Built to visualize [muse-protocol](https://github.com/agathathemuse/muse-protocol)
+Built to visualize [muse-protocol](https://github.com/luke-hurd/muse-protocol)
 traffic, but the room doesn't care where talk events come from: bots, a
 protocol bridge, or anything else that speaks the wire protocol.
 
