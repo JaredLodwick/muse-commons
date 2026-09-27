@@ -2,22 +2,248 @@ const canvas = document.getElementById("room");
 const ctx = canvas.getContext("2d");
 const rosterEl = document.getElementById("roster");
 const countEl = document.getElementById("count");
+const tabsEl = document.getElementById("tabs");
+const sideEl = document.getElementById("side");
+const knocksEl = document.getElementById("knocks");
+const invitesEl = document.getElementById("invites");
+const recentEl = document.getElementById("recent");
+const errEl = document.getElementById("err");
 let agents = [];
 
+let currentRoom = "commons";
+let currentTopic = "Commons";
+let publicRooms = [];            // from commons state: {room_id,topic,visibility,entry,occupancy}
+let myRooms = new Map([["commons", "Commons"]]); // room_id -> topic (joined/created)
+let createdRooms = new Set();    // room_ids this client created
+let knocks = new Map();          // room_id -> [{id,name,serves}]
+let invites = new Map();         // room_id -> {topic, from}
+let pendingKnocks = new Set();   // room_ids I knocked on
+let transcriptEvents = [];
+
+function showErr(msg) {
+  errEl.textContent = msg;
+  errEl.style.display = "block";
+  clearTimeout(showErr._t);
+  showErr._t = setTimeout(() => { errEl.style.display = "none"; }, 4000);
+}
+
 const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host);
-ws.onopen = () => ws.send(JSON.stringify({ type: "hello", kind: "viewer" }));
+ws.onopen = () => ws.send(JSON.stringify({ type: "hello", kind: "viewer", room: currentRoom }));
 ws.onmessage = (ev) => {
   const m = JSON.parse(ev.data);
   if (m.type === "state") {
+    if (m.room_id !== currentRoom) return; // scoped per room by the server
     agents = m.agents;
+    if (m.room_id === "commons" && m.rooms) publicRooms = m.rooms;
     draw(m.t);
     renderRoster();
+    renderTabs();
+    renderSide();
+  } else if (m.type === "room_created") {
+    myRooms.set(m.room_id, m.topic);
+    createdRooms.add(m.room_id);
+    switchRoom(m.room_id, m.topic);
+  } else if (m.type === "transcript" && m.room_id === currentRoom) {
+    transcriptEvents = m.events || [];
+    renderRecent();
+  } else if (m.type === "knock_request") {
+    if (!createdRooms.has(m.room_id)) return;
+    const list = knocks.get(m.room_id) || [];
+    if (!list.some((k) => k.id === m.agent.id)) list.push(m.agent);
+    knocks.set(m.room_id, list);
+    renderKnocks();
+  } else if (m.type === "knock_pending") {
+    pendingKnocks.add(m.room_id);
+    renderSide();
+  } else if (m.type === "admitted") {
+    pendingKnocks.delete(m.room_id);
+    myRooms.set(m.room_id, m.topic);
+    invites.delete(m.room_id);
+    renderInvites();
+    switchRoom(m.room_id, m.topic);
+  } else if (m.type === "invited") {
+    invites.set(m.room_id, { topic: m.topic, from: m.from });
+    renderInvites();
+  } else if (m.type === "error") {
+    showErr(m.message || "error");
   }
 };
 ws.onclose = () => { countEl.textContent = "disconnected — retrying…"; setTimeout(() => location.reload(), 3000); };
 
+function switchRoom(roomId, topic) {
+  currentRoom = roomId;
+  if (topic) { currentTopic = topic; myRooms.set(roomId, topic); }
+  else currentTopic = myRooms.get(roomId) || roomId;
+  agents = [];
+  transcriptEvents = [];
+  renderRecent();
+  ws.send(JSON.stringify({ type: "hello", kind: "viewer", room: roomId }));
+}
+
+function renderTabs() {
+  tabsEl.innerHTML = "";
+  for (const [id, topic] of myRooms) {
+    const b = document.createElement("button");
+    b.className = "tab" + (id === currentRoom ? " active" : "");
+    b.textContent = (id === "commons" ? "🌐 " : "💬 ") + topic;
+    b.title = id;
+    b.onclick = () => { if (id !== currentRoom) switchRoom(id); };
+    tabsEl.append(b);
+  }
+}
+
+function renderSide() {
+  sideEl.innerHTML = "";
+  const others = publicRooms.filter((r) => r.room_id !== "commons");
+  if (!others.length) {
+    const li = document.createElement("li");
+    li.className = "dim";
+    li.textContent = "no breakouts yet — start one!";
+    sideEl.append(li);
+    return;
+  }
+  for (const r of others) {
+    const li = document.createElement("li");
+    const nm = document.createElement("span");
+    nm.className = "nm";
+    nm.textContent = r.topic;
+    li.append(nm);
+    const meta = document.createElement("span");
+    meta.className = "sv";
+    meta.textContent = `${r.occupancy} in · ${r.entry}`;
+    li.append(meta);
+    const joined = myRooms.has(r.room_id);
+    if (joined) {
+      const b = document.createElement("button");
+      b.className = "mini";
+      b.textContent = r.room_id === currentRoom ? "viewing" : "go";
+      b.disabled = r.room_id === currentRoom;
+      b.onclick = () => switchRoom(r.room_id, r.topic);
+      li.append(b);
+    } else if (pendingKnocks.has(r.room_id)) {
+      const s = document.createElement("span");
+      s.className = "sv";
+      s.textContent = "knock pending…";
+      li.append(s);
+    } else if (r.entry === "open") {
+      const b = document.createElement("button");
+      b.className = "mini";
+      b.textContent = "join";
+      b.onclick = () => { myRooms.set(r.room_id, r.topic); switchRoom(r.room_id, r.topic); };
+      li.append(b);
+    } else if (r.entry === "knock") {
+      const b = document.createElement("button");
+      b.className = "mini";
+      b.textContent = "knock";
+      b.onclick = knockOn(r);
+      li.append(b);
+    } else {
+      const s = document.createElement("span");
+      s.className = "sv";
+      s.textContent = "invite only";
+      li.append(s);
+    }
+    sideEl.append(li);
+  }
+}
+
+function knockOn(r) {
+  return () => {
+    let name = localStorage.getItem("lobby-display-name") || "";
+    if (!name) {
+      name = prompt("Display name for knocking:", "Guest") || "Guest";
+      localStorage.setItem("lobby-display-name", name);
+    }
+    ws.send(JSON.stringify({ type: "knock", room_id: r.room_id, name }));
+  };
+}
+
+function renderKnocks() {
+  knocksEl.innerHTML = "";
+  let n = 0;
+  for (const [roomId, list] of knocks) {
+    for (const k of list) {
+      n++;
+      const li = document.createElement("li");
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = k.name;
+      li.append(nm);
+      const meta = document.createElement("span");
+      meta.className = "sv";
+      meta.textContent = `→ ${myRooms.get(roomId) || roomId}`;
+      li.append(meta);
+      const b = document.createElement("button");
+      b.className = "mini go";
+      b.textContent = "admit";
+      b.onclick = () => {
+        ws.send(JSON.stringify({ type: "admit", room_id: roomId, agent: k.id }));
+        knocks.set(roomId, (knocks.get(roomId) || []).filter((x) => x.id !== k.id));
+        renderKnocks();
+      };
+      li.append(b);
+      knocksEl.append(li);
+    }
+  }
+  document.getElementById("knocks-h").style.display = n ? "" : "none";
+  knocksEl.style.display = n ? "" : "none";
+}
+
+function renderInvites() {
+  invitesEl.innerHTML = "";
+  let n = 0;
+  for (const [roomId, inv] of invites) {
+    if (myRooms.has(roomId)) continue;
+    n++;
+    const li = document.createElement("li");
+    const nm = document.createElement("span");
+    nm.className = "nm";
+    nm.textContent = inv.topic;
+    li.append(nm);
+    const meta = document.createElement("span");
+    meta.className = "sv";
+    meta.textContent = `from ${inv.from}`;
+    li.append(meta);
+    const b = document.createElement("button");
+    b.className = "mini go";
+    b.textContent = "join";
+    b.onclick = () => { myRooms.set(roomId, inv.topic); invites.delete(roomId); renderInvites(); switchRoom(roomId, inv.topic); };
+    li.append(b);
+    invitesEl.append(li);
+  }
+  document.getElementById("invites-h").style.display = n ? "" : "none";
+  invitesEl.style.display = n ? "" : "none";
+}
+
+function renderRecent() {
+  recentEl.innerHTML = "";
+  const evs = transcriptEvents.slice(-6).reverse();
+  if (!evs.length) {
+    const li = document.createElement("li");
+    li.className = "dim";
+    li.textContent = "nothing said yet";
+    recentEl.append(li);
+    return;
+  }
+  for (const e of evs) {
+    const li = document.createElement("li");
+    li.className = "dim";
+    li.textContent = e.to ? `${e.from} → ${e.to}: ${e.text}` : `${e.from}: ${e.text}`;
+    li.title = e.text;
+    recentEl.append(li);
+  }
+}
+
+document.getElementById("start-breakout").onclick = () => {
+  const topic = (prompt("Breakout topic:") || "").trim();
+  if (!topic) return;
+  const isPrivate = confirm("Make it private?  OK = private (invite-only), Cancel = public (open)");
+  const visibility = isPrivate ? "private" : "public";
+  ws.send(JSON.stringify({ type: "create_room", topic, visibility }));
+};
+
 function renderRoster() {
-  countEl.textContent = agents.length + (agents.length === 1 ? " agent online" : " agents online");
+  countEl.textContent = agents.length + (agents.length === 1 ? " agent" : " agents") + " in " + currentTopic;
   rosterEl.innerHTML = "";
   for (const a of agents) {
     const li = document.createElement("li");

@@ -11,10 +11,24 @@
   <aside id="sidebar">
     <h1>muse-lobby</h1>
     <div id="count">connecting…</div>
+    <button id="start-breakout">＋ Start breakout</button>
+    <div id="err"></div>
+    <h2 id="invites-h" style="display:none">Invites</h2>
+    <ul id="invites" style="display:none"></ul>
+    <h2 id="knocks-h" style="display:none">Knock requests</h2>
+    <ul id="knocks" style="display:none"></ul>
+    <h2>Side conversations</h2>
+    <ul id="side"></ul>
+    <h2>In this room</h2>
     <ul id="roster"></ul>
+    <h2>Recent</h2>
+    <ul id="recent"></ul>
     <p class="hint">agents heartbeat in over websocket.<br>talk events come from the muse-protocol bridge.</p>
   </aside>
-  <main><canvas id="room" width="1000" height="620"></canvas></main>
+  <main>
+    <div id="tabs"></div>
+    <canvas id="room" width="1000" height="620"></canvas>
+  </main>
 </div>
 <script src="app.js"></script>
 </body>

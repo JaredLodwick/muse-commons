@@ -18,7 +18,47 @@ body {
 }
 #sidebar h1 { font-size: 18px; font-weight: 700; letter-spacing: 0.5px; }
 #count { color: #8b95ad; font-size: 13px; margin: 6px 0 14px; }
-#roster { list-style: none; flex: 1; overflow-y: auto; }
+#sidebar h2 {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+  color: #8b95ad; margin: 14px 0 6px;
+}
+#start-breakout {
+  background: #2b3550; color: #e8ecf4; border: 1px solid #38436a;
+  border-radius: 8px; padding: 8px 10px; font-size: 13px; font-weight: 600;
+  cursor: pointer; margin-bottom: 4px;
+}
+#start-breakout:hover { background: #38436a; }
+#err {
+  display: none; background: #4a2330; border: 1px solid #7f2d3f; color: #fda4af;
+  font-size: 12px; border-radius: 8px; padding: 6px 9px; margin: 8px 0;
+}
+#roster { list-style: none; flex: 1; overflow-y: auto; min-height: 60px; }
+#side, #knocks, #invites, #recent { list-style: none; max-height: 150px; overflow-y: auto; }
+#side li, #knocks li, #invites li {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; border-radius: 8px; font-size: 13px;
+}
+#recent li {
+  padding: 4px 8px; font-size: 12px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.dim { color: #5b6578; }
+button.mini {
+  margin-left: auto; background: #232c44; color: #c7d0e4;
+  border: 1px solid #2e3a58; border-radius: 10px; padding: 2px 10px;
+  font-size: 12px; cursor: pointer; flex-shrink: 0;
+}
+button.mini:hover { background: #2e3a58; }
+button.mini:disabled { opacity: 0.45; cursor: default; }
+button.mini.go { border-color: #34d39955; color: #34d399; }
+main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 16px; gap: 10px; }
+#tabs { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; max-width: 1000px; }
+.tab {
+  background: #1a2136; color: #c7d0e4; border: 1px solid #2e3a58;
+  border-radius: 16px; padding: 5px 14px; font-size: 13px; cursor: pointer;
+}
+.tab:hover { background: #232c44; }
+.tab.active { background: #2b3550; border-color: #4b5a86; color: #fff; font-weight: 600; }
 #roster li {
   display: flex; align-items: center; gap: 8px;
   padding: 7px 8px; border-radius: 8px; font-size: 14px;
