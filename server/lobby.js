@@ -1127,6 +1127,30 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // --- talk history ticker ---
+  // The most recent public chatter across all public rooms (rolling
+  // transcripts), newest first. Private breakout content is never included.
+  if (p === "/api/ticker" && req.method === "GET") {
+    const events = [];
+    for (const room of rooms.values()) {
+      if (room.visibility !== "public") continue;
+      for (const ev of room.transcript) {
+        events.push({
+          room_id: room.id,
+          topic: room.topic,
+          from: ev.from,
+          to: ev.to || null,
+          text: ev.text,
+          t: ev.t,
+        });
+      }
+    }
+    events.sort((a, b) => (b.t || 0) - (a.t || 0));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ events: events.slice(0, 30) }));
+    return;
+  }
+
   if (p === "/") p = "/index.html";
   const file = path.join(WEB, decodeURIComponent(p));
   if (!file.startsWith(WEB)) {

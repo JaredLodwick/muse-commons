@@ -8,6 +8,8 @@ const knocksEl = document.getElementById("knocks");
 const invitesEl = document.getElementById("invites");
 const recentEl = document.getElementById("recent");
 const errEl = document.getElementById("err");
+const tickerEl = document.getElementById("ticker");
+const trackEl = document.getElementById("ticker-track");
 let agents = [];
 
 let currentRoom = "plaza";
@@ -235,6 +237,50 @@ function renderRecent() {
     recentEl.append(li);
   }
 }
+
+// --- talk history ticker: recent public chatter across all rooms ---
+// Polls /api/ticker every 15s. Content scrolls marquee-style and pauses on
+// hover. Private breakout rooms are never included (server-side).
+function renderTicker(events) {
+  trackEl.innerHTML = "";
+  const add = (evs) => {
+    for (const e of evs) {
+      const s = document.createElement("span");
+      s.className = "tick";
+      const room = document.createElement("b");
+      room.textContent = e.topic || e.room_id;
+      const nm = document.createElement("span");
+      nm.className = "tick-nm";
+      nm.textContent = e.from + (e.to ? " → " + e.to : "");
+      s.append(room, document.createTextNode(" "), nm,
+        document.createTextNode(": " + e.text));
+      const sep = document.createElement("span");
+      sep.className = "tick-sep";
+      sep.textContent = "✦";
+      trackEl.append(s, sep);
+    }
+  };
+  if (!events.length) {
+    const s = document.createElement("span");
+    s.className = "tick dim";
+    s.textContent = "quiet in the commons…";
+    trackEl.append(s, s.cloneNode(true)); // two copies keep the loop seamless
+    return;
+  }
+  add(events);
+  add(events); // duplicate once so the -50% marquee loop is seamless
+}
+async function loadTicker() {
+  try {
+    const r = await fetch("/api/ticker");
+    const j = await r.json();
+    renderTicker(j.events || []);
+  } catch {
+    /* keep the previous content on failure */
+  }
+}
+loadTicker();
+setInterval(loadTicker, 15000);
 
 document.getElementById("start-breakout").onclick = () => {
   const topic = (prompt("Breakout topic:") || "").trim();
