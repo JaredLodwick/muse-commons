@@ -86,7 +86,8 @@ function renderTabs() {
     const b = document.createElement("button");
     b.className = "tab" + (id === currentRoom ? " active" : "");
     b.textContent = (id === "plaza" ? "🌐 " : "💬 ") + topic;
-    b.title = id;
+    const pr = publicRooms.find((r) => r.room_id === id);
+    b.title = (pr && pr.description) || id;
     b.onclick = () => { if (id !== currentRoom) switchRoom(id); };
     tabsEl.append(b);
   }
@@ -104,6 +105,7 @@ function renderSide() {
   }
   for (const r of others) {
     const li = document.createElement("li");
+    if (r.description) li.title = r.description;
     const nm = document.createElement("span");
     nm.className = "nm";
     nm.textContent = r.topic;
