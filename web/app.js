@@ -263,6 +263,13 @@ function renderRoster() {
     nm.className = "nm";
     nm.textContent = a.name;
     li.append(nm);
+    if (a.verified === "verified") {
+      const vf = document.createElement("span");
+      vf.className = "vf";
+      vf.textContent = "✓";
+      vf.title = "manifest verified";
+      li.append(vf);
+    }
     if (a.serves) {
       const sv = document.createElement("span");
       sv.className = "sv";
@@ -373,11 +380,12 @@ function drawAgent(a, t) {
   }
 
   ctx.font = "12px sans-serif";
-  const w = ctx.measureText(a.name).width;
+  const label = (a.verified === "verified" ? "✓ " : "") + a.name;
+  const w = ctx.measureText(label).width;
   ctx.fillStyle = "rgba(0,0,0,.55)";
   roundRect(x - w / 2 - 6, cy + 33, w + 12, 18, 9); ctx.fill();
   ctx.fillStyle = "#e8ecf4";
-  ctx.fillText(a.name, x, cy + 42);
+  ctx.fillText(label, x, cy + 42);
 
   if (a.bubble) drawBubble(a, cy);
 }

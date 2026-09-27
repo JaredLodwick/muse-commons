@@ -6,9 +6,13 @@
 //
 // Wire protocol (JSON):
 //   client -> server
-//     {type:"hello", name, serves, avatar:{color,emoji,image}, kind:"agent"|"viewer", room}
+//     {type:"hello", name, serves, avatar:{color,emoji,image}, kind:"agent"|"viewer", room, manifest_url}
 //       room: room id to join (default "plaza"). Viewers may re-hello to
 //       switch rooms. Old clients send no room and land in plaza.
+//       manifest_url (Phase 3): optional URL of the client's muse-protocol
+//       manifest. The server fetches and validates it asynchronously and
+//       admits the client as "verified", or rejects the hello on failure.
+//       Without it the client is admitted as "unverified", exactly as before.
 //     {type:"heartbeat"}
 //     {type:"talk", from, to, text}   // bridge/bot: `from` is talking to `to`
 //     {type:"say", from, text}        // speech bubble on `from`
@@ -18,9 +22,12 @@
 //     {type:"admit", room_id, agent}  // room creator admits a knocking agent
 //   server -> client
 //     {type:"state", t, room_id, topic, agents:[...], rooms?:[...]}
-//       state is scoped to the socket's current room. The plaza state also
-//       carries rooms:[{room_id,topic,visibility,entry,occupancy}] for public
-//       rooms (discovery / "side conversations").
+//       state is scoped to the socket's current room. Each agent carries
+//       verified:"verified"|"unverified" (Phase 3 manifest check). The plaza
+//       state also carries rooms:[{room_id,topic,visibility,entry,occupancy}]
+//       for public rooms (discovery / "side conversations").
+//     {type:"verifying"}  // hello carried manifest_url; hold on while we check it
+//     {type:"error", message, room_id?}  // also sent when manifest verification fails
 //     {type:"room_created", room_id, topic, visibility, entry}
 //     {type:"transcript", room_id, events:[{from,to?,text,t}]}  // last 50, on join
 //     {type:"knock_request", room_id, topic, agent:{id,name,serves}}  // to creator
@@ -30,6 +37,9 @@
 //     {type:"error", message, room_id?}
 
 const http = require("http");
+const https = require("https");
+const dns = require("dns").promises;
+const net = require("net");
 const fs = require("fs");
 const path = require("path");
 const { WebSocketServer } = require("ws");
@@ -271,6 +281,241 @@ ensureDirectorySeeded();
 refreshSelfEntry();
 setInterval(refreshSelfEntry, DIR_REFRESH_MS);
 
+// --- manifest verification (Phase 3: federation, inbound half) ---
+// A client may present `manifest_url` in its hello: the URL of its
+// muse-protocol manifest. The server fetches and validates it asynchronously
+// (the socket waits in a "verifying" state, bounded by a 5s timeout) and
+// admits the client as `verified`, or rejects the hello.
+//
+// Verification states:
+//   verified   — manifest fetched; identity + lobbies checks passed. The
+//                roster shows a badge.
+//   unverified — no manifest_url (legacy clients, local bots, the bridge):
+//                admitted exactly as before, no badge.
+//   failed     — manifest_url given but fetch/validation failed: the hello
+//                is rejected with a clear error and the client is not
+//                admitted. Failures are cached for 60s to avoid hammering.
+//
+// SSRF protection: only http(s) URLs, no credentials in the URL, and the
+// host must resolve to at least one address of which NONE may be
+// private/loopback/link-local/etc. Set MANIFEST_ALLOW_PRIVATE=1 to lift the
+// IP restriction (tests only — never in production).
+const MANIFEST_TIMEOUT_MS = 5000;
+const MANIFEST_MAX_BYTES = 64 * 1024;
+const MANIFEST_FAIL_TTL_MS = 60 * 1000;
+const MANIFEST_ALLOW_PRIVATE = process.env.MANIFEST_ALLOW_PRIVATE === "1";
+const manifestFailCache = new Map(); // url -> {at, message}
+
+const V4_BLOCKED = [
+  "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+  "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
+  "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+].map((c) => {
+  const [ip, bits] = c.split("/");
+  const p = ip.split(".").map(Number);
+  const addr = (((p[0] * 256 + p[1]) * 256 + p[2]) * 256 + p[3]) >>> 0;
+  const n = Number(bits);
+  const mask = n === 0 ? 0 : (0xffffffff - (2 ** (32 - n) - 1)) >>> 0;
+  return [addr, mask];
+});
+
+function v4Blocked(ip) {
+  const p = ip.split(".").map(Number);
+  if (p.length !== 4 || p.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return true;
+  const addr = (((p[0] * 256 + p[1]) * 256 + p[2]) * 256 + p[3]) >>> 0;
+  return V4_BLOCKED.some(([net, mask]) => (addr & mask) === (net & mask));
+}
+
+function v6Blocked(ip) {
+  let l = ip.toLowerCase();
+  // unwrap IPv4-mapped addresses and judge the inner address
+  const mapped = l.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped) return v4Blocked(mapped[1]);
+  return (
+    l === "::1" || l === "::" ||
+    l.startsWith("fe80:") || // link-local
+    l.startsWith("fc") || l.startsWith("fd") || // unique-local fc00::/7
+    l.startsWith("ff") // multicast ff00::/8
+  );
+}
+
+function isPublicIp(ip) {
+  if (net.isIPv4(ip)) return !v4Blocked(ip);
+  if (net.isIPv6(ip)) return !v6Blocked(ip);
+  return false;
+}
+
+function checkedManifestUrl(urlStr) {
+  let u;
+  try {
+    u = new URL(urlStr);
+  } catch {
+    throw new Error("not a valid URL");
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error("must be an http(s) URL");
+  }
+  if (u.username || u.password) throw new Error("must not contain credentials");
+  return u;
+}
+
+async function resolvePublic(u) {
+  let addrs;
+  try {
+    addrs = await dns.lookup(u.hostname, { all: true });
+  } catch {
+    throw new Error("could not resolve host");
+  }
+  if (!addrs.length) throw new Error("could not resolve host");
+  if (!MANIFEST_ALLOW_PRIVATE) {
+    for (const { address } of addrs) {
+      if (!isPublicIp(address)) throw new Error("host resolves to a private address");
+    }
+  }
+}
+
+function fetchOnce(u) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, val) => {
+      if (!settled) {
+        settled = true;
+        fn(val);
+      }
+    };
+    const mod = u.protocol === "https:" ? https : http;
+    const req = mod.get(
+      u,
+      { timeout: MANIFEST_TIMEOUT_MS, headers: { "User-Agent": "muse-commons-manifest/1.0" } },
+      (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          done(resolve, { redirect: res.headers.location });
+          return;
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          done(reject, new Error(`fetch failed: HTTP ${res.statusCode}`));
+          return;
+        }
+        const chunks = [];
+        let size = 0;
+        res.on("data", (c) => {
+          size += c.length;
+          if (size > MANIFEST_MAX_BYTES) {
+            req.destroy();
+            done(reject, new Error("manifest exceeds size limit"));
+            return;
+          }
+          chunks.push(c);
+        });
+        res.on("end", () => done(resolve, { body: Buffer.concat(chunks).toString("utf8") }));
+        res.on("error", (e) => done(reject, e));
+      }
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      done(reject, new Error("fetch timed out"));
+    });
+    req.on("error", (e) => done(reject, e));
+  });
+}
+
+async function fetchManifestBody(urlStr) {
+  let u = checkedManifestUrl(urlStr);
+  for (let hop = 0; hop < 3; hop++) {
+    await resolvePublic(u); // re-checked on every hop (SSRF-safe redirects)
+    const out = await fetchOnce(u);
+    if (out.redirect) {
+      u = checkedManifestUrl(new URL(out.redirect, u).toString());
+      continue;
+    }
+    return out.body;
+  }
+  throw new Error("too many redirects");
+}
+
+function validHttpUrl(s) {
+  try {
+    const u = new URL(String(s));
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+// Throws with a clear message when the manifest doesn't check out; returns
+// {name, avatarUrl} on success. `requestHost` is the Host header the client
+// connected with (fallback when LOBBY_PUBLIC_URL isn't quite right).
+function validateManifestBody(text, requestHost) {
+  let m;
+  try {
+    m = JSON.parse(text);
+  } catch {
+    throw new Error("not valid JSON");
+  }
+  if (!m || typeof m !== "object" || Array.isArray(m)) throw new Error("not a JSON object");
+  const ident =
+    m.muse && typeof m.muse === "object" && !Array.isArray(m.muse) ? m.muse : m;
+  const name = ident.name;
+  if (typeof name !== "string" || !name.trim()) {
+    throw new Error("no recognizable identity (missing name)");
+  }
+  // avatar_url: must be well-formed http(s) to be used; a bad one is
+  // ignored (cosmetic), never fatal to verification.
+  let avatarUrl = ident.avatar_url !== undefined ? ident.avatar_url : m.avatar_url;
+  avatarUrl =
+    avatarUrl !== undefined && avatarUrl !== null && avatarUrl !== "" && validHttpUrl(avatarUrl)
+      ? String(avatarUrl)
+      : null;
+  // lobbies: optional; when present, this lobby must be listed in it.
+  const lobbies = Array.isArray(m.lobbies)
+    ? m.lobbies
+    : m.muse && Array.isArray(m.muse.lobbies)
+      ? m.muse.lobbies
+      : null;
+  if (lobbies) {
+    const ours = normUrl(LOBBY_SELF.url);
+    const reqHost = String(requestHost || "").split(":")[0].toLowerCase();
+    const listed = lobbies.some((e) => {
+      const raw = typeof e === "string" ? e : e && e.url;
+      if (typeof raw !== "string" || !raw) return false;
+      let n;
+      try {
+        n = normUrl(raw);
+      } catch {
+        return false;
+      }
+      if (n === ours) return true;
+      if (reqHost) {
+        try {
+          if (new URL(n).hostname.toLowerCase() === reqHost) return true;
+        } catch {
+          /* ignore malformed entries */
+        }
+      }
+      return false;
+    });
+    if (!listed) throw new Error("this lobby is not listed in the manifest's lobbies");
+  }
+  return { name: name.trim(), avatarUrl };
+}
+
+async function verifyManifestUrl(urlStr, requestHost) {
+  const cached = manifestFailCache.get(urlStr);
+  if (cached && Date.now() - cached.at < MANIFEST_FAIL_TTL_MS) {
+    throw new Error(cached.message);
+  }
+  manifestFailCache.delete(urlStr);
+  try {
+    const body = await fetchManifestBody(urlStr);
+    return validateManifestBody(body, requestHost);
+  } catch (e) {
+    manifestFailCache.set(urlStr, { at: Date.now(), message: e.message || "verification failed" });
+    throw e;
+  }
+}
+
 // --- agents (per room) ---
 function ensureAgent(room, id, info = {}) {
   let a = room.agents.get(id);
@@ -406,6 +651,21 @@ function joinRoom(ws, roomId) {
   return enterOrKnock(ws, room, ws.agentName, ws.agentServes) ? room : null;
 }
 
+// Shared agent admission for both verified and unverified hellos. A verified
+// manifest's avatar_url (already validated as http(s)) takes precedence over
+// the self-asserted hello avatar image.
+function admitHelloAgent(ws, m, roomId, proof) {
+  ws.agentId = agentIdOf(m.name);
+  ws.agentName = m.name;
+  ws.agentServes = m.serves || "";
+  const room = joinRoom(ws, roomId);
+  if (!room) return; // invite-only rejection or knock pending
+  let avatar = m.avatar;
+  if (proof.avatarUrl) avatar = { ...(avatar || {}), image: proof.avatarUrl };
+  const a = ensureAgent(room, ws.agentId, { name: m.name, serves: m.serves, avatar });
+  a.verified = proof.verified;
+}
+
 function registerKnock(room, agentId, name, serves, ws) {
   room.knocking.set(agentId, { name, serves, ws, t: Date.now() });
   // notify the creator (their socket, or any socket of their agent identity)
@@ -463,6 +723,7 @@ function tick() {
         color: a.color,
         emoji: a.emoji,
         image: a.image,
+        verified: a.verified || "unverified", // Phase 3: manifest check state
         x: Math.round(a.x),
         y: Math.round(a.y),
         talking: !!a.talking,
@@ -577,12 +838,14 @@ const httpServer = http.createServer((req, res) => {
 });
 
 const wss = new WebSocketServer({ server: httpServer });
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
   ws.agentId = null;
   ws.agentName = null;
   ws.agentServes = "";
   ws.guestId = null; // stable knock identity for sockets without an agent
   ws.roomId = "plaza";
+  ws.verifying = false; // Phase 3: a manifest check is in flight
+  ws.hostHeader = (req && req.headers && req.headers.host) || ""; // Phase 3: request-host fallback for the lobbies check
   send(ws, { type: "transcript", room_id: "plaza", events: rooms.get("plaza").transcript });
   ws.on("message", (raw) => {
     let m;
@@ -596,6 +859,7 @@ wss.on("connection", (ws) => {
     if (roomId === "commons") roomId = "plaza"; // legacy alias: old clients said "commons"
 
     if (m.type === "hello") {
+      if (ws.verifying) return; // a manifest check is already in flight
       if (m.kind === "viewer" || !m.name) {
         // viewers (re)subscribe to a room; they get no avatar. Viewers pass
         // through the same entry gate as agents.
@@ -609,12 +873,31 @@ wss.on("connection", (ws) => {
         enterOrKnock(ws, room, null, "");
         return;
       }
-      ws.agentId = agentIdOf(m.name);
-      ws.agentName = m.name;
-      ws.agentServes = m.serves || "";
-      const room = joinRoom(ws, roomId);
-      if (!room) return; // invite-only rejection or knock pending
-      ensureAgent(room, ws.agentId, { name: m.name, serves: m.serves, avatar: m.avatar });
+      const manifestUrl = typeof m.manifest_url === "string" ? m.manifest_url.trim() : "";
+      if (manifestUrl) {
+        // Phase 3: hold the socket in "verifying" while the async manifest
+        // check runs (bounded by the fetch timeout). Admit-as-verified or
+        // reject once it resolves; never block the socket on it.
+        ws.verifying = true;
+        send(ws, { type: "verifying" });
+        verifyManifestUrl(manifestUrl, ws.hostHeader).then(
+          (proof) => {
+            ws.verifying = false;
+            if (ws.readyState !== 1) return;
+            admitHelloAgent(ws, m, roomId, { verified: "verified", avatarUrl: proof.avatarUrl });
+          },
+          (err) => {
+            ws.verifying = false;
+            if (ws.readyState !== 1) return;
+            send(ws, {
+              type: "error",
+              message: "manifest verification failed: " + (err.message || "unknown error"),
+            });
+          }
+        );
+        return;
+      }
+      admitHelloAgent(ws, m, roomId, { verified: "unverified", avatarUrl: null });
     } else if (m.type === "heartbeat") {
       const room = rooms.get(ws.roomId);
       const a = ws.agentId && room && room.agents.get(ws.agentId);
