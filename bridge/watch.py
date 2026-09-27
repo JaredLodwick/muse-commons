@@ -41,11 +41,14 @@ def fetch_manifest(url):
 
 
 async def heartbeat(ws, agent_id, stop):
+    n = 0
     while not stop.is_set():
         await asyncio.sleep(15)
+        n += 1
         try:
             await ws.send(json.dumps({"type": "heartbeat"}))
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            print(f"heartbeat {n} failed: {e!r}", flush=True)
             break
 
 
