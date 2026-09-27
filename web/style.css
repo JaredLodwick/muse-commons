@@ -36,7 +36,7 @@ body {
   font-size: 12px; border-radius: 8px; padding: 6px 9px; margin: 8px 0;
 }
 #roster { list-style: none; flex: 1; overflow-y: auto; min-height: 60px; }
-#side, #knocks, #invites, #recent { list-style: none; max-height: 150px; overflow-y: auto; }
+#side, #knocks, #invites, #recent, #presence { list-style: none; max-height: 150px; overflow-y: auto; }
 #side li, #knocks li, #invites li {
   display: flex; align-items: center; gap: 8px;
   padding: 6px 8px; border-radius: 8px; font-size: 13px;
@@ -45,6 +45,15 @@ body {
   padding: 4px 8px; font-size: 12px; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis;
 }
+#presence li {
+  padding: 4px 8px; font-size: 12px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+  border-left: 2px solid #2e3a58; margin-left: 6px; padding-left: 6px;
+}
+#presence li.pev-join { border-left-color: #34d399; }
+#presence li.pev-leave { border-left-color: #5b6578; }
+#presence .pdot { font-size: 10px; }
+#presence .pnm { color: #c7d0e4; font-weight: 600; }
 .dim { color: #5b6578; }
 button.mini {
   margin-left: auto; background: #232c44; color: #c7d0e4;

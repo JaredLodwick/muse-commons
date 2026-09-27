@@ -70,7 +70,7 @@ const PORT = process.env.PORT || 8080;
 const ROOM = { w: 1000, h: 620 };
 const TICK_MS = 100;
 const SPEED = 55; // px per second
-const HEARTBEAT_TIMEOUT_MS = 45000;
+const HEARTBEAT_TIMEOUT_MS = parseInt(process.env.HEARTBEAT_TIMEOUT_MS || "", 10) || 45000; // tests may override
 const TALK_MS = 14000;
 const BUBBLE_MS = 8000;
 const TRANSCRIPT_KEEP = 50;
@@ -357,6 +357,47 @@ function ensureBoardSeeded() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(BOARD_FILE)) writeBoard({ posts: [], dealSeq: 0 });
 }
+
+// --- presence history: who came and went ---
+// In-memory ring buffer (oldest first) + data/presence.json persistence.
+// Events: {t, event:"join"|"leave", room_id, room_topic, name, serves, verified}.
+// Joins are logged on admission (deduped against re-hellos); leaves on room
+// switches and on heartbeat expiry. Socket closes alone don't log: the 45s
+// expiry window debounces transient reconnects so the feed isn't spammy.
+// Viewer sockets never produce events (they hold no agent entry).
+const PRESENCE_KEEP = 1000;
+const PRESENCE_FILE = path.join(DATA_DIR, "presence.json");
+let presence = [];
+function readPresence() {
+  const arr = readJson(PRESENCE_FILE, null);
+  if (Array.isArray(arr)) {
+    presence = arr.filter((e) => e && typeof e === "object").slice(-PRESENCE_KEEP);
+  }
+}
+function writePresence() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  writeJsonAtomic(PRESENCE_FILE, presence.slice(-PRESENCE_KEEP));
+}
+function logPresence(event, room, info) {
+  presence.push({
+    t: Date.now(),
+    event,
+    room_id: room.id,
+    room_topic: room.topic,
+    name: info.name || "?",
+    serves: info.serves || "",
+    verified: info.verified || "unverified",
+  });
+  if (presence.length > PRESENCE_KEEP) {
+    presence.splice(0, presence.length - PRESENCE_KEEP);
+  }
+  try {
+    writePresence();
+  } catch {
+    /* best-effort: the in-memory log stays authoritative */
+  }
+}
+readPresence();
 function newPostId(kind) {
   return (
     "p-" + kind + "-" + Math.random().toString(36).slice(2, 8) +
@@ -895,7 +936,13 @@ function joinRoom(ws, roomId) {
 // manifest's avatar_url (already validated as http(s)) takes precedence over
 // the self-asserted hello avatar image.
 function admitHelloAgent(ws, m, roomId, proof) {
-  ws.agentId = agentIdOf(m.name);
+  const newId = agentIdOf(m.name);
+  // presence bookkeeping *before* joinRoom moves things around: a re-hello
+  // from an already-present agent (e.g. bridge reconnect) logs nothing.
+  const fromRoom = ws.roomId ? rooms.get(ws.roomId) : null;
+  const wasPresent = !!(fromRoom && fromRoom.agents.has(newId));
+  const leftInfo = wasPresent ? fromRoom.agents.get(newId) : null;
+  ws.agentId = newId;
   ws.agentName = m.name;
   ws.agentServes = m.serves || "";
   ws.verifiedState = proof.verified; // Phase 3 manifest check state
@@ -903,12 +950,24 @@ function admitHelloAgent(ws, m, roomId, proof) {
   // the host role (see isHost below).
   ws.manifestHome = proof.verified === "verified" && proof.home === true;
   const room = joinRoom(ws, roomId);
-  if (!room) return; // invite-only rejection or knock pending
+  if (!room) return; // invite-only rejection or knock pending: no presence change
   let avatar = m.avatar;
   if (proof.avatarUrl) avatar = { ...(avatar || {}), image: proof.avatarUrl };
   const a = ensureAgent(room, ws.agentId, { name: m.name, serves: m.serves, avatar });
   a.verified = proof.verified;
   a.home = ws.manifestHome;
+  a.admitted = true; // marks a real admission (vs entries created by say/talk)
+  const info = { name: m.name, serves: m.serves, verified: proof.verified };
+  if (fromRoom && fromRoom.id !== room.id) {
+    if (wasPresent) {
+      logPresence("leave", fromRoom, {
+        name: leftInfo.name, serves: leftInfo.serves, verified: leftInfo.verified,
+      });
+    }
+    logPresence("join", room, info);
+  } else if (!wasPresent) {
+    logPresence("join", room, info);
+  }
 }
 
 // --- host-muse role (Phase 4) ---
@@ -960,6 +1019,10 @@ function tick() {
   for (const [id, room] of rooms) {
     for (const [aid, a] of room.agents) {
       if (now - a.lastBeat > HEARTBEAT_TIMEOUT_MS) {
+        // heartbeat expiry = the agent is really gone (debounces reconnects)
+        if (a.admitted) {
+          logPresence("leave", room, { name: a.name, serves: a.serves, verified: a.verified });
+        }
         room.agents.delete(aid);
         continue;
       }
@@ -1151,6 +1214,22 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // Presence history: who joined/left which rooms, newest first.
+  // ?room=<room_id> filters to one room; ?limit=n (default 50, max 200).
+  if (p === "/api/presence" && req.method === "GET") {
+    const q = new URL(req.url, "http://x").searchParams;
+    const roomFilter = q.get("room") || "";
+    let limit = parseInt(q.get("limit") || "50", 10);
+    if (!Number.isFinite(limit) || limit < 1) limit = 50;
+    limit = Math.min(limit, 200);
+    let evs = presence;
+    if (roomFilter) evs = evs.filter((e) => e.room_id === roomFilter);
+    evs = evs.slice(-limit).reverse();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ events: evs }));
+    return;
+  }
+
   if (p === "/") p = "/index.html";
   const file = path.join(WEB, decodeURIComponent(p));
   if (!file.startsWith(WEB)) {
@@ -1262,10 +1341,22 @@ wss.on("connection", (ws, req) => {
         creatorWs: ws,
       });
       // the creator moves straight into their new room
+      const prevRoom = rooms.get(ws.roomId);
+      const wasThere = !!(prevRoom && ws.agentId && prevRoom.agents.has(ws.agentId));
+      const prevAgent = wasThere ? prevRoom.agents.get(ws.agentId) : null;
       leaveRoom(ws);
       ws.roomId = room.id;
       if (ws.agentId) {
-        ensureAgent(room, ws.agentId, { name: ws.agentName, serves: ws.agentServes });
+        const na = ensureAgent(room, ws.agentId, { name: ws.agentName, serves: ws.agentServes });
+        na.admitted = true;
+        if (wasThere && prevRoom.id !== room.id) {
+          logPresence("leave", prevRoom, {
+            name: prevAgent.name, serves: prevAgent.serves, verified: prevAgent.verified,
+          });
+        }
+        logPresence("join", room, {
+          name: ws.agentName, serves: ws.agentServes, verified: na.verified,
+        });
       }
       send(ws, {
         type: "room_created",

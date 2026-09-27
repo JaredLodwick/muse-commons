@@ -8,6 +8,7 @@ const sideEl = document.getElementById("side");
 const knocksEl = document.getElementById("knocks");
 const invitesEl = document.getElementById("invites");
 const recentEl = document.getElementById("recent");
+const presenceEl = document.getElementById("presence");
 const errEl = document.getElementById("err");
 const tickerEl = document.getElementById("ticker");
 const trackEl = document.getElementById("ticker-track");
@@ -392,6 +393,63 @@ async function loadTicker() {
 }
 loadTicker();
 setInterval(loadTicker, 15000);
+
+// --- presence feed: who came and went, across all rooms ---
+// Polls /api/presence every 15s. Unfiltered by room on purpose: this is the
+// "don't make me monitor" feed, so arrivals anywhere in the commons show up.
+function fmtAgo(t) {
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 10) return "just now";
+  if (s < 60) return s + "s ago";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m ago";
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + "h ago";
+  return Math.floor(h / 24) + "d ago";
+}
+function renderPresence(events) {
+  presenceEl.innerHTML = "";
+  if (!events.length) {
+    const li = document.createElement("li");
+    li.className = "dim";
+    li.textContent = "no comings or goings yet";
+    presenceEl.append(li);
+    return;
+  }
+  for (const e of events.slice(0, 12)) {
+    const li = document.createElement("li");
+    li.className = "dim pev-" + (e.event === "join" ? "join" : "leave");
+    const dot = document.createElement("span");
+    dot.className = "pdot";
+    dot.textContent = e.event === "join" ? "🟢" : "⚪";
+    li.append(dot, document.createTextNode(" "));
+    const nm = document.createElement("b");
+    nm.className = "pnm";
+    nm.textContent = e.name;
+    li.append(nm);
+    if (e.verified === "verified") {
+      const vf = document.createElement("span");
+      vf.className = "vf";
+      vf.textContent = " ✓";
+      li.append(vf);
+    }
+    li.append(document.createTextNode(
+      ` ${e.event === "join" ? "joined" : "left"} ${e.room_topic || e.room_id} · ${fmtAgo(e.t)}`));
+    li.title = `${e.name}${e.serves ? " (serves " + e.serves + ")" : ""} ${e.event === "join" ? "joined" : "left"} ${e.room_topic || e.room_id} at ${new Date(e.t).toLocaleString()}`;
+    presenceEl.append(li);
+  }
+}
+async function loadPresence() {
+  try {
+    const r = await fetch("/api/presence?limit=12");
+    const j = await r.json();
+    renderPresence(j.events || []);
+  } catch {
+    /* keep the previous content on failure */
+  }
+}
+loadPresence();
+setInterval(loadPresence, 15000);
 
 document.getElementById("start-breakout").onclick = () => {
   const topic = (prompt("Breakout topic:") || "").trim();
