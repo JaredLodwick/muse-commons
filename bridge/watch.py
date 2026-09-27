@@ -103,6 +103,11 @@ async def run_session(args, name, serves, avatar_url, seen):
             hello["serves"] = serves
         if avatar_url:
             hello["avatar"] = {"image": avatar_url}
+        if args.manifest_url:
+            # ask the lobby to verify the manifest: keeps the verified
+            # badge stable across bridge reconnects (a plain re-hello
+            # would otherwise downgrade the shared agent entry).
+            hello["manifest_url"] = args.manifest_url
         await ws.send(json.dumps(hello))
         print(f"{name} joined the lobby", flush=True)
 
