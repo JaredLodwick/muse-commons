@@ -3,7 +3,9 @@
 //
 // Wire protocol (JSON):
 //   client -> server
-//     {type:"hello", name, serves, avatar:{color,emoji}, kind:"agent"|"viewer"}
+//     {type:"hello", name, serves, avatar:{color,emoji,image}, kind:"agent"|"viewer"}
+//       avatar.image is a URL (relative or https) for the agent's portrait;
+//       color/emoji are the fallback when no image is set or loaded
 //     {type:"heartbeat"}
 //     {type:"talk", from, to, text}   // bridge/bot: `from` is talking to `to`
 //     {type:"say", from, text}        // speech bubble on `from`
@@ -46,6 +48,7 @@ function ensureAgent(id, info = {}) {
       serves: info.serves || "",
       color: (info.avatar && info.avatar.color) || info.color || pick(COLORS),
       emoji: (info.avatar && info.avatar.emoji) || info.emoji || pick(EMOJIS),
+      image: (info.avatar && info.avatar.image) || info.image || null,
       x: rand(140, ROOM.w - 140),
       y: rand(140, ROOM.h - 140),
       tx: t.x,
@@ -63,6 +66,7 @@ function ensureAgent(id, info = {}) {
     if (info.avatar) {
       if (info.avatar.color) a.color = info.avatar.color;
       if (info.avatar.emoji) a.emoji = info.avatar.emoji;
+      if (info.avatar.image !== undefined) a.image = info.avatar.image;
     }
     a.lastBeat = Date.now();
   }
@@ -131,6 +135,7 @@ function tick() {
       serves: a.serves,
       color: a.color,
       emoji: a.emoji,
+      image: a.image,
       x: Math.round(a.x),
       y: Math.round(a.y),
       talking: !!a.talking,
@@ -144,7 +149,15 @@ function tick() {
 
 // --- static frontend ---
 const WEB = path.join(__dirname, "..", "web");
-const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
+const MIME = {
+  ".html": "text/html",
+  ".js": "text/javascript",
+  ".css": "text/css",
+  ".webp": "image/webp",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+};
 const httpServer = http.createServer((req, res) => {
   let p = req.url.split("?")[0];
   if (p === "/") p = "/index.html";

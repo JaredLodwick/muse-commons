@@ -21,13 +21,22 @@ function renderRoster() {
   rosterEl.innerHTML = "";
   for (const a of agents) {
     const li = document.createElement("li");
-    const dot = document.createElement("span");
-    dot.className = "dot";
-    dot.style.background = a.color;
+    if (a.image) {
+      const im = document.createElement("img");
+      im.className = "ava";
+      im.src = a.image;
+      im.alt = "";
+      li.append(im);
+    } else {
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      dot.style.background = a.color;
+      li.append(dot);
+    }
     const nm = document.createElement("span");
     nm.className = "nm";
     nm.textContent = a.name;
-    li.append(dot, nm);
+    li.append(nm);
     if (a.serves) {
       const sv = document.createElement("span");
       sv.className = "sv";
@@ -106,36 +115,62 @@ function drawAgent(a, t) {
 
   // gentle bob
   const bob = Math.sin(t / 500 + x) * 2;
+  const cy = y + bob;
 
+  // portrait: real avatar image when available, emoji fallback otherwise
+  const img = getAvatarImage(a.image);
   ctx.fillStyle = a.color;
-  ctx.beginPath(); ctx.arc(x, y + bob, 24, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x, cy, 24, 0, Math.PI * 2); ctx.fill();
+  if (img) {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(x, cy, 21, 0, Math.PI * 2); ctx.clip();
+    // cover-fit the portrait into the circle
+    const s = Math.max(42 / img.naturalWidth, 42 / img.naturalHeight);
+    const dw = img.naturalWidth * s, dh = img.naturalHeight * s;
+    ctx.drawImage(img, x - dw / 2, cy - dh / 2, dw, dh);
+    ctx.restore();
+  } else {
+    ctx.font = "24px serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(a.emoji, x, cy + 1);
+  }
   ctx.lineWidth = 3;
   ctx.strokeStyle = a.talking ? "#34d399" : "rgba(255,255,255,.25)";
-  ctx.stroke();
-
-  ctx.font = "24px serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(a.emoji, x, y + 1 + bob);
+  ctx.beginPath(); ctx.arc(x, cy, 24, 0, Math.PI * 2); ctx.stroke();
 
   if (a.talking) {
     const n = 1 + ((t / 400) | 0) % 3;
     ctx.font = "13px sans-serif";
     ctx.fillStyle = "#34d399";
-    ctx.fillText("●".repeat(n), x, y - 38 + bob);
+    ctx.fillText("●".repeat(n), x, cy - 38);
   }
 
   ctx.font = "12px sans-serif";
   const w = ctx.measureText(a.name).width;
   ctx.fillStyle = "rgba(0,0,0,.55)";
-  roundRect(x - w / 2 - 6, y + 33, w + 12, 18, 9); ctx.fill();
+  roundRect(x - w / 2 - 6, cy + 33, w + 12, 18, 9); ctx.fill();
   ctx.fillStyle = "#e8ecf4";
-  ctx.fillText(a.name, x, y + 42);
+  ctx.fillText(a.name, x, cy + 42);
 
-  if (a.bubble) drawBubble(a, bob);
+  if (a.bubble) drawBubble(a, cy);
 }
 
-function drawBubble(a, bob) {
+// Avatar image cache: loads each unique URL once, returns the Image only
+// once it's fully loaded (null until then -> emoji fallback meanwhile).
+const imgCache = new Map();
+function getAvatarImage(url) {
+  if (!url) return null;
+  let e = imgCache.get(url);
+  if (!e) {
+    e = new Image();
+    e.src = url;
+    imgCache.set(url, e);
+  }
+  return e.complete && e.naturalWidth > 0 ? e : null;
+}
+
+function drawBubble(a, cy) {
   ctx.font = "13px sans-serif";
   const maxW = 200;
   const words = String(a.bubble).split(/\s+/);
@@ -150,7 +185,7 @@ function drawBubble(a, bob) {
   const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 20;
   const h = lines.length * 18 + 16;
   const bx = Math.min(990 - w, Math.max(10, a.x - w / 2));
-  const by = a.y - 58 - h + bob;
+  const by = cy - 58 - h;
   ctx.fillStyle = "rgba(10,14,24,.94)";
   roundRect(bx, by, w, h, 12); ctx.fill();
   ctx.strokeStyle = "rgba(255,255,255,.18)";

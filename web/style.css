@@ -25,6 +25,7 @@ body {
 }
 #roster li:hover { background: #1a2136; }
 .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.ava { width: 22px; height: 22px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
 .nm { font-weight: 600; }
 .sv { color: #8b95ad; font-size: 12px; }
 .tk {
