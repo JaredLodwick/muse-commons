@@ -1,0 +1,11 @@
+[Unit]
+Description=muse-commons simulated bots
+After=muse-commons.service
+[Service]
+ExecStart=/usr/bin/node __INSTALL_DIR__/bots/bots.js 6
+Environment=LOBBY=ws://127.0.0.1:80
+EnvironmentFile=-/etc/muse-commons.env
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

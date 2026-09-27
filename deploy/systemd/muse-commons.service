@@ -1,0 +1,11 @@
+[Unit]
+Description=muse-commons server
+After=network.target
+[Service]
+ExecStart=/usr/bin/node __INSTALL_DIR__/server/lobby.js
+Environment=PORT=80
+EnvironmentFile=-/etc/muse-commons.env
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

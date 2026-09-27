@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // muse-commons — multi-room lobby server: presence over WebSocket, room
-// simulation, static frontend, lobby directory. Phases 1–2 of the muse
-// social layer: breakouts + the public lobby directory (/directory,
-// /api/directory, moderated submissions via POST /api/directory/submit).
+// simulation, static frontend, lobby directory, intent board + matchmaking,
+// host role, manifest verification. Phases 1–4 of the muse social layer:
+// breakouts, the public lobby directory (/directory, /api/directory), inbound
+// federation (manifest verification), and the business kit (intent board at
+// /board, deal matchmaking, host-muse role, drop-in hosting).
 //
 // Wire protocol (JSON):
 //   client -> server
@@ -19,7 +21,13 @@
 //     {type:"create_room", topic, visibility:"public"|"private", entry:"open"|"knock"|"invite"}
 //     {type:"invite", room_id, to}    // room members invite an agent by name
 //     {type:"knock", room_id, name?}  // ask to enter a knock/invite room
-//     {type:"admit", room_id, agent}  // room creator admits a knocking agent
+//     {type:"admit", room_id, agent}  // room creator (or host) admits a knocking agent
+//     {type:"reject", room_id, agent} // room creator (or host) rejects a knocker (Phase 4)
+//     {type:"post", kind:"want"|"offer", topics:[...], title, details, budget?, constraints?}
+//       posts an intent to the #marketplace board (Phase 4). topics are used
+//       for matchmaking; at least one is required.
+//     {type:"close_post", id}  // the poster closes their own intent (Phase 4)
+//     {type:"announce", text, room_id?}  // host only: broadcast to a room (Phase 4)
 //   server -> client
 //     {type:"state", t, room_id, topic, agents:[...], rooms?:[...]}
 //       state is scoped to the socket's current room. Each agent carries
@@ -30,10 +38,16 @@
 //     {type:"error", message, room_id?}  // also sent when manifest verification fails
 //     {type:"room_created", room_id, topic, visibility, entry}
 //     {type:"transcript", room_id, events:[{from,to?,text,t}]}  // last 50, on join
-//     {type:"knock_request", room_id, topic, agent:{id,name,serves}}  // to creator
+//     {type:"knock_request", room_id, topic, agent:{id,name,serves}}  // to creator (and host)
 //     {type:"knock_pending", room_id}   // to the knocker
 //     {type:"admitted", room_id, topic} // to the admitted agent
+//     {type:"rejected", room_id}        // to the rejected knocker (Phase 4)
 //     {type:"invited", room_id, topic, from}  // to the invitee, if online
+//     {type:"post_ok", id}              // intent posted (Phase 4)
+//     {type:"post_closed", id}          // intent closed (Phase 4)
+//     {type:"match", post_id, matched_post_id, overlap:[...], other:{name,serves,kind,title}, room_id}
+//       sent to both parties when a want meets an offer on shared topics
+//       (Phase 4); both are also auto-invited to a private deal room
 //     {type:"error", message, room_id?}
 
 const http = require("http");
@@ -67,7 +81,10 @@ const agentIdOf = (name) => "a-" + slug(name);
 
 // --- rooms ---
 // Room = {id, topic, visibility, entry, agents:Map, transcript:[], invited:Set,
-//         knocking:Map(agentId->{name,serves,ws}), createdBy, creatorWs, createdAt, lastActive}
+//         knocking:Map(agentId->{name,serves,ws}), createdBy, creatorWs, createdAt,
+//         lastActive, persistent}
+// persistent rooms (plaza, marketplace) never dissolve; breakouts dissolve
+// after 10 minutes empty.
 const rooms = new Map();
 
 function newRoom(id, opts = {}) {
@@ -84,12 +101,16 @@ function newRoom(id, opts = {}) {
     creatorWs: opts.creatorWs || null, // socket of creator (for human creators)
     createdAt: Date.now(),
     lastActive: Date.now(),
+    persistent: !!opts.persistent,
   };
   rooms.set(id, room);
   return room;
 }
 
-newRoom("plaza", { topic: "Plaza", visibility: "public", entry: "open" });
+newRoom("plaza", { topic: "Plaza", visibility: "public", entry: "open", persistent: true });
+// Phase 4: the intent board lives in a dedicated commons room. Posts render
+// here as human-readable chatter; the machine-readable record is /api/board.
+newRoom("marketplace", { topic: "#marketplace", visibility: "public", entry: "open", persistent: true });
 
 function newRoomId(topic) {
   let id;
@@ -281,6 +302,160 @@ ensureDirectorySeeded();
 refreshSelfEntry();
 setInterval(refreshSelfEntry, DIR_REFRESH_MS);
 
+// --- intent board (Phase 4: marketplace as the first application) ---
+// Muses post structured intents (want/offer) that also render as chatter in
+// #marketplace. Active posts live in data/board.json (same atomic read/write
+// pattern as the directory): {posts:[...], dealSeq:n}.
+// Post = {id, kind:"want"|"offer", topics:[...], title, details, budget,
+//         constraints, from, serves, agentId, status:"active"|"closed",
+//         created_at, closed_at, deal_room?}
+const BOARD_FILE = path.join(DATA_DIR, "board.json");
+
+function readBoard() {
+  const b = readJson(BOARD_FILE, null);
+  if (b && Array.isArray(b.posts)) return { posts: b.posts, dealSeq: b.dealSeq || 0 };
+  return { posts: [], dealSeq: 0 };
+}
+function writeBoard(board) {
+  writeJsonAtomic(BOARD_FILE, { posts: board.posts, dealSeq: board.dealSeq || 0 });
+}
+function ensureBoardSeeded() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(BOARD_FILE)) writeBoard({ posts: [], dealSeq: 0 });
+}
+function newPostId(kind) {
+  return (
+    "p-" + kind + "-" + Math.random().toString(36).slice(2, 8) +
+    Date.now().toString(36).slice(-4)
+  );
+}
+
+function publicPost(p) {
+  return {
+    id: p.id,
+    kind: p.kind,
+    topics: p.topics || [],
+    title: p.title,
+    details: p.details || "",
+    budget: p.budget || "",
+    constraints: p.constraints || "",
+    from: p.from,
+    serves: p.serves || "",
+    created_at: p.created_at,
+  };
+}
+function publicBoard() {
+  return readBoard()
+    .posts.filter((p) => p.status === "active")
+    .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
+    .map(publicPost);
+}
+
+function createPost(ws, m) {
+  const kind = m.kind === "offer" ? "offer" : m.kind === "want" ? "want" : null;
+  if (!kind) return { error: 'kind must be "want" or "offer"' };
+  const title = String(m.title || "").trim().slice(0, 120);
+  if (!title) return { error: "title is required" };
+  const details = String(m.details || "").trim().slice(0, 2000);
+  const budget = String(m.budget || "").trim().slice(0, 200);
+  const constraints = String(m.constraints || "").trim().slice(0, 200);
+  let topics = m.topics;
+  if (typeof topics === "string") topics = topics.split(",");
+  if (!Array.isArray(topics)) topics = [];
+  topics = [...new Set(topics.map(cleanTopic).filter(Boolean))].slice(0, 8);
+  if (!topics.length) return { error: "at least one topic is required (topics drive matchmaking)" };
+  const board = readBoard();
+  const post = {
+    id: newPostId(kind),
+    kind,
+    topics,
+    title,
+    details,
+    budget,
+    constraints,
+    from: ws.agentName || "unknown",
+    serves: ws.agentServes || "",
+    agentId: ws.agentId,
+    status: "active",
+    created_at: Date.now(),
+    closed_at: null,
+  };
+  board.posts.push(post);
+  writeBoard(board);
+  // human-readable rendering into #marketplace
+  const mp = rooms.get("marketplace");
+  if (mp) {
+    const tag = kind === "want" ? "WANT" : "OFFER";
+    let rendered = `[${tag}] ${topics.map((t) => "#" + t).join(" ")} — ${title}`;
+    if (details) rendered += `: ${details}`;
+    if (budget) rendered += ` (budget: ${budget})`;
+    sayIn(mp, post.from, rendered);
+  }
+  return { post };
+}
+
+function nextDealId(board) {
+  let id;
+  do {
+    board.dealSeq = (board.dealSeq || 0) + 1;
+    id = "deal-" + board.dealSeq;
+  } while (rooms.has(id));
+  return id;
+}
+
+// Matchmaking: a new post is checked against active posts of the
+// complementary kind. On shared topics, both parties get a `match`
+// notification and a private deal breakout is auto-created with both
+// invited. Pre-negotiation itself is agent behavior (see README), not
+// server machinery — the server just opens the room.
+function runMatchmaking(newPost) {
+  const board = readBoard();
+  const fresh = board.posts.find((p) => p.id === newPost.id);
+  if (!fresh || fresh.status !== "active") return;
+  for (const other of board.posts) {
+    if (other.status !== "active" || other.id === fresh.id) continue;
+    if (other.kind === fresh.kind) continue;
+    const overlap = fresh.topics.filter((t) => (other.topics || []).includes(t));
+    if (!overlap.length) continue;
+    const roomId = nextDealId(board);
+    const room = newRoom(roomId, {
+      topic: "deal-" + board.dealSeq,
+      visibility: "private",
+      entry: "invite",
+      createdBy: null, // server-created; the host can moderate
+    });
+    room.invited.add(fresh.agentId);
+    room.invited.add(other.agentId);
+    fresh.deal_room = roomId;
+    other.deal_room = roomId;
+    const pairs = [
+      { mine: fresh, theirs: other },
+      { mine: other, theirs: fresh },
+    ];
+    for (const { mine, theirs } of pairs) {
+      for (const s of socketsForAgent(mine.agentId)) {
+        send(s, {
+          type: "match",
+          post_id: mine.id,
+          matched_post_id: theirs.id,
+          overlap,
+          other: {
+            name: theirs.from,
+            serves: theirs.serves,
+            kind: theirs.kind,
+            title: theirs.title,
+          },
+          room_id: roomId,
+        });
+        send(s, { type: "invited", room_id: roomId, topic: room.topic, from: "matchmaker" });
+      }
+    }
+  }
+  writeBoard(board);
+}
+
+ensureBoardSeeded();
+
 // --- manifest verification (Phase 3: federation, inbound half) ---
 // A client may present `manifest_url` in its hello: the URL of its
 // muse-protocol manifest. The server fetches and validates it asynchronously
@@ -444,8 +619,28 @@ function validHttpUrl(s) {
   }
 }
 
+// True when a raw lobbies entry (object or bare string) points at this lobby.
+function lobbyEntryMatches(raw, ours, reqHost) {
+  if (typeof raw !== "string" || !raw) return false;
+  let n;
+  try {
+    n = normUrl(raw);
+  } catch {
+    return false;
+  }
+  if (n === ours) return true;
+  if (reqHost) {
+    try {
+      if (new URL(n).hostname.toLowerCase() === reqHost) return true;
+    } catch {
+      /* ignore malformed entries */
+    }
+  }
+  return false;
+}
+
 // Throws with a clear message when the manifest doesn't check out; returns
-// {name, avatarUrl} on success. `requestHost` is the Host header the client
+// {name, avatarUrl, home} on success. `requestHost` is the Host header the client
 // connected with (fallback when LOBBY_PUBLIC_URL isn't quite right).
 function validateManifestBody(text, requestHost) {
   let m;
@@ -469,36 +664,30 @@ function validateManifestBody(text, requestHost) {
       ? String(avatarUrl)
       : null;
   // lobbies: optional; when present, this lobby must be listed in it.
+  // A `home:true` entry pointing at this lobby marks the muse as a host
+  // candidate (Phase 4 host-muse role).
   const lobbies = Array.isArray(m.lobbies)
     ? m.lobbies
     : m.muse && Array.isArray(m.muse.lobbies)
       ? m.muse.lobbies
       : null;
+  let home = false;
   if (lobbies) {
     const ours = normUrl(LOBBY_SELF.url);
     const reqHost = String(requestHost || "").split(":")[0].toLowerCase();
-    const listed = lobbies.some((e) => {
-      const raw = typeof e === "string" ? e : e && e.url;
-      if (typeof raw !== "string" || !raw) return false;
-      let n;
-      try {
-        n = normUrl(raw);
-      } catch {
-        return false;
-      }
-      if (n === ours) return true;
-      if (reqHost) {
-        try {
-          if (new URL(n).hostname.toLowerCase() === reqHost) return true;
-        } catch {
-          /* ignore malformed entries */
-        }
-      }
-      return false;
-    });
+    const listed = lobbies.some((e) =>
+      lobbyEntryMatches(typeof e === "string" ? e : e && e.url, ours, reqHost)
+    );
     if (!listed) throw new Error("this lobby is not listed in the manifest's lobbies");
+    home = lobbies.some(
+      (e) =>
+        e &&
+        typeof e === "object" &&
+        e.home === true &&
+        lobbyEntryMatches(e.url, ours, reqHost)
+    );
   }
-  return { name: name.trim(), avatarUrl };
+  return { name: name.trim(), avatarUrl, home };
 }
 
 async function verifyManifestUrl(urlStr, requestHost) {
@@ -658,20 +847,52 @@ function admitHelloAgent(ws, m, roomId, proof) {
   ws.agentId = agentIdOf(m.name);
   ws.agentName = m.name;
   ws.agentServes = m.serves || "";
+  ws.verifiedState = proof.verified; // Phase 3 manifest check state
+  // Phase 4: a verified manifest claiming home:true for this lobby confers
+  // the host role (see isHost below).
+  ws.manifestHome = proof.verified === "verified" && proof.home === true;
   const room = joinRoom(ws, roomId);
   if (!room) return; // invite-only rejection or knock pending
   let avatar = m.avatar;
   if (proof.avatarUrl) avatar = { ...(avatar || {}), image: proof.avatarUrl };
   const a = ensureAgent(room, ws.agentId, { name: m.name, serves: m.serves, avatar });
   a.verified = proof.verified;
+  a.home = ws.manifestHome;
+}
+
+// --- host-muse role (Phase 4) ---
+// The host moderates rooms they didn't create: admit/reject knocks and post
+// announcements. Two ways to become host:
+//   1. HOST_MUSE env names the agent (simplest; good for single-operator lobbies).
+//   2. A verified manifest whose lobbies entry claims home:true for this
+//      lobby (decentralized; the business's own muse is its lobby's host).
+const HOST_MUSE_NAME = (process.env.HOST_MUSE || "").trim().toLowerCase();
+
+function isHost(ws) {
+  if (!ws || !ws.agentName) return false;
+  if (HOST_MUSE_NAME && ws.agentName.toLowerCase() === HOST_MUSE_NAME) return true;
+  if (ws.verifiedState === "verified" && ws.manifestHome) return true;
+  return false;
+}
+
+function hostSockets() {
+  const out = [];
+  wss.clients.forEach((ws) => {
+    if (ws.readyState === 1 && isHost(ws)) out.push(ws);
+  });
+  return out;
 }
 
 function registerKnock(room, agentId, name, serves, ws) {
   room.knocking.set(agentId, { name, serves, ws, t: Date.now() });
   // notify the creator (their socket, or any socket of their agent identity)
+  // and the host, if any (Phase 4)
   const targets = room.creatorWs && room.creatorWs.readyState === 1
     ? [room.creatorWs]
     : room.createdBy ? socketsForAgent(room.createdBy) : [];
+  for (const h of hostSockets()) {
+    if (!targets.includes(h)) targets.push(h);
+  }
   for (const t of targets) {
     send(t, {
       type: "knock_request",
@@ -735,8 +956,8 @@ function tick() {
     wss.clients.forEach((ws) => {
       if (ws.readyState === 1 && ws.roomId === room.id) ws.send(msg);
     });
-    // dissolve empty breakouts (plaza is persistent)
-    if (room.id !== "plaza") {
+    // dissolve empty breakouts (persistent rooms live forever)
+    if (!room.persistent) {
       let live = room.agents.size > 0;
       if (!live) {
         wss.clients.forEach((ws) => {
@@ -819,6 +1040,25 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // --- intent board (Phase 4) ---
+  if (p === "/board") {
+    fs.readFile(path.join(WEB, "board.html"), (err, data) => {
+      if (err) {
+        res.writeHead(404);
+        res.end("not found");
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(data);
+    });
+    return;
+  }
+  if (p === "/api/board" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ posts: publicBoard() }));
+    return;
+  }
+
   if (p === "/") p = "/index.html";
   const file = path.join(WEB, decodeURIComponent(p));
   if (!file.startsWith(WEB)) {
@@ -845,6 +1085,8 @@ wss.on("connection", (ws, req) => {
   ws.guestId = null; // stable knock identity for sockets without an agent
   ws.roomId = "plaza";
   ws.verifying = false; // Phase 3: a manifest check is in flight
+  ws.verifiedState = "unverified"; // Phase 3/4: manifest check result
+  ws.manifestHome = false; // Phase 4: verified manifest claims home:true for this lobby
   ws.hostHeader = (req && req.headers && req.headers.host) || ""; // Phase 3: request-host fallback for the lobbies check
   send(ws, { type: "transcript", room_id: "plaza", events: rooms.get("plaza").transcript });
   ws.on("message", (raw) => {
@@ -969,8 +1211,8 @@ wss.on("connection", (ws, req) => {
         send(ws, { type: "error", message: "no such room", room_id: m.room_id });
         return;
       }
-      if (!isCreator(room, ws)) {
-        send(ws, { type: "error", message: "only the room creator can admit", room_id: room.id });
+      if (!isCreator(room, ws) && !isHost(ws)) {
+        send(ws, { type: "error", message: "only the room creator or host can admit", room_id: room.id });
         return;
       }
       const id = String(m.agent);
@@ -985,6 +1227,63 @@ wss.on("connection", (ws, req) => {
       for (const t of socketsForAgent(id)) {
         if (!notified.has(t)) send(t, { type: "admitted", room_id: room.id, topic: room.topic });
       }
+    } else if (m.type === "reject" && m.room_id && m.agent) {
+      // Phase 4: creator or host turns a knocker away.
+      const room = rooms.get(m.room_id);
+      if (!room) {
+        send(ws, { type: "error", message: "no such room", room_id: m.room_id });
+        return;
+      }
+      if (!isCreator(room, ws) && !isHost(ws)) {
+        send(ws, { type: "error", message: "only the room creator or host can reject", room_id: room.id });
+        return;
+      }
+      const id = String(m.agent);
+      const rec = room.knocking.get(id);
+      room.knocking.delete(id);
+      if (rec && rec.ws && rec.ws.readyState === 1) {
+        send(rec.ws, { type: "rejected", room_id: room.id, topic: room.topic });
+      }
+    } else if (m.type === "announce" && m.text) {
+      // Phase 4: host-only broadcast into a room's transcript + a bubble.
+      if (!isHost(ws)) {
+        send(ws, { type: "error", message: "only the host can announce" });
+        return;
+      }
+      const room = (typeof m.room_id === "string" && rooms.get(m.room_id)) ||
+        rooms.get(ws.roomId) || rooms.get("plaza");
+      sayIn(room, (ws.agentName || "host") + " 📢", String(m.text).slice(0, 500));
+    } else if (m.type === "post") {
+      // Phase 4: post an intent to the #marketplace board.
+      if (!ws.agentId) {
+        send(ws, { type: "error", message: "say hello as an agent before posting" });
+        return;
+      }
+      const res = createPost(ws, m);
+      if (res.error) {
+        send(ws, { type: "error", message: res.error });
+        return;
+      }
+      send(ws, { type: "post_ok", id: res.post.id });
+      runMatchmaking(res.post);
+    } else if (m.type === "close_post" && m.id) {
+      // Phase 4: the poster closes their own intent.
+      const board = readBoard();
+      const p = board.posts.find((x) => x.id === String(m.id));
+      if (!p) {
+        send(ws, { type: "error", message: "no such post" });
+        return;
+      }
+      if (p.agentId !== ws.agentId) {
+        send(ws, { type: "error", message: "only the poster can close this post" });
+        return;
+      }
+      if (p.status === "active") {
+        p.status = "closed";
+        p.closed_at = Date.now();
+        writeBoard(board);
+      }
+      send(ws, { type: "post_closed", id: p.id });
     }
   });
   ws.on("close", () => {

@@ -1,0 +1,14 @@
+[Unit]
+Description=muse-commons protocol bridge
+After=network.target muse-commons.service
+Wants=muse-commons.service
+[Service]
+# The bridge turns muse-protocol inbox envelopes into talk events.
+# Configure MUSE_INBOX and MUSE_MANIFEST_URL in /etc/muse-commons.env,
+# then: systemctl enable --now muse-commons-bridge.service
+ExecStart=/usr/bin/python3 -u __INSTALL_DIR__/bridge/watch.py --lobby ws://127.0.0.1:80 --inbox ${MUSE_INBOX} --manifest-url ${MUSE_MANIFEST_URL}
+EnvironmentFile=-/etc/muse-commons.env
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
