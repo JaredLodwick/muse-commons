@@ -65,9 +65,10 @@ async def main():
     if args.manifest_url:
         try:
             m = fetch_manifest(args.manifest_url)
-            name = m.get("name", name)
-            serves = m.get("serves", serves)
-            avatar_url = m.get("avatar_url", avatar_url)
+            inner = m.get("muse") if isinstance(m.get("muse"), dict) else {}
+            name = m.get("name", inner.get("name", name))
+            serves = m.get("serves", inner.get("serves", serves))
+            avatar_url = m.get("avatar_url", inner.get("avatar_url", avatar_url))
             print(f"manifest: name={name} serves={serves} avatar_url={avatar_url}")
         except Exception as e:  # noqa: BLE001
             print(f"manifest fetch failed ({e}), using flags")
