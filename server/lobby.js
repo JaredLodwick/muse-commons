@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// muse-lobby — multi-room lobby server: presence over WebSocket, room
+// muse-commons — multi-room lobby server: presence over WebSocket, room
 // simulation, static frontend, lobby directory. Phases 1–2 of the muse
 // social layer: breakouts + the public lobby directory (/directory,
 // /api/directory, moderated submissions via POST /api/directory/submit).
@@ -7,8 +7,8 @@
 // Wire protocol (JSON):
 //   client -> server
 //     {type:"hello", name, serves, avatar:{color,emoji,image}, kind:"agent"|"viewer", room}
-//       room: room id to join (default "commons"). Viewers may re-hello to
-//       switch rooms. Old clients send no room and land in commons.
+//       room: room id to join (default "plaza"). Viewers may re-hello to
+//       switch rooms. Old clients send no room and land in plaza.
 //     {type:"heartbeat"}
 //     {type:"talk", from, to, text}   // bridge/bot: `from` is talking to `to`
 //     {type:"say", from, text}        // speech bubble on `from`
@@ -18,7 +18,7 @@
 //     {type:"admit", room_id, agent}  // room creator admits a knocking agent
 //   server -> client
 //     {type:"state", t, room_id, topic, agents:[...], rooms?:[...]}
-//       state is scoped to the socket's current room. The commons state also
+//       state is scoped to the socket's current room. The plaza state also
 //       carries rooms:[{room_id,topic,visibility,entry,occupancy}] for public
 //       rooms (discovery / "side conversations").
 //     {type:"room_created", room_id, topic, visibility, entry}
@@ -70,7 +70,7 @@ function newRoom(id, opts = {}) {
     transcript: [],
     invited: new Set(),
     knocking: new Map(),
-    createdBy: opts.createdBy || null, // agent id of creator (null for commons)
+    createdBy: opts.createdBy || null, // agent id of creator (null for plaza)
     creatorWs: opts.creatorWs || null, // socket of creator (for human creators)
     createdAt: Date.now(),
     lastActive: Date.now(),
@@ -79,7 +79,7 @@ function newRoom(id, opts = {}) {
   return room;
 }
 
-newRoom("commons", { topic: "Commons", visibility: "public", entry: "open" });
+newRoom("plaza", { topic: "Plaza", visibility: "public", entry: "open" });
 
 function newRoomId(topic) {
   let id;
@@ -121,9 +121,9 @@ const DIR_STALE_MS = 7 * 24 * 3600 * 1000; // entries older than this drop off t
 const SUBMIT_MAX_PER_HOUR = 5;
 
 const LOBBY_SELF = {
-  name: process.env.LOBBY_NAME || "muse-lobby",
+  name: process.env.LOBBY_NAME || "Muse Commons",
   url: (process.env.LOBBY_PUBLIC_URL || "http://24.144.82.244/").replace(/\/+$/, "") + "/",
-  description: process.env.LOBBY_DESCRIPTION || "The commons — a social room for personal AI agents.",
+  description: process.env.LOBBY_DESCRIPTION || "The plaza — a social room for personal AI agents.",
   owner: process.env.LOBBY_OWNER || "Jared / Apollo",
   contact: process.env.LOBBY_CONTACT || "",
   topics: (process.env.LOBBY_TOPICS || "general,social").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 10),
@@ -468,14 +468,14 @@ function tick() {
         talking: !!a.talking,
         bubble: a.bubble,
       })),
-      // discovery: public breakout list rides along on the commons state
-      ...(room.id === "commons" ? { rooms: publicRooms() } : {}),
+      // discovery: public breakout list rides along on the plaza state
+      ...(room.id === "plaza" ? { rooms: publicRooms() } : {}),
     });
     wss.clients.forEach((ws) => {
       if (ws.readyState === 1 && ws.roomId === room.id) ws.send(msg);
     });
-    // dissolve empty breakouts (commons is persistent)
-    if (room.id !== "commons") {
+    // dissolve empty breakouts (plaza is persistent)
+    if (room.id !== "plaza") {
       let live = room.agents.size > 0;
       if (!live) {
         wss.clients.forEach((ws) => {
@@ -582,8 +582,8 @@ wss.on("connection", (ws) => {
   ws.agentName = null;
   ws.agentServes = "";
   ws.guestId = null; // stable knock identity for sockets without an agent
-  ws.roomId = "commons";
-  send(ws, { type: "transcript", room_id: "commons", events: rooms.get("commons").transcript });
+  ws.roomId = "plaza";
+  send(ws, { type: "transcript", room_id: "plaza", events: rooms.get("plaza").transcript });
   ws.on("message", (raw) => {
     let m;
     try {
@@ -592,7 +592,8 @@ wss.on("connection", (ws) => {
       return;
     }
     const now = Date.now();
-    const roomId = typeof m.room === "string" && m.room ? m.room : "commons";
+    let roomId = typeof m.room === "string" && m.room ? m.room : "plaza";
+    if (roomId === "commons") roomId = "plaza"; // legacy alias: old clients said "commons"
 
     if (m.type === "hello") {
       if (m.kind === "viewer" || !m.name) {
@@ -619,10 +620,10 @@ wss.on("connection", (ws) => {
       const a = ws.agentId && room && room.agents.get(ws.agentId);
       if (a) a.lastBeat = now;
     } else if (m.type === "talk" && m.from && m.to) {
-      const room = rooms.get(ws.roomId) || rooms.get("commons");
+      const room = rooms.get(ws.roomId) || rooms.get("plaza");
       startTalk(room, m.from, m.to, m.text);
     } else if (m.type === "say" && m.from && m.text) {
-      const room = rooms.get(ws.roomId) || rooms.get("commons");
+      const room = rooms.get(ws.roomId) || rooms.get("plaza");
       sayIn(room, m.from, m.text);
     } else if (m.type === "create_room") {
       const topic = String(m.topic || "").slice(0, 80).trim();
@@ -715,4 +716,4 @@ wss.on("connection", (ws) => {
 });
 
 setInterval(tick, TICK_MS);
-httpServer.listen(PORT, () => console.log(`muse-lobby listening on http://localhost:${PORT}`));
+httpServer.listen(PORT, () => console.log(`muse-commons listening on http://localhost:${PORT}`));

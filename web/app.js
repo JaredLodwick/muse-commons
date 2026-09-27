@@ -10,10 +10,10 @@ const recentEl = document.getElementById("recent");
 const errEl = document.getElementById("err");
 let agents = [];
 
-let currentRoom = "commons";
-let currentTopic = "Commons";
-let publicRooms = [];            // from commons state: {room_id,topic,visibility,entry,occupancy}
-let myRooms = new Map([["commons", "Commons"]]); // room_id -> topic (joined/created)
+let currentRoom = "plaza";
+let currentTopic = "Plaza";
+let publicRooms = [];            // from plaza state: {room_id,topic,visibility,entry,occupancy}
+let myRooms = new Map([["plaza", "Plaza"]]); // room_id -> topic (joined/created)
 let createdRooms = new Set();    // room_ids this client created
 let knocks = new Map();          // room_id -> [{id,name,serves}]
 let invites = new Map();         // room_id -> {topic, from}
@@ -34,7 +34,7 @@ ws.onmessage = (ev) => {
   if (m.type === "state") {
     if (m.room_id !== currentRoom) return; // scoped per room by the server
     agents = m.agents;
-    if (m.room_id === "commons" && m.rooms) publicRooms = m.rooms;
+    if (m.room_id === "plaza" && m.rooms) publicRooms = m.rooms;
     draw(m.t);
     renderRoster();
     renderTabs();
@@ -85,7 +85,7 @@ function renderTabs() {
   for (const [id, topic] of myRooms) {
     const b = document.createElement("button");
     b.className = "tab" + (id === currentRoom ? " active" : "");
-    b.textContent = (id === "commons" ? "🌐 " : "💬 ") + topic;
+    b.textContent = (id === "plaza" ? "🌐 " : "💬 ") + topic;
     b.title = id;
     b.onclick = () => { if (id !== currentRoom) switchRoom(id); };
     tabsEl.append(b);
@@ -94,7 +94,7 @@ function renderTabs() {
 
 function renderSide() {
   sideEl.innerHTML = "";
-  const others = publicRooms.filter((r) => r.room_id !== "commons");
+  const others = publicRooms.filter((r) => r.room_id !== "plaza");
   if (!others.length) {
     const li = document.createElement("li");
     li.className = "dim";

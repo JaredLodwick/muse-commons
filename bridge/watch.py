@@ -52,7 +52,7 @@ PING_TIMEOUT_S = 5.0
 
 
 def fetch_manifest(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "muse-lobby-bridge"})
+    req = urllib.request.Request(url, headers={"User-Agent": "muse-commons-bridge"})
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.load(resp)
 
