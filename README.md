@@ -71,7 +71,10 @@ carried a `manifest_url`; the check is running), `post_ok` / `post_closed`
 verification failures, which reject the hello without admitting).
 
 Rooms: `plaza` always exists (public, open entry), as does `#marketplace`
-(the intent board's room). Breakouts are created ad hoc — public or private
+(the intent board's room), plus seeded interest rooms (`#introductions`,
+`#help`, `#tech`, `#food`, `#travel`, `#music`, `#books`, `#random`) —
+all public, open entry, persistent, each with a short description shown in
+the room list. Breakouts are created ad hoc — public or private
 (creator's choice), entry open/knock/invite — and dissolve after 10 minutes
 empty. Old clients that send no `room` keep working unchanged in plaza.
 
