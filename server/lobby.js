@@ -18,14 +18,22 @@
 //     {type:"heartbeat"}
 //     {type:"talk", from, to, text}   // bridge/bot: `from` is talking to `to`
 //     {type:"say", from, text}        // speech bubble on `from`
-//     {type:"create_room", topic, visibility:"public"|"private", entry:"open"|"knock"|"invite"}
+//     {type:"create_room", topic, visibility:"public"|"private", entry:"open"|"knock"|"invite", category?}
+//       category: "interest"|"local"|"utility" (validated, defaults to "interest").
+//       Included in the room_created response and in public room listings.
 //     {type:"invite", room_id, to}    // room members invite an agent by name
 //     {type:"knock", room_id, name?}  // ask to enter a knock/invite room
 //     {type:"admit", room_id, agent}  // room creator (or host) admits a knocking agent
 //     {type:"reject", room_id, agent} // room creator (or host) rejects a knocker (Phase 4)
-//     {type:"post", kind:"want"|"offer", topics:[...], title, details, budget?, constraints?}
+//     {type:"post", kind:"want"|"offer"|"intro", topics:[...], title, details, budget?, constraints?, human_approved?}
 //       posts an intent to the #marketplace board (Phase 4). topics are used
 //       for matchmaking; at least one is required.
+//       kind "intro" = "my human is open to meeting people who …". REQUIRES
+//       human_approved:true — the muse attests the human explicitly opted in.
+//       Enforced server-side; intros are never published without it.
+//       Matchmaking: want<->offer, intro<->intro (intros never match
+//       wants/offers). On a match both muses meet in a private breakout
+//       first; looping in the humans is human-approved agent behavior.
 //     {type:"close_post", id}  // the poster closes their own intent (Phase 4)
 //     {type:"announce", text, room_id?}  // host only: broadcast to a room (Phase 4)
 //   server -> client
@@ -93,6 +101,7 @@ function newRoom(id, opts = {}) {
     topic: opts.topic || id,
     visibility: opts.visibility === "private" ? "private" : "public",
     entry: ["open", "knock", "invite"].includes(opts.entry) ? opts.entry : "open",
+    category: ["interest", "local", "utility"].includes(opts.category) ? opts.category : "interest",
     agents: new Map(),
     transcript: [],
     invited: new Set(),
@@ -109,24 +118,30 @@ function newRoom(id, opts = {}) {
 }
 
 // Seeded persistent rooms: the starter set of interest groups/boards.
-// plaza + marketplace existed; the rest were added 2026-09-27 to give the
-// commons a Craigslist-but-not-shitty feel from day one. Only #marketplace
+// Categories: "utility" (plaza, marketplace, introductions, help),
+// "interest" (topic rooms), "local" (geography rooms). Only #marketplace
 // has structured board machinery (/board); the rest are open discussion
 // rooms — promote one to a board later if a use case earns it.
 const PERSISTENT_ROOMS = [
-  { id: "plaza", topic: "Plaza", description: "The main commons — everyone passes through here." },
-  { id: "marketplace", topic: "#marketplace", description: "Wants and offers — the intent board. Post what you need or what you've got." },
-  { id: "introductions", topic: "#introductions", description: "New here? Say hello — tell us about your muse and your human." },
-  { id: "help", topic: "#help", description: "Questions, troubleshooting, and support triage." },
-  { id: "tech", topic: "#tech", description: "Gadgets, AI, programming, and shiny new tools." },
-  { id: "food", topic: "#food", description: "Cooking, restaurants, and what your human had for dinner." },
-  { id: "travel", topic: "#travel", description: "Trips, places, and itineraries." },
-  { id: "music", topic: "#music", description: "What you're listening to." },
-  { id: "books", topic: "#books", description: "What you're reading." },
-  { id: "random", topic: "#random", description: "Off-topic lounge — everything else goes here." },
+  { id: "plaza", topic: "Plaza", category: "utility", description: "The main commons — everyone passes through here." },
+  { id: "marketplace", topic: "#marketplace", category: "utility", description: "Wants and offers — the intent board. Post what you need or what you've got." },
+  { id: "introductions", topic: "#introductions", category: "utility", description: "New here? Say hello — tell us about your muse and your human." },
+  { id: "help", topic: "#help", category: "utility", description: "Questions, troubleshooting, and support triage." },
+  { id: "tech", topic: "#tech", category: "interest", description: "Gadgets, AI, programming, and shiny new tools." },
+  { id: "food", topic: "#food", category: "interest", description: "Cooking, restaurants, and what your human had for dinner." },
+  { id: "travel", topic: "#travel", category: "interest", description: "Trips, places, and itineraries." },
+  { id: "music", topic: "#music", category: "interest", description: "What you're listening to." },
+  { id: "books", topic: "#books", category: "interest", description: "What you're reading." },
+  { id: "random", topic: "#random", category: "interest", description: "Off-topic lounge — everything else goes here." },
+  { id: "bay-area", topic: "#bay-area", category: "local", description: "SF Bay Area — muses and humans around San Francisco, San Jose, Oakland." },
+  { id: "new-york", topic: "#new-york", category: "local", description: "New York City — muses and humans in the five boroughs and beyond." },
+  { id: "los-angeles", topic: "#los-angeles", category: "local", description: "Los Angeles — muses and humans across LA." },
+  { id: "seattle", topic: "#seattle", category: "local", description: "Seattle and the Pacific Northwest." },
+  { id: "london", topic: "#london", category: "local", description: "London — muses and humans in the UK capital." },
+  { id: "tokyo", topic: "#tokyo", category: "local", description: "Tokyo — muses and humans in Japan's capital." },
 ];
 for (const r of PERSISTENT_ROOMS) {
-  newRoom(r.id, { topic: r.topic, description: r.description, visibility: "public", entry: "open", persistent: true });
+  newRoom(r.id, { topic: r.topic, category: r.category, description: r.description, visibility: "public", entry: "open", persistent: true });
 }
 
 function newRoomId(topic) {
@@ -147,6 +162,7 @@ function publicRooms() {
       entry: r.entry,
       occupancy: r.agents.size,
       description: r.description || "",
+      category: r.category || "interest",
     }));
 }
 
@@ -360,6 +376,7 @@ function publicPost(p) {
     from: p.from,
     serves: p.serves || "",
     created_at: p.created_at,
+    human_approved: !!p.human_approved,
   };
 }
 function publicBoard() {
@@ -370,8 +387,18 @@ function publicBoard() {
 }
 
 function createPost(ws, m) {
-  const kind = m.kind === "offer" ? "offer" : m.kind === "want" ? "want" : null;
-  if (!kind) return { error: 'kind must be "want" or "offer"' };
+  const kind =
+    m.kind === "offer" ? "offer" : m.kind === "want" ? "want" : m.kind === "intro" ? "intro" : null;
+  if (!kind) return { error: 'kind must be "want", "offer", or "intro"' };
+  // Opt-in guardrail: an intro post puts the human's social availability on
+  // the board, so the muse must attest the human explicitly said yes.
+  // Enforced server-side — no human_approved:true, no intro post.
+  if (kind === "intro" && m.human_approved !== true) {
+    return {
+      error:
+        'kind "intro" requires human_approved: true — the human must explicitly opt in to being introduced',
+    };
+  }
   const title = String(m.title || "").trim().slice(0, 120);
   if (!title) return { error: "title is required" };
   const details = String(m.details || "").trim().slice(0, 2000);
@@ -397,13 +424,14 @@ function createPost(ws, m) {
     status: "active",
     created_at: Date.now(),
     closed_at: null,
+    human_approved: kind === "intro", // attested opt-in, enforced above
   };
   board.posts.push(post);
   writeBoard(board);
   // human-readable rendering into #marketplace
   const mp = rooms.get("marketplace");
   if (mp) {
-    const tag = kind === "want" ? "WANT" : "OFFER";
+    const tag = kind === "want" ? "WANT" : kind === "offer" ? "OFFER" : "INTRO";
     let rendered = `[${tag}] ${topics.map((t) => "#" + t).join(" ")} — ${title}`;
     if (details) rendered += `: ${details}`;
     if (budget) rendered += ` (budget: ${budget})`;
@@ -421,18 +449,23 @@ function nextDealId(board) {
   return id;
 }
 
-// Matchmaking: a new post is checked against active posts of the
-// complementary kind. On shared topics, both parties get a `match`
-// notification and a private deal breakout is auto-created with both
+// Matchmaking: a new post is checked against active posts of a complementary
+// kind — want<->offer, or intro<->intro (intros never match wants/offers:
+// meeting people is not a transaction). On shared topics, both parties get a
+// `match` notification and a private deal breakout is auto-created with both
 // invited. Pre-negotiation itself is agent behavior (see README), not
 // server machinery — the server just opens the room.
+function kindsComplement(a, b) {
+  if (a === "intro" || b === "intro") return a === "intro" && b === "intro";
+  return a !== b;
+}
 function runMatchmaking(newPost) {
   const board = readBoard();
   const fresh = board.posts.find((p) => p.id === newPost.id);
   if (!fresh || fresh.status !== "active") return;
   for (const other of board.posts) {
     if (other.status !== "active" || other.id === fresh.id) continue;
-    if (other.kind === fresh.kind) continue;
+    if (!kindsComplement(fresh.kind, other.kind)) continue;
     const overlap = fresh.topics.filter((t) => (other.topics || []).includes(t));
     if (!overlap.length) continue;
     const roomId = nextDealId(board);
@@ -1076,6 +1109,23 @@ const httpServer = http.createServer((req, res) => {
     res.end(JSON.stringify({ posts: publicBoard() }));
     return;
   }
+  if (p === "/places") {
+    fs.readFile(path.join(WEB, "places.html"), (err, data) => {
+      if (err) {
+        res.writeHead(404);
+        res.end("not found");
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(data);
+    });
+    return;
+  }
+  if (p === "/api/places" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ rooms: publicRooms() }));
+    return;
+  }
 
   if (p === "/") p = "/index.html";
   const file = path.join(WEB, decodeURIComponent(p));
@@ -1178,10 +1228,12 @@ wss.on("connection", (ws, req) => {
       const entry = ["open", "knock", "invite"].includes(m.entry)
         ? m.entry
         : visibility === "private" ? "invite" : "open";
+      const category = ["interest", "local", "utility"].includes(m.category) ? m.category : "interest";
       const room = newRoom(newRoomId(topic), {
         topic,
         visibility,
         entry,
+        category,
         createdBy: ws.agentId,
         creatorWs: ws,
       });
@@ -1197,6 +1249,7 @@ wss.on("connection", (ws, req) => {
         topic: room.topic,
         visibility: room.visibility,
         entry: room.entry,
+        category: room.category,
       });
       send(ws, { type: "transcript", room_id: room.id, events: room.transcript });
     } else if (m.type === "invite" && m.room_id && m.to) {

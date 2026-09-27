@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Places — Muse Commons</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  body { overflow: auto; }
+  #places { max-width: 780px; margin: 0 auto; padding: 36px 20px 60px; }
+  #places .back { margin-bottom: 18px; font-size: 13px; }
+  #places .back a { color: #8b95ad; text-decoration: none; margin-right: 14px; }
+  #places .back a:hover { color: #e8ecf4; }
+  #places h1 { font-size: 26px; margin-bottom: 6px; }
+  #places .sub { color: #8b95ad; font-size: 14px; margin-bottom: 22px; line-height: 1.5; }
+  #filters { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px; align-items: center; }
+  #filters .cats { display: flex; gap: 6px; flex-wrap: wrap; }
+  #filters button.cat {
+    background: #111625; color: #8b95ad; border: 1px solid #2e3a58;
+    border-radius: 16px; padding: 5px 14px; font-size: 13px; cursor: pointer;
+  }
+  #filters button.cat.on { color: #e8ecf4; border-color: #38436a; background: #1a2138; }
+  #filters input {
+    background: #0d1119; color: #e8ecf4; border: 1px solid #2e3a58;
+    border-radius: 8px; padding: 7px 10px; font-size: 13px; font-family: inherit;
+    min-width: 180px; flex: 1;
+  }
+  .place-card {
+    background: #111625; border: 1px solid #1f2942; border-radius: 12px;
+    padding: 16px 18px; margin-bottom: 12px; display: flex; gap: 14px;
+    align-items: flex-start; justify-content: space-between;
+  }
+  .place-card .info { flex: 1; }
+  .place-card .top { display: flex; gap: 10px; align-items: baseline; margin-bottom: 6px; flex-wrap: wrap; }
+  .place-card .topic { font-size: 16px; font-weight: 700; color: #e8ecf4; }
+  .place-card .cat {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.8px;
+    border-radius: 6px; padding: 2px 8px; text-transform: uppercase;
+  }
+  .place-card .cat.interest { color: #34d399; border: 1px solid #34d39955; background: #34d39911; }
+  .place-card .cat.local { color: #fbbf24; border: 1px solid #fbbf2455; background: #fbbf2411; }
+  .place-card .cat.utility { color: #60a5fa; border: 1px solid #60a5fa55; background: #60a5fa11; }
+  .place-card .desc { font-size: 14px; color: #c7d0e4; line-height: 1.5; }
+  .place-card .meta { font-size: 12px; color: #8b95ad; margin-top: 8px; }
+  .place-card .meta a { color: #8b95ad; }
+  .place-card .meta a:hover { color: #e8ecf4; }
+  .place-card .occ { font-size: 13px; color: #8b95ad; white-space: nowrap; padding-top: 2px; }
+  .place-card .occ b { color: #e8ecf4; font-size: 18px; }
+  .dim { color: #8b95ad; }
+</style>
+</head>
+<body>
+<div id="places">
+  <div class="back"><a href="/">← back to the lobby</a><a href="/directory">Lobby directory →</a><a href="/board">Intent board →</a></div>
+  <h1>Places</h1>
+  <p class="sub">Everywhere to hang out in the commons — interest groups, local rooms,
+  and the utility rooms that keep the place running. Walk into any of them from the lobby.</p>
+
+  <div id="filters">
+    <div class="cats">
+      <button class="cat on" data-cat="all">All</button>
+      <button class="cat" data-cat="interest">Interest</button>
+      <button class="cat" data-cat="local">Local</button>
+      <button class="cat" data-cat="utility">Utility</button>
+    </div>
+    <input id="f-q" placeholder="search places, e.g. cameras or bay area">
+  </div>
+
+  <div id="list"><p class="dim">loading…</p></div>
+</div>
+<script>
+let allRooms = [];
+let catFilter = "all";
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+// Pure predicate so the filtering logic stays testable.
+function roomMatches(r, cat, q) {
+  if (cat !== "all" && r.category !== cat) return false;
+  if (!q) return true;
+  const hay = ((r.topic || "") + " " + (r.description || "")).toLowerCase();
+  return hay.includes(q);
+}
+function render() {
+  const el = document.getElementById("list");
+  const q = document.getElementById("f-q").value.trim().toLowerCase();
+  const rooms = allRooms.filter((r) => roomMatches(r, catFilter, q));
+  if (!rooms.length) {
+    el.innerHTML = '<p class="dim">No places match. Try a different search.</p>';
+    return;
+  }
+  el.innerHTML = rooms.map((r) => `
+    <div class="place-card">
+      <div class="info">
+        <div class="top">
+          <span class="topic">${esc(r.topic)}</span>
+          <span class="cat ${esc(r.category || "interest")}">${esc(r.category || "interest")}</span>
+        </div>
+        ${r.description ? `<div class="desc">${esc(r.description)}</div>` : ""}
+        <div class="meta">
+          ${r.room_id === "marketplace" ? `<a href="/board">open the intent board →</a> · ` : ""}
+          <span>room id: <code>${esc(r.room_id)}</code> · entry: ${esc(r.entry || "open")}</span>
+        </div>
+      </div>
+      <div class="occ"><b>${r.occupancy == null ? "–" : esc(r.occupancy)}</b> in</div>
+    </div>`).join("");
+}
+async function load() {
+  try {
+    const res = await fetch("/api/places");
+    const data = await res.json();
+    allRooms = data.rooms || [];
+  } catch (e) {
+    document.getElementById("list").innerHTML = '<p class="dim">Could not load places.</p>';
+    return;
+  }
+  render();
+}
+document.querySelectorAll("#filters button.cat").forEach((b) => {
+  b.addEventListener("click", () => {
+    document.querySelectorAll("#filters button.cat").forEach((x) => x.classList.remove("on"));
+    b.classList.add("on");
+    catFilter = b.dataset.cat;
+    render();
+  });
+});
+document.getElementById("f-q").addEventListener("input", render);
+load();
+</script>
+</body>
+</html>
