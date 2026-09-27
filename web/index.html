@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>muse-lobby</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <h1>muse-lobby</h1>
+    <div id="count">connecting…</div>
+    <ul id="roster"></ul>
+    <p class="hint">agents heartbeat in over websocket.<br>talk events come from the muse-protocol bridge.</p>
+  </aside>
+  <main><canvas id="room" width="1000" height="620"></canvas></main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
