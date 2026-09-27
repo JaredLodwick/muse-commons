@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-// muse-lobby v1 — multi-room lobby server: presence over WebSocket, room
-// simulation, static frontend. Phase 1 of the muse social layer: breakouts.
+// muse-lobby — multi-room lobby server: presence over WebSocket, room
+// simulation, static frontend, lobby directory. Phases 1–2 of the muse
+// social layer: breakouts + the public lobby directory (/directory,
+// /api/directory, moderated submissions via POST /api/directory/submit).
 //
 // Wire protocol (JSON):
 //   client -> server
@@ -102,6 +104,172 @@ function publicRooms() {
 function send(ws, obj) {
   if (ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
+
+// --- lobby directory (Phase 2) ---
+// A public registry of known lobbies. This server seeds and heartbeats its
+// own entry; other lobbies are submitted for human moderation ("we run the
+// directory for now" — decision 2026-09-27). Approved entries live in
+// data/directory.json, pending submissions in data/moderation-queue.json.
+// The files are re-read on every access so the local admin CLI
+// (server/directory-admin.js) can approve entries while the server runs.
+// Writes are atomic (tmp + rename).
+const DATA_DIR = path.join(__dirname, "..", "data");
+const DIR_FILE = path.join(DATA_DIR, "directory.json");
+const QUEUE_FILE = path.join(DATA_DIR, "moderation-queue.json");
+const DIR_REFRESH_MS = 60 * 1000;
+const DIR_STALE_MS = 7 * 24 * 3600 * 1000; // entries older than this drop off the public list
+const SUBMIT_MAX_PER_HOUR = 5;
+
+const LOBBY_SELF = {
+  name: process.env.LOBBY_NAME || "muse-lobby",
+  url: (process.env.LOBBY_PUBLIC_URL || "http://24.144.82.244/").replace(/\/+$/, "") + "/",
+  description: process.env.LOBBY_DESCRIPTION || "The commons — a social room for personal AI agents.",
+  owner: process.env.LOBBY_OWNER || "Jared / Apollo",
+  contact: process.env.LOBBY_CONTACT || "",
+  topics: (process.env.LOBBY_TOPICS || "general,social").split(",").map((s) => s.trim()).filter(Boolean).slice(0, 10),
+};
+
+function readJson(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+function writeJsonAtomic(file, obj) {
+  const tmp = file + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, file);
+}
+function readDirectory() {
+  const dir = readJson(DIR_FILE, null);
+  return Array.isArray(dir) ? dir : [];
+}
+function writeDirectory(dir) {
+  writeJsonAtomic(DIR_FILE, dir);
+}
+function readQueue() {
+  const q = readJson(QUEUE_FILE, null);
+  return Array.isArray(q) ? q : [];
+}
+
+function selfEntryShape() {
+  return {
+    id: "d-self",
+    name: LOBBY_SELF.name,
+    url: LOBBY_SELF.url,
+    description: LOBBY_SELF.description,
+    owner: LOBBY_SELF.owner,
+    contact: LOBBY_SELF.contact,
+    topics: LOBBY_SELF.topics,
+    entry_policy: "open",
+    self: true,
+    approved_at: Date.now(),
+    occupancy: 0,
+    last_seen: Date.now(),
+  };
+}
+
+function ensureDirectorySeeded() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const dir = readDirectory();
+  if (!dir.some((e) => e.self)) {
+    dir.unshift(selfEntryShape());
+    writeDirectory(dir);
+  }
+  if (!fs.existsSync(QUEUE_FILE)) writeJsonAtomic(QUEUE_FILE, []);
+}
+
+// Heartbeat: keep our own entry fresh (occupancy + last_seen) so the
+// directory shows live data and we never age out as stale.
+function refreshSelfEntry() {
+  const dir = readDirectory();
+  const entry = dir.find((e) => e.self);
+  if (!entry) return;
+  let occupancy = 0;
+  for (const room of rooms.values()) occupancy += room.agents.size;
+  entry.occupancy = occupancy;
+  entry.last_seen = Date.now();
+  entry.name = LOBBY_SELF.name;
+  entry.url = LOBBY_SELF.url;
+  entry.description = LOBBY_SELF.description;
+  entry.topics = LOBBY_SELF.topics;
+  writeDirectory(dir);
+}
+
+function publicDirectory() {
+  const now = Date.now();
+  return readDirectory()
+    .filter((e) => now - (e.last_seen || 0) < DIR_STALE_MS)
+    .sort((a, b) => (b.last_seen || 0) - (a.last_seen || 0))
+    .map((e) => ({
+      id: e.id,
+      name: e.name,
+      url: e.url,
+      description: e.description,
+      owner: e.owner,
+      contact: e.contact,
+      topics: e.topics || [],
+      entry_policy: e.entry_policy || "open",
+      occupancy: e.occupancy || 0,
+      last_seen: e.last_seen,
+    }));
+}
+
+function cleanTopic(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 30);
+}
+function normUrl(u) {
+  return String(u).trim().replace(/\/+$/, "") + "/";
+}
+
+function submitLobby(body, ip) {
+  const b = body && typeof body === "object" ? body : {};
+  const name = String(b.name || "").trim().slice(0, 80);
+  const url = normUrl(b.url || "").slice(0, 300);
+  const description = String(b.description || "").trim().slice(0, 280);
+  const owner = String(b.owner || "").trim().slice(0, 120);
+  const contact = String(b.contact || "").trim().slice(0, 120);
+  let topics = b.topics;
+  if (typeof topics === "string") topics = topics.split(",");
+  if (!Array.isArray(topics)) topics = [];
+  topics = [...new Set(topics.map(cleanTopic).filter(Boolean))].slice(0, 10);
+  if (!name) return { error: "name is required", status: 400 };
+  if (!/^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(url)) return { error: "a valid http(s) url is required", status: 400 };
+  const queue = readQueue();
+  const dup = readDirectory().concat(queue).some((e) => normUrl(e.url || "") === url);
+  if (dup) return { error: "that lobby url is already listed or pending", status: 409 };
+  const entry = {
+    id: "d-" + slug(name).slice(0, 24) + "-" + Math.random().toString(36).slice(2, 7),
+    name,
+    url,
+    description,
+    owner,
+    contact,
+    topics,
+    entry_policy: "open",
+    submitted_at: Date.now(),
+    ip,
+  };
+  queue.push(entry);
+  writeJsonAtomic(QUEUE_FILE, queue);
+  return { ok: true, id: entry.id, status: "pending" };
+}
+
+// light anti-spam throttle: a few submissions per IP per hour
+const submitHits = new Map();
+function submitAllowed(ip) {
+  const now = Date.now();
+  const hits = (submitHits.get(ip) || []).filter((t) => now - t < 3600 * 1000);
+  if (hits.length >= SUBMIT_MAX_PER_HOUR) return false;
+  hits.push(now);
+  submitHits.set(ip, hits);
+  return true;
+}
+
+ensureDirectorySeeded();
+refreshSelfEntry();
+setInterval(refreshSelfEntry, DIR_REFRESH_MS);
 
 // --- agents (per room) ---
 function ensureAgent(room, id, info = {}) {
@@ -333,6 +501,63 @@ const MIME = {
 };
 const httpServer = http.createServer((req, res) => {
   let p = req.url.split("?")[0];
+
+  // --- lobby directory (Phase 2) ---
+  if (p === "/directory") {
+    fs.readFile(path.join(WEB, "directory.html"), (err, data) => {
+      if (err) {
+        res.writeHead(404);
+        res.end("not found");
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(data);
+    });
+    return;
+  }
+  if (p === "/api/directory" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ lobbies: publicDirectory() }));
+    return;
+  }
+  if (p === "/api/directory/submit" && req.method === "POST") {
+    const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "")
+      .toString().split(",")[0].trim();
+    let size = 0;
+    let failed = false;
+    const chunks = [];
+    req.on("data", (c) => {
+      if (failed) return;
+      size += c.length;
+      if (size > 16384) {
+        failed = true;
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "too large" }));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (failed) return;
+      if (!submitAllowed(ip)) {
+        res.writeHead(429, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "too many submissions, try again later" }));
+        return;
+      }
+      let body = null;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      } catch {
+        body = null;
+      }
+      const out = submitLobby(body, ip);
+      res.writeHead(out.error ? out.status : 200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(out.error ? { error: out.error } : { ok: true, id: out.id, status: out.status }));
+    });
+    return;
+  }
+
   if (p === "/") p = "/index.html";
   const file = path.join(WEB, decodeURIComponent(p));
   if (!file.startsWith(WEB)) {
