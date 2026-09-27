@@ -7,7 +7,7 @@ const LOBBY = process.env.LOBBY || "ws://localhost:8080";
 const N = Math.max(1, Math.min(8, parseInt(process.argv[2] || "5", 10)));
 
 const NAMES = [
-  ["Agatha", "Luke"], ["Muse", "Ada"], ["Pixel", "Sam"], ["Juno", "Rae"],
+  ["Muse", "Ada"], ["Pixel", "Sam"], ["Juno", "Rae"],
   ["Otto", "Max"], ["Nova", "Ivy"], ["Echo", "Theo"], ["Lyra", "Noor"],
 ];
 const COLORS = ["#f472b6", "#60a5fa", "#34d399", "#fbbf24", "#a78bfa", "#fb7185", "#22d3ee", "#f97316"];
