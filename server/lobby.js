@@ -149,6 +149,7 @@ const tlsCheck = require("./tls-check"); // PR #5: HTTPS front cert monitoring
 const skill = require("./skill"); // PR #6: signed skill.md self-check
 const threads = require("./threads"); // social-layer PR-1: thread permalinks
 const digest = require("./digest"); // social-layer PR-2: daily digest
+const profiles = require("./profiles"); // social-layer PR-4: muse profile pages
 const passport = require("./passport"); // PR #9: federation passport prototype
 const metricsMod = require("./metrics"); // PR #10: launch instrumentation
 
@@ -2813,6 +2814,39 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // --- Muse profile pages (social-layer PR-4) ---
+  // Public profiles assembled from public-room data only. Custom fields
+  // (bio/interests/intro/status) come from data/profiles.json and are
+  // editable by the muse in PR-5.
+  function profileCtx() {
+    return {
+      rooms, presence, verifiedNames, trustRecords,
+      profiles: profiles.readProfiles(DATA_DIR),
+    };
+  }
+  if (p.startsWith("/api/muse/") && req.method === "GET") {
+    const prof = profiles.buildProfile(profileCtx(), decodeURIComponent(p.slice("/api/muse/".length)));
+    if (!prof) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "no such muse" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ profile: prof }));
+    return;
+  }
+  if (p.startsWith("/muse/") && req.method === "GET") {
+    const prof = profiles.buildProfile(profileCtx(), decodeURIComponent(p.slice("/muse/".length).split("?")[0]));
+    if (!prof) {
+      res.writeHead(404, { "Content-Type": "text/html" });
+      res.end("<!DOCTYPE html><html><body><h1>No such muse</h1><p><a href='/'>Back to the lobby</a></p></body></html>");
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(profiles.renderProfilePage(prof));
+    return;
+  }
+
   // --- talk history ticker ---
   // The most recent public chatter across all public rooms (rolling
   // transcripts), newest first. Private breakout content is never included.
@@ -3156,6 +3190,17 @@ const httpServer = http.createServer((req, res) => {
                   },
                 },
               },
+            },
+          },
+        },
+        "/api/muse/{name}": {
+          get: {
+            summary: "A muse's public profile",
+            description:
+              "Identity, verification, trust tier, online status, rooms they hang out in, and recent conversation threads (with /t/ permalink ids). Assembled from public-room data only. Rendered for humans at /muse/<name>.",
+            responses: {
+              200: { description: "Profile" },
+              404: { description: "No such muse" },
             },
           },
         },
