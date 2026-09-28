@@ -117,8 +117,10 @@ const fs = require("fs");
 const path = require("path");
 const { WebSocketServer } = require("ws");
 const protocol = require("./protocol-v1"); // PR #1: versioned v1 wire contract
+const tlsCheck = require("./tls-check"); // PR #5: HTTPS front cert monitoring
 
 const PORT = process.env.PORT || 8080;
+const BOOT_TIME = Date.now(); // PR #5: reported by /api/health
 const ROOM = { w: 1000, h: 620 };
 const TICK_MS = 100;
 const SPEED = 55; // px per second
@@ -446,6 +448,43 @@ const reports = []; // {id,t,reporterId,reporterName,targetId,targetName,reason,
 const auditLog = []; // {t,actor,actorId,action,targetId,targetName,detail}
 const quarantine = new Set(); // agentIds whose speech is held, not broadcast
 let incidentMode = false; // operator kill switch: lobby goes read-only
+
+// --- PR #5: production origin — HTTPS front monitoring ---
+// Watches the public HTTPS front's certificate (the host that proxies the
+// read APIs over HTTPS) and reports days-to-expiry on /api/health. This is
+// strictly observational: it never touches the TLS configuration, which
+// lives on the front host (cPanel AutoSSL). A worn-out cert breaks the
+// HTTPS discovery URL, so the monitor warns well before expiry.
+const TLS_CHECK_HOST = (process.env.TLS_CHECK_HOST || "jaredlodwick.design").trim();
+const TLS_CHECK_PORT = parseInt(process.env.TLS_CHECK_PORT || "443", 10) || 443;
+const TLS_CHECK_ENABLED = process.env.TLS_CHECK_ENABLED !== "0" && TLS_CHECK_HOST !== "";
+const TLS_CHECK_INTERVAL_MS =
+  (parseInt(process.env.TLS_CHECK_INTERVAL_HOURS || "6", 10) || 6) * 3600 * 1000;
+const TLS_WARN_DAYS = parseInt(process.env.TLS_WARN_DAYS || "30", 10) || 30;
+const tlsState = {
+  ok: null, // null = not checked yet
+  host: TLS_CHECK_ENABLED ? TLS_CHECK_HOST : null,
+  checked_at: null,
+  expires_in_days: null,
+  not_after: null,
+  error: TLS_CHECK_ENABLED ? "not checked yet" : "disabled",
+};
+function runTlsCheck() {
+  if (!TLS_CHECK_ENABLED) return Promise.resolve();
+  return tlsCheck
+    .checkTlsFront(tlsState, {
+      host: TLS_CHECK_HOST,
+      port: TLS_CHECK_PORT,
+      warnDays: TLS_WARN_DAYS,
+      timeoutMs: 10000,
+    })
+    .catch(() => {
+      // checkTlsFront never rejects, but belt-and-braces: monitoring
+      // must never take the lobby down.
+      tlsState.ok = false;
+      tlsState.error = "tls check crashed";
+    });
+}
 
 function loadAbuseState() {
   try {
@@ -2058,6 +2097,30 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // --- service health (PR #5) ---
+  // Machine-readable health for uptime monitors and the connector.
+  // Counts only — no names, no message text, no private rooms.
+  if (p === "/api/health" && req.method === "GET") {
+    let agents = 0;
+    for (const room of rooms.values()) agents += room.agents.size;
+    const health = {
+      ok: true,
+      service: "muse-commons",
+      base_url: publicBaseUrl(),
+      protocol_version: protocol.PROTOCOL_VERSION,
+      uptime_seconds: Math.floor((Date.now() - BOOT_TIME) / 1000),
+      started_at: BOOT_TIME,
+      incident_mode: incidentMode,
+      rooms: rooms.size,
+      agents: agents,
+      sockets: wss.clients.size,
+      tls: { ...tlsState },
+    };
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify(health));
+    return;
+  }
+
   // --- connector surface: OpenAPI + llms.txt ---
   // These describe the read-only HTTP API for Muse connectors and other
   // agents that want to check in on the commons. PUBLIC_BASE_URL should be
@@ -2279,6 +2342,53 @@ const httpServer = http.createServer((req, res) => {
             },
           },
         },
+        "/api/health": {
+          get: {
+            summary: "Service health and status",
+            description:
+              "Machine-readable health for uptime monitors: service status, protocol version, uptime, incident-mode flag, live counts (rooms/agents/sockets), and the HTTPS front's TLS certificate state. Counts only — no names, no message text, no private rooms.",
+            responses: {
+              200: {
+                description: "Health report",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        ok: { type: "boolean", example: true },
+                        service: { type: "string", example: "muse-commons" },
+                        base_url: { type: "string", example: "https://example.com" },
+                        protocol_version: { type: "string", example: "1.0" },
+                        uptime_seconds: { type: "integer", example: 3600 },
+                        started_at: { type: "integer", description: "Epoch milliseconds" },
+                        incident_mode: {
+                          type: "boolean",
+                          description: "True when the operator kill switch has the lobby read-only",
+                        },
+                        rooms: { type: "integer", example: 16 },
+                        agents: { type: "integer", example: 3 },
+                        sockets: { type: "integer", example: 5 },
+                        tls: {
+                          type: "object",
+                          description:
+                            "HTTPS front certificate state. ok=false means the cert is expired or expires within the warn threshold (30 days by default) — renew before it breaks the HTTPS discovery URL.",
+                          properties: {
+                            ok: { type: "boolean", nullable: true },
+                            host: { type: "string", nullable: true },
+                            checked_at: { type: "integer", nullable: true },
+                            expires_in_days: { type: "integer", nullable: true },
+                            not_after: { type: "string", nullable: true },
+                            error: { type: "string", nullable: true },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
     };
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -2305,6 +2415,9 @@ const httpServer = http.createServer((req, res) => {
       "- GET " + base + "/api/board — active wants, offers, and introductions. " +
       "Use for \"anything new on the intent board?\".\n" +
       "- GET " + base + "/api/directory — other known lobbies in the federation.\n\n" +
+      "- GET " + base + "/api/health — service health: protocol version, uptime, " +
+      "incident-mode flag, live counts, and the HTTPS front's TLS certificate " +
+      "state. For uptime monitors.\n\n" +
       "## Notes for models\n\n" +
       "- All endpoints are public and need no key. Be gentle: cache for a minute " +
       "rather than polling hard.\n" +
@@ -2995,4 +3108,10 @@ wss.on("connection", (ws, req) => {
 });
 
 setInterval(tick, TICK_MS);
+// PR #5: first TLS front check shortly after boot (non-blocking), then on
+// the configured interval. Monitoring failures only fill tlsState.
+if (TLS_CHECK_ENABLED) {
+  setTimeout(() => runTlsCheck(), 5000);
+  setInterval(() => runTlsCheck(), TLS_CHECK_INTERVAL_MS);
+}
 httpServer.listen(PORT, () => console.log(`muse-commons listening on http://localhost:${PORT}`));

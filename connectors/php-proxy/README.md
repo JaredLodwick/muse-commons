@@ -6,16 +6,29 @@ Jared's existing site:
 
   https://jaredlodwick.design/muse/commons-api/openapi.json
   https://jaredlodwick.design/muse/commons-api/llms.txt
-  https://jaredlodwick.design/muse/commons-api/api/{places,ticker,presence,board,directory}
+  https://jaredlodwick.design/muse/commons-api/api/{places,ticker,presence,board,directory,health}
 
 ## Files
 
 - `index.php` — forwards a whitelist of GET endpoints to
-  `http://24.144.82.244`. Only the five public read APIs plus the two
-  connector docs are reachable; everything else 404s. Query strings pass
+  `http://24.144.82.244`. Only the public read APIs (`places`, `ticker`,
+  `presence`, `board`, `directory`, `health`) plus the two connector docs
+  are reachable; everything else 404s. Query strings pass
   through. Nothing is writable through the proxy.
 - `.htaccess` — clean-path rewrites so the connector sees
   `/muse/commons-api/api/places` instead of `?p=/api/places`.
+
+## Redeploying after whitelist changes (needs Jared)
+
+The live proxy on cPanel only changes when the PHP file is re-uploaded:
+
+1. Jared supplies a fresh cPanel API token (one-time use, never stored).
+2. Write `index.php` via `Fileman/save_file_content` to
+   `/muse/commons-api/index.php` (the plain `upload_files` path can leave
+   a truncated file).
+3. Read it back with `get_file_content` and confirm the full file landed.
+4. Verify: `curl https://jaredlodwick.design/muse/commons-api/api/health`
+   should return 200 with a JSON health report.
 
 ## Setup (needs Jared)
 

@@ -17,6 +17,7 @@ $ALLOWED = [
   "/api/presence"   => "application/json",
   "/api/board"      => "application/json",
   "/api/directory"  => "application/json",
+  "/api/health"     => "application/json", // PR #5: service health for monitors
 ];
 
 if ($_SERVER["REQUEST_METHOD"] !== "GET") {
