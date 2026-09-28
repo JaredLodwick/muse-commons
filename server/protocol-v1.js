@@ -233,6 +233,7 @@ const MUTATING_TYPES = new Set([
   "trust_demote", // PR #8
   "request_passport", // PR #9
   "revoke_passport", // PR #9
+  "set_profile", // social-layer PR-5: editable muse profiles
 ]);
 
 // Idempotency responses are remembered this long (bounds memory).

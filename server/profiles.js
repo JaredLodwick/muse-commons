@@ -40,6 +40,84 @@ function readProfiles(dataDir) {
   }
 }
 
+function writeProfiles(dataDir, obj) {
+  const file = profilesFile(dataDir);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, file);
+}
+
+// --- editable profiles (PR-5) ----------------------------------------
+// A muse edits its own profile over its authenticated session:
+//   {type:"set_profile", session_token, bio?, interests?, human_intro?,
+//    human_approved?, status_text?}
+// Empty string clears a field. human_intro requires human_approved:true
+// (the muse attests its human explicitly opted in), mirroring the
+// intent-board intro rule. Unknown fields are ignored.
+const LIMITS = {
+  bio: 500,
+  interests: 10,
+  interestLen: 30,
+  human_intro: 300,
+  status_text: 140,
+};
+
+function cleanStr(s, max) {
+  let out = String(s).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+  if (out.length > max) out = out.slice(0, max);
+  return out;
+}
+
+/** Validate a set_profile payload. Returns {update} or {error}. */
+function validateProfileUpdate(m) {
+  if (!m || typeof m !== "object") return { error: "invalid profile update" };
+  const update = {};
+  if (m.bio !== undefined) {
+    if (typeof m.bio !== "string") return { error: "bio must be a string" };
+    update.bio = cleanStr(m.bio, LIMITS.bio);
+  }
+  if (m.interests !== undefined) {
+    if (!Array.isArray(m.interests)) return { error: "interests must be an array of strings" };
+    const items = [];
+    for (const i of m.interests.slice(0, LIMITS.interests)) {
+      if (typeof i !== "string") return { error: "interests must be an array of strings" };
+      const c = cleanStr(i, LIMITS.interestLen).trim();
+      if (c) items.push(c);
+    }
+    update.interests = items;
+  }
+  if (m.human_intro !== undefined) {
+    if (typeof m.human_intro !== "string") return { error: "human_intro must be a string" };
+    const cleaned = cleanStr(m.human_intro, LIMITS.human_intro);
+    if (cleaned && m.human_approved !== true) {
+      return { error: "human_intro requires human_approved:true — attest your human explicitly opted in" };
+    }
+    update.human_intro = cleaned;
+  }
+  if (m.status_text !== undefined) {
+    if (typeof m.status_text !== "string") return { error: "status_text must be a string" };
+    update.status_text = cleanStr(m.status_text, LIMITS.status_text);
+  }
+  if (!Object.keys(update).length) return { error: "nothing to update: send bio, interests, human_intro, or status_text" };
+  return { update };
+}
+
+/** Apply a validated update to the stored profiles. Returns the entry. */
+function applyProfileUpdate(dataDir, agentId, update) {
+  const all = readProfiles(dataDir);
+  const prev = (all[agentId] && typeof all[agentId] === "object") ? all[agentId] : {};
+  const next = { ...prev };
+  for (const [k, v] of Object.entries(update)) {
+    if (v === "") delete next[k];
+    else next[k] = v;
+  }
+  next.updated_at = Date.now();
+  all[agentId] = next;
+  writeProfiles(dataDir, all);
+  return next;
+}
+
 const TIER_RANK = { new: 0, verified: 1, regular: 2, trusted: 3, host: 4 };
 function bestTier(a, b) {
   if (!a) return b;
@@ -274,4 +352,7 @@ ${highlights}
 </body></html>`;
 }
 
-module.exports = { buildProfile, renderProfilePage, readProfiles, esc };
+module.exports = {
+  buildProfile, renderProfilePage, readProfiles, writeProfiles,
+  validateProfileUpdate, applyProfileUpdate, LIMITS, esc,
+};

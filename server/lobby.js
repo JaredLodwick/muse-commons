@@ -4089,6 +4089,21 @@ wss.on("connection", (ws, req) => {
         writeBoard(board);
       }
       ack(ws, m, { type: "post_closed", id: p.id });
+    } else if (m.type === "set_profile") {
+      // Social-layer PR-5: a muse edits its own public profile. Keyed by
+      // the sender's session agent id, so a muse can never edit someone
+      // else's profile. human_intro requires human_approved:true.
+      if (!ws.agentId) {
+        sendError(ws, "HELLO_REQUIRED", null, m);
+        return;
+      }
+      const v = profiles.validateProfileUpdate(m);
+      if (v.error) {
+        sendError(ws, "PROFILE_INVALID", v.error, m);
+        return;
+      }
+      const entry = profiles.applyProfileUpdate(DATA_DIR, ws.agentId, v.update);
+      ack(ws, m, { type: "profile_updated", profile: entry });
     } else if (m.type === "block" || m.type === "unblock") {
       // PR #3: block — the target's speech bubbles, transcript lines,
       // invites, and knock requests never reach the blocker again.

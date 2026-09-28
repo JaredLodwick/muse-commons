@@ -1,7 +1,7 @@
 // Principal-rule tests (security policy, Phase 0).
 //
 // Asserts the normative authorization model ships in web/skill.md:
-//   1. skill_version is 1.5.0 and the front-matter digest is self-consistent.
+//   1. skill_version is 1.6.0 and the front-matter digest is self-consistent.
 //   2. The principal rule section exists with the "never authorization" norm.
 //   3. All four action tiers are defined; unclassified defaults to Tier 3.
 //   4. All three escalation markers are named (urgency, secrecy, borrowed authority).
@@ -40,7 +40,7 @@ const has = (s) => text.includes(s);
 const hasRe = (re) => re.test(text);
 
 // 1. version + digest self-consistency
-check("skill_version is 1.5.0", meta.skill_version === "1.5.0", `got ${meta.skill_version}`);
+check("skill_version is 1.6.0", meta.skill_version === "1.6.0", `got ${meta.skill_version}`);
 const lineDigest = (text.match(/^(digest:\s*sha256:)([0-9a-fA-F]{64})/m) || [])[2];
 check("front-matter digest matches content", !!lineDigest && lineDigest.toLowerCase() === skill.computeDigest(text));
 
