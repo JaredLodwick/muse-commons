@@ -116,7 +116,7 @@ function verifySkillFiles(skillFile, sigFile) {
 }
 
 /** Machine-readable discovery document served at /.well-known/muse-commons.json. */
-function wellKnownDocument(status, baseUrl) {
+function wellKnownDocument(status, baseUrl, passportIssuerPubkey) {
   const base = String(baseUrl || "").replace(/\/+$/, "");
   const meta = status.meta || {};
   const skillUrl = meta.canonical_url || (base ? base + "/skill.md" : null);
@@ -139,6 +139,10 @@ function wellKnownDocument(status, baseUrl) {
     signature_url: meta.signature_url || (base ? base + "/skill.md.sig" : null),
     operator_pubkey: meta.operator_pubkey || null,
     operator_key_id: meta.operator_key_id || null,
+    // PR #9: the key that signs federation passports. Usually the same
+    // operator key as above, but advertised separately so key rotation
+    // for one use does not silently break the other.
+    passport_issuer_pubkey: passportIssuerPubkey || null,
     protocol_version: meta.protocol_version || "1.0",
     skill_signature_ok: status.ok === true,
     conformance: origin ? origin + "/conform-skill.js" : null,

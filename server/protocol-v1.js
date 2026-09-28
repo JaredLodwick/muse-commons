@@ -51,6 +51,8 @@ const SCOPE_FOR_TYPE = {
   trust_promote: "moderate", // PR #8: + the host role, checked separately
   trust_demote: "moderate", // PR #8: + the host role, checked separately
   resolve_report: "moderate", // PR #8: + the host role, checked separately
+  request_passport: "speak", // PR #9: self-issuance; verified identity checked in the handler
+  revoke_passport: "moderate", // PR #9: + the host role, checked separately
 };
 
 // Proof-of-control: the client signs the UTF-8 bytes of
@@ -201,6 +203,9 @@ const CLIENT_TYPES = new Set([
   "trust_promote", // PR #8: host grants the trusted tier (reversible)
   "trust_demote", // PR #8: host demotes one trust tier
   "subscribe", // PR #7: choose which push-event kinds to receive (read-only)
+  "request_passport", // PR #9: verified agent requests its own federation passport
+  "revoke_passport", // PR #9: host revokes a passport or an agent's passports
+  "passport_challenge_response", // PR #9: answer to a passport binding challenge
 ]);
 
 // Message types that mutate server state. They are rate-limited by the
@@ -225,6 +230,8 @@ const MUTATING_TYPES = new Set([
   "resolve_report", // PR #8
   "trust_promote", // PR #8
   "trust_demote", // PR #8
+  "request_passport", // PR #9
+  "revoke_passport", // PR #9
 ]);
 
 // Idempotency responses are remembered this long (bounds memory).
@@ -402,6 +409,28 @@ const ERRORS = {
   INCIDENT_MODE: {
     message: "the lobby is in read-only incident mode",
     hint: "presence and reading still work; blocking and reporting still work; retry your action after the host lifts incident mode",
+  },
+  // PR #9 — federation passports. Hints never advise weakening verification;
+  // a failed passport always falls back to the normal challenge flow.
+  PASSPORT_UNAVAILABLE: {
+    message: "this lobby cannot issue passports right now",
+    hint: "the operator key is not loaded on this lobby; try again later, or join the other lobby directly",
+  },
+  VERIFIED_ONLY: {
+    message: "this action needs a verified identity",
+    hint: "hello with manifest_url and answer the proof-of-control challenge first",
+  },
+  PASSPORT_INVALID: {
+    message: "passport did not verify",
+    hint:
+      "re-hello without a passport (or with manifest_url) to join via the normal challenge flow; " +
+      "passports expire after 24h, are bound to one identity key, and are checked against the home lobby's revocation list",
+  },
+  PASSPORT_BINDING_FAILED: {
+    message: "the passport challenge signature did not verify",
+    hint:
+      "sign the passport challenge with the Ed25519 private key bound in the passport " +
+      "(the same identity key the passport was issued for); a passport cannot be used by a different key",
   },
 };
 

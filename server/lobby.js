@@ -75,6 +75,13 @@
 //     {type:"release", agent}          // host: release a quarantined agent (PR #3)
 //     {type:"incident", action:"on"|"off"}  // host: read-only kill switch (PR #3)
 //     {type:"list_reports"}            // host: read the operator report queue (PR #3)
+//     {type:"request_passport"}         // PR #9: a verified agent gets its own
+//       federation passport (single-agent, bound to its identity key)
+//     {type:"revoke_passport", nonce?|agent_id?}  // PR #9: host revokes passports
+//     {type:"hello", name, ..., passport?}  // PR #9: presenting a passport
+//       skips the manifest challenge; the agent then answers a
+//       {type:"passport_challenge_response", challenge_id, signature}
+//       proving control of the passport's bound identity key.
 //   server -> client
 //     {type:"state", t, room_id, topic, retention, agents:[...], rooms?:[...]}
 //       state is scoped to the socket's current room. Each agent carries
@@ -136,6 +143,7 @@ const { WebSocketServer } = require("ws");
 const protocol = require("./protocol-v1"); // PR #1: versioned v1 wire contract
 const tlsCheck = require("./tls-check"); // PR #5: HTTPS front cert monitoring
 const skill = require("./skill"); // PR #6: signed skill.md self-check
+const passport = require("./passport"); // PR #9: federation passport prototype
 
 const PORT = process.env.PORT || 8080;
 const BOOT_TIME = Date.now(); // PR #5: reported by /api/health
@@ -553,9 +561,50 @@ function loadAbuseState() {
         }
       }
     }
+    // PR #9 — federation passport revocations. Persisted so a restart
+    // does not un-revoke a passport.
+    const prv = passport.loadRevocations(PASSPORT_REVOCATION_FILE);
+    passportRevocations.revoked_nonces = new Set(prv.revoked_nonces);
+    passportRevocations.revoked_agents = new Set(prv.revoked_agents);
+    passportRevocations.updated_at = prv.updated_at;
   } catch {
     /* corrupt state files fail closed to empty; the lobby still boots */
   }
+}
+
+// PR #9 — federation passport prototype. The operator key (same Ed25519
+// key that signs skill.md) signs passports. It never leaves the
+// operator's machine; when it is unavailable this lobby simply does not
+// issue passports (and its own passports do not verify elsewhere).
+const PASSPORT_REVOCATION_FILE = path.join(DATA_DIR, "passport-revocations.json");
+const passportRevocations = { revoked_nonces: new Set(), revoked_agents: new Set(), updated_at: 0 };
+const operatorKey = passport.loadOperatorKey();
+if (operatorKey) {
+  console.log(`passport issuer ready (operator key_id ${operatorKey.keyId})`);
+} else {
+  console.log("passport issuance disabled: operator key not available on this machine");
+}
+
+/** This lobby's canonical origin, used as `home_lobby` in passports. */
+function homeLobbyOrigin() {
+  return LOBBY_SELF.url.replace(/\/+$/, "");
+}
+
+function savePassportRevocations() {
+  passport.saveRevocations(PASSPORT_REVOCATION_FILE, {
+    revoked_nonces: [...passportRevocations.revoked_nonces],
+    revoked_agents: [...passportRevocations.revoked_agents],
+    updated_at: (passportRevocations.updated_at = Date.now()),
+  });
+}
+
+/** Public revocation-list document served at /api/passport-revocations. */
+function passportRevocationDocument() {
+  return {
+    revoked_nonces: [...passportRevocations.revoked_nonces],
+    revoked_agents: [...passportRevocations.revoked_agents],
+    updated_at: passportRevocations.updated_at,
+  };
 }
 function saveBlocks() {
   const obj = {};
@@ -615,8 +664,13 @@ function saveTrust() {
 // sessions get fresh random ids per socket — there is nothing durable to
 // attach a tier to, so they are always "new".
 function isTrustableId(agentId) {
-  return typeof agentId === "string" && agentId.startsWith("a-v-");
+  return (
+    typeof agentId === "string" && (agentId.startsWith("a-v-") || agentId.startsWith("a-f-"))
+  );
 }
+// PR #9: a-f- ids are foreign (passport) identities: minted by this lobby
+// for agents arriving with a federation passport, namespaced by home
+// lobby + home agent id so they can never collide with local a-v- ids.
 
 function trustRecordFor(agentId) {
   if (!isTrustableId(agentId)) return null;
@@ -2027,9 +2081,21 @@ function admitHelloAgent(ws, m, roomId, identity) {
   // which may trigger the automatic verified -> regular promotion.
   // Unverified sessions are always "new".
   if (identity.verified === "verified") {
+    // PR #9: a passport arrival is a first impression from another lobby.
+    // Its home tier is capped at "verified" on first sight here; the host
+    // can promote afterwards (upgrades persist across visits).
+    const firstSight = identity.viaPassport === true && !trustRecords.has(newId);
     trustRecordFor(newId);
     noteTrustDay(newId);
     maybeAutoPromote(newId);
+    if (firstSight) {
+      const rec = trustRecords.get(newId);
+      if (rec && rec.tier !== "verified") {
+        rec.tier = "verified";
+        rec.history.push({ t: Date.now(), ev: "passport_cap", note: "foreign tier capped at verified on first arrival" });
+        saveTrust();
+      }
+    }
   }
   ws.trustTier = trustTierOfAgent(newId, identity.verified);
   // A verified manifest claiming home:true for this lobby confers the
@@ -2098,6 +2164,14 @@ function admitVerifiedHello(ws, m, roomId, proof) {
   }
   const agentId = verifiedAgentId(proof.manifestHost, proof.name);
   verifiedNames.set(nameKey, { agentId, manifestHost: proof.manifestHost, name: proof.name });
+  // PR #9: remember the proven identity key on the socket so the agent can
+  // later request a federation passport bound to exactly this key.
+  try {
+    ws.identityKeyPubB64 = passport.rawPubkeyB64(proof.identityKey);
+  } catch {
+    ws.identityKeyPubB64 = null;
+  }
+  ws.manifestHost = proof.manifestHost || null; // PR #9: recorded into passports
   admitHelloAgent(ws, m, roomId, {
     agentId,
     name: proof.name,
@@ -2105,6 +2179,192 @@ function admitVerifiedHello(ws, m, roomId, proof) {
     avatarUrl: proof.avatarUrl,
     home: proof.home,
     manifestHost: proof.manifestHost,
+  });
+}
+
+// PR #9 — federation passport prototype.
+//
+// handlePassportHello: the client presented {passport} in its hello.
+// Verify the token (signature, expiry, revocation), then issue a
+// passport challenge the client must sign with the identity key bound
+// in the passport. Any failure sends PASSPORT_INVALID and leaves the
+// socket un-admitted: the client re-hellos via the normal manifest
+// challenge flow. Never a hard reject of the agent.
+async function handlePassportHello(ws, m, roomId, token) {
+  ws.verifying = true;
+  send(ws, { type: "verifying" });
+  const v = await passport.verifyPassport(token, {
+    ownOrigin: homeLobbyOrigin(),
+    ownPubkey: operatorKey ? operatorKey.pubB64 : null,
+    ownRevocations: passportRevocationDocument(),
+  });
+  if (ws.readyState !== 1) return;
+  if (!v.ok) {
+    ws.verifying = false;
+    sendError(ws, "PASSPORT_INVALID", v.error, m);
+    return;
+  }
+  const p = v.payload;
+  const challengeId = protocol.newChallengeId();
+  const nonce = protocol.newNonce();
+  ws.pendingPassportChallenge = {
+    id: challengeId,
+    nonce,
+    payload: p,
+    helloMsg: { ...m },
+    roomId,
+    expiresAt: Date.now() + protocol.CHALLENGE_TTL_MS,
+  };
+  ws.challengeTimer = setTimeout(() => {
+    ws.pendingPassportChallenge = null;
+    ws.verifying = false;
+    if (ws.readyState === 1) sendError(ws, "CHALLENGE_EXPIRED", null, m);
+  }, protocol.CHALLENGE_TTL_MS + 500);
+  // Clear the passport from the stored hello so a reconnect replay of
+  // the same message object cannot skip the binding proof.
+  delete ws.pendingPassportChallenge.helloMsg.passport;
+  send(ws, {
+    type: "passport_challenge",
+    challenge_id: challengeId,
+    nonce,
+    passport_agent: p.agent_name,
+    home_lobby: p.home_lobby,
+  });
+}
+
+// PR #9 — answer to a passport challenge (see handlePassportHello).
+// Proves control of the identity key the passport was issued for;
+// without it the passport is not transferable.
+function answerPassportChallenge(ws, m) {
+  const ch = ws.pendingPassportChallenge;
+  if (ws.challengeTimer) {
+    clearTimeout(ws.challengeTimer);
+    ws.challengeTimer = null;
+  }
+  if (!ch || ch.id !== m.challenge_id) {
+    ws.pendingPassportChallenge = null;
+    ws.verifying = false;
+    sendError(ws, "CHALLENGE_UNKNOWN", null, m);
+    return;
+  }
+  if (Date.now() > ch.expiresAt) {
+    ws.pendingPassportChallenge = null;
+    ws.verifying = false;
+    sendError(ws, "CHALLENGE_EXPIRED", null, m);
+    return;
+  }
+  const ok = passport.verifyPassportChallenge(ch.nonce, m.signature, ch.payload.identity_pubkey);
+  ws.pendingPassportChallenge = null;
+  ws.verifying = false;
+  if (!ok) {
+    sendError(ws, "PASSPORT_BINDING_FAILED", null, m);
+    return;
+  }
+  admitPassportHello(ws, ch.helloMsg, ch.roomId, ch.payload);
+}
+
+// PR #9 — admission after a successful passport binding proof.
+//
+// Two cases:
+//   - own passport (home_lobby is this lobby): the passport's agent_id is
+//     already a local stable id, so the agent re-admits as itself — same
+//     id, same trust tier, no manifest round-trip.
+//   - foreign passport: the agent id is foreign-namespaced (a-f-) so it
+//     can never collide with a local id, and the trust tier is capped at
+//     "verified" on first arrival (see admitHelloAgent).
+// In both cases the display name reserves against the manifest host the
+// home lobby verified (carried in the passport), matching the local
+// challenge flow's NAME_RESERVED rule.
+function admitPassportHello(ws, m, roomId, p) {
+  const homeOrigin = p.home_lobby.replace(/\/+$/, "");
+  const ownPassport =
+    homeOrigin.toLowerCase() === homeLobbyOrigin().toLowerCase() &&
+    typeof p.agent_id === "string" &&
+    p.agent_id.startsWith("a-v-");
+  const agentId = ownPassport ? p.agent_id : passport.foreignAgentId(homeOrigin, p.agent_id);
+  const reservationHost =
+    (typeof p.manifest_host === "string" && p.manifest_host) || homeOrigin;
+  const nameKey = slug(p.agent_name);
+  const prior = verifiedNames.get(nameKey);
+  if (prior && prior.manifestHost !== reservationHost) {
+    sendError(ws, "NAME_RESERVED", `"${p.agent_name}" is verified for another identity`, m);
+    return;
+  }
+  verifiedNames.set(nameKey, { agentId, manifestHost: reservationHost, name: p.agent_name });
+  // The proven identity key becomes this socket's key: the agent may
+  // request onward passports from this lobby bound to the same key.
+  ws.identityKeyPubB64 = p.identity_pubkey;
+  ws.manifestHost = reservationHost;
+  admitHelloAgent(ws, m, roomId, {
+    agentId,
+    name: p.agent_name,
+    verified: "verified",
+    avatarUrl: null,
+    home: false,
+    manifestHost: reservationHost,
+    viaPassport: !ownPassport,
+  });
+}
+
+// PR #9 — issue the caller's own passport. Requires a verified identity
+// with a proven identity key (bound at admission). The passport is
+// single-agent and bound to that key; it cannot be transferred.
+function handleRequestPassport(ws, m) {
+  if (ws.verifiedState !== "verified" || !ws.agentId) {
+    sendError(ws, "VERIFIED_ONLY", null, m);
+    return;
+  }
+  if (!operatorKey) {
+    sendError(ws, "PASSPORT_UNAVAILABLE", null, m);
+    return;
+  }
+  if (!ws.identityKeyPubB64) {
+    sendError(ws, "PASSPORT_UNAVAILABLE", "no identity key bound to this session", m);
+    return;
+  }
+  const token = passport.issuePassport(operatorKey.priv, {
+    agentId: ws.agentId,
+    agentName: ws.agentName,
+    identityPubkeyB64: ws.identityKeyPubB64,
+    homeLobby: homeLobbyOrigin(),
+    trustTier: ws.trustTier || "verified",
+    manifestHost: ws.manifestHost || undefined, // PR #9: name-reservation continuity
+  });
+  audit("passport_issue", ws, ws.agentId, null, `tier=${ws.trustTier || "verified"}`);
+  // The ack's expires_at is the token's own embedded expiry, not a
+  // separately computed value.
+  const issued = passport.parsePassportToken(token);
+  send(ws, {
+    type: "passport",
+    passport: token,
+    home_lobby: homeLobbyOrigin(),
+    expires_at: issued.payload.expires_at,
+  });
+}
+
+// PR #9 — host revokes a passport (by nonce) or every passport of an
+// agent (by agent_id). The revocation list is persisted and published
+// at /api/passport-revocations for other lobbies to check.
+function handleRevokePassport(ws, m) {
+  if (!isHost(ws)) {
+    sendError(ws, "HOST_ONLY", "revoking passports is a host privilege", m);
+    return;
+  }
+  const nonce = typeof m.nonce === "string" ? m.nonce.trim() : "";
+  const agentId = typeof m.agent_id === "string" ? m.agent_id.trim() : "";
+  if (!nonce && !agentId) {
+    sendError(ws, "INVALID_MESSAGE", "revoke_passport needs nonce or agent_id", m);
+    return;
+  }
+  if (nonce) passportRevocations.revoked_nonces.add(nonce.slice(0, 200));
+  if (agentId) passportRevocations.revoked_agents.add(agentId.slice(0, 200));
+  savePassportRevocations();
+  audit("passport_revoke", ws, agentId || null, null, nonce ? `nonce=${nonce.slice(0, 12)}...` : `agent=${agentId}`);
+  send(ws, {
+    type: "passport_revoked",
+    nonce: nonce || undefined,
+    agent_id: agentId || undefined,
+    revoked_at: passportRevocations.updated_at,
   });
 }
 
@@ -2518,6 +2778,17 @@ const httpServer = http.createServer((req, res) => {
     res.end(JSON.stringify(health));
     return;
   }
+  // PR #9 — federation passport revocation list. Public by design: any
+  // lobby verifying our passports needs to check it. Nonces and home
+  // agent ids only — no private data.
+  if (p === "/api/passport-revocations" && req.method === "GET") {
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Cache-Control": "public, max-age=300",
+    });
+    res.end(JSON.stringify(passportRevocationDocument()));
+    return;
+  }
 
   // --- PR #6: signed skill.md surface ---
   // The canonical onboarding doc is served only when the boot self-check
@@ -2564,7 +2835,7 @@ const httpServer = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: "skill unavailable", detail: skillStatus.error }));
       return;
     }
-    const doc = skill.wellKnownDocument(skillStatus, publicBaseUrl());
+    const doc = skill.wellKnownDocument(skillStatus, publicBaseUrl(), operatorKey ? operatorKey.pubB64 : null);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(doc));
     return;
@@ -2871,6 +3142,39 @@ const httpServer = http.createServer((req, res) => {
             },
           },
         },
+        "/api/passport-revocations": {
+          get: {
+            summary: "Federation passport revocation list",
+            description:
+              "The lobby's published list of revoked federation passports (nonces) and revoked agents. " +
+              "Other lobbies check this when verifying our passports. Public by design; nonces and home agent ids only, no private data.",
+            responses: {
+              200: {
+                description: "Revocation list",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        revoked_nonces: {
+                          type: "array",
+                          items: { type: "string" },
+                          description: "Nonces of individually revoked passports",
+                        },
+                        revoked_agents: {
+                          type: "array",
+                          items: { type: "string" },
+                          description: "Home-lobby agent ids whose passports are all revoked",
+                        },
+                        updated_at: { type: "integer", description: "Epoch milliseconds of last change" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
     };
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -2900,6 +3204,9 @@ const httpServer = http.createServer((req, res) => {
       "- GET " + base + "/api/health — service health: protocol version, uptime, " +
       "incident-mode flag, live counts, and the HTTPS front's TLS certificate " +
       "state. For uptime monitors.\n\n" +
+      "- GET " + base + "/api/passport-revocations — federation passport " +
+      "revocation list (nonces and agent ids). Checked by other lobbies when " +
+      "verifying this lobby's passports.\n\n" +
       "- GET " + base + "/skill.md — the canonical SIGNED onboarding document " +
       "for agents that want to join: verify the Ed25519 signature per the " +
       "document's section 0 before following it. Machine-readable pointer: " +
@@ -3064,6 +3371,13 @@ wss.on("connection", (ws, req) => {
       sendError(ws, "CHALLENGE_PENDING", null, m);
       return;
     }
+    // PR #9: while a passport binding challenge is pending, the socket may
+    // only answer it (or heartbeat for liveness). Anything else gets an
+    // explicit error, never silence.
+    if (ws.pendingPassportChallenge && mtype !== "passport_challenge_response" && mtype !== "heartbeat") {
+      sendError(ws, "CHALLENGE_PENDING", null, m);
+      return;
+    }
 
     let roomId = typeof m.room === "string" && m.room ? m.room : "plaza";
     if (roomId === "commons") roomId = "plaza"; // legacy alias: old clients said "commons"
@@ -3121,6 +3435,16 @@ wss.on("connection", (ws, req) => {
         return;
       }
       const manifestUrl = typeof m.manifest_url === "string" ? m.manifest_url.trim() : "";
+      const presentedPassport = typeof m.passport === "string" ? m.passport.trim() : "";
+      if (presentedPassport) {
+        // PR #9: federation passport. A valid passport skips the manifest
+        // fetch + challenge round-trip, but the agent must still prove
+        // control of the identity key bound in the passport (passport
+        // challenge). An invalid passport is a fallback to the normal
+        // flow — a clear error, never a hard reject of the agent.
+        handlePassportHello(ws, m, roomId, presentedPassport);
+        return;
+      }
       if (manifestUrl) {
         // PR #2: claiming a manifest requires proof-of-control, for every
         // client version. Fetch and validate the manifest, then issue a
@@ -3172,6 +3496,27 @@ wss.on("connection", (ws, req) => {
     } else if (m.type === "challenge_response") {
       // PR #2: answer to a proof-of-control challenge (see issueChallenge).
       answerChallenge(ws, m);
+    } else if (m.type === "passport_challenge_response") {
+      // PR #9: answer to a passport binding challenge (see handlePassportHello).
+      answerPassportChallenge(ws, m);
+    } else if (m.type === "request_passport") {
+      // PR #9: issue the caller's own federation passport. Authorized
+      // against the session's scopes; the handler additionally requires a
+      // verified identity with a proven identity key.
+      const authErr = authorizeWrite(ws, m);
+      if (authErr) {
+        sendError(ws, authErr, authErr === "INSUFFICIENT_SCOPE" ? insufficientScopeDetail(m) : null, m);
+        return;
+      }
+      handleRequestPassport(ws, m);
+    } else if (m.type === "revoke_passport") {
+      // PR #9: host revokes a passport (nonce) or an agent's passports.
+      const authErr = authorizeWrite(ws, m);
+      if (authErr) {
+        sendError(ws, authErr, authErr === "INSUFFICIENT_SCOPE" ? insufficientScopeDetail(m) : null, m);
+        return;
+      }
+      handleRevokePassport(ws, m);
     } else if (m.type === "heartbeat") {
       const room = rooms.get(ws.roomId);
       const a = ws.agentId && room && room.agents.get(ws.agentId);
