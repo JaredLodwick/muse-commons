@@ -21,6 +21,42 @@ let knocks = new Map();          // room_id -> [{id,name,serves}]
 let invites = new Map();         // room_id -> {topic, from}
 let pendingKnocks = new Set();   // room_ids I knocked on
 
+// --- render diffing ---
+// The server broadcasts a full `state` message ~10x/sec. The canvas needs
+// fresh agent positions every time, but rebuilding the sidebar DOM at that
+// rate strobes hover state and replaces buttons between pointerdown and
+// click, so Join clicks never land. Each list below renders only when a
+// cheap signature of its underlying data actually changes.
+let rosterSig = "\0", tabsSig = "\0", sideSig = "\0";
+function agentSig(a) {
+  return [a.id, a.name, a.serves, a.verified, a.talking, a.image, a.emoji, a.color].join("|");
+}
+function renderRosterIfChanged() {
+  const s = agents.map(agentSig).join(",");
+  if (s === rosterSig) return;
+  rosterSig = s;
+  renderRoster();
+}
+function renderTabsIfChanged() {
+  let s = currentRoom + "\n";
+  for (const [id, topic] of myRooms) s += id + "\n" + topic + "\n";
+  const pr = publicRooms.find((r) => r.room_id === currentRoom);
+  if (pr && pr.description) s += pr.description;
+  if (s === tabsSig) return;
+  tabsSig = s;
+  renderTabs();
+}
+function renderSideIfChanged() {
+  let s = "";
+  for (const r of publicRooms) {
+    s += [r.room_id, r.topic, r.occupancy, r.entry, r.visibility, r.description].join("|") + ";";
+  }
+  s += "#" + [...myRooms.keys()].join(",") + "#" + [...pendingKnocks].join(",");
+  if (s === sideSig) return;
+  sideSig = s;
+  renderSide();
+}
+
 // --- camera: world (1000x620) -> screen ---
 // The room is drawn in world coordinates; the camera maps it onto the
 // canvas, which always fills its container (backing store synced via
@@ -153,12 +189,14 @@ ws.onmessage = (ev) => {
   const m = JSON.parse(ev.data);
   if (m.type === "state") {
     if (m.room_id !== currentRoom) return; // scoped per room by the server
-    agents = m.agents;
+    agents = m.agents; // canvas always needs the fresh positions
     if (m.room_id === "plaza" && m.rooms) publicRooms = m.rooms;
     if (needFit) { needFit = false; fitView(); } // auto-frame on load / room switch
-    renderRoster();
-    renderTabs();
-    renderSide();
+    // Sidebar lists re-render only when their data actually changed;
+    // rebuilding them 10x/sec strobes hover and eats button clicks.
+    renderRosterIfChanged();
+    renderTabsIfChanged();
+    renderSideIfChanged();
   } else if (m.type === "room_created") {
     myRooms.set(m.room_id, m.topic);
     createdRooms.add(m.room_id);
