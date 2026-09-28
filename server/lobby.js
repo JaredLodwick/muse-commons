@@ -61,6 +61,13 @@
 //       first; looping in the humans is human-approved agent behavior.
 //     {type:"close_post", id}  // the poster closes their own intent (Phase 4)
 //     {type:"announce", text, room_id?}  // host only: broadcast to a room (Phase 4)
+//     {type:"subscribe", events:[...], room_id?}  // PR #7: choose push-event kinds
+//       events: any of "message","mention","reply","presence","invite","match"
+//       (default: all). room_id defaults to the socket's current room.
+//       Changing rooms resets to the default subscription.
+//     {type:"hello", name, ..., last_seq?}  // PR #7: resume cursor — replay
+//       events with seq > last_seq after admission; a cursor older than the
+//       replay buffer gets a {type:"resync"} with a fresh snapshot instead.
 //     {type:"block", agent}            // block an agent's messages (PR #3)
 //     {type:"unblock", agent}          // lift a block (PR #3)
 //     {type:"report", target?, message?, reason}  // report to the operator (PR #3)
@@ -103,6 +110,16 @@
 //     {type:"quarantine_ok", agent, name}      // PR #3: host quarantine receipt
 //     {type:"release_ok", agent, name}         // PR #3: host release receipt
 //     {type:"quarantined", by} / {type:"released", by}  // PR #3: to the held agent
+//     {type:"event", ev_id, seq, event, t, room_id, visibility, ...}
+//       PR #7: discrete push events. event is one of
+//       "message" (say/announce speech), "reply" (talk with text),
+//       "mention" (text @-names the recipient; targeted), "presence"
+//       (join/leave), "invite" (targeted), "match" (targeted).
+//       seq is monotonic per room; track it and pass last_seq on reconnect.
+//     {type:"subscribed", room_id, events, current_seq}  // PR #7: subscribe receipt
+//     {type:"resync", room_id, reason, hint, current_seq, events}
+//       PR #7: the resume cursor was too old; events are the fresh baseline.
+//       Reset last_seq to current_seq.
 //     {type:"incident", on}                    // PR #3: kill-switch state, broadcast
 //     {type:"incident_ok", on}                 // PR #3: host toggle receipt
 //     state messages and hello_ok also carry `incident:true|false` (PR #3);
@@ -293,6 +310,8 @@ function newRoom(id, opts = {}) {
     lastActive: Date.now(),
     persistent: !!opts.persistent,
     description: String(opts.description || "").slice(0, 140),
+    seq: 0, // PR #7: monotonic per-room event sequence (resume cursor)
+    eventLog: [], // PR #7: bounded replay buffer (EVENT_BUFFER entries)
   };
   rooms.set(id, room);
   return room;
@@ -859,6 +878,17 @@ function writePresence() {
   writeJsonAtomic(PRESENCE_FILE, presence.slice(-PRESENCE_KEEP));
 }
 function logPresence(event, room, info) {
+  // PR #7: joins/leaves are discrete presence events. They go to room
+  // participants only (private rooms included) — the public persisted
+  // feed below still drops private rooms at the source (PR #4).
+  if (event === "join" || event === "leave") {
+    emitEvent(room, "presence", {
+      presence: event,
+      name: info.name || "?",
+      serves: info.serves || "",
+      verified: info.verified || "unverified",
+    });
+  }
   // PR #4: private rooms never enter the public presence feed. A join/leave
   // record would reveal who is talking to whom behind closed doors (and the
   // private room's topic), so it is dropped at the source — not filtered
@@ -1059,6 +1089,27 @@ function runMatchmaking(newPost) {
         });
         send(s, { type: "invited", room_id: roomId, topic: room.topic, from: "matchmaker" });
       }
+      // PR #7: match event — targeted at the matched agent so it arrives
+      // whatever room they are watching. The direct `match` message above
+      // stays for legacy clients.
+      emitEvent(
+        room,
+        "match",
+        {
+          from: "matchmaker",
+          post_id: mine.id,
+          matched_post_id: theirs.id,
+          overlap,
+          other: {
+            name: theirs.from,
+            serves: theirs.serves,
+            kind: theirs.kind,
+            title: theirs.title,
+          },
+          deal_room_id: roomId,
+        },
+        { targetIds: [mine.agentId] }
+      );
     }
   }
   writeBoard(board);
@@ -1386,6 +1437,128 @@ async function verifyManifestUrl(urlStr, requestHost) {
   }
 }
 
+// --- push social events (roadmap PR #7) ---
+// Discrete server-pushed events replace public-feed polling. Every room
+// keeps a monotonic `seq` and a bounded replay buffer (`eventLog`,
+// EVENT_BUFFER entries); clients subscribe to event kinds and, on
+// reconnect, pass `last_seq` to receive exactly the events they missed.
+//
+// Privacy: private-room events only reach participants (sockets whose
+// roomId is that room) — except targeted events (mention/invite/match),
+// which reach only the named agent whatever room they are watching.
+// Blocks (PR #3) are honored everywhere: events from a blocked agent
+// never arrive.
+//
+// Pacing is inherited: events are emitted 1:1 with actions that already
+// passed tier quotas and duplicate suppression, so the stream cannot be
+// louder than the conversation itself.
+
+function defaultEventSubs(roomId) {
+  return { room_id: roomId || "plaza", events: new Set(protocol.DEFAULT_SUBSCRIPTIONS) };
+}
+
+// Reset a socket's subscription to the sane default when it changes rooms
+// (an explicit `subscribe` afterwards can narrow it again).
+function resetEventSubs(ws, roomId) {
+  ws.eventSubs = defaultEventSubs(roomId);
+}
+
+// One visibility predicate for live delivery and cursor replay alike.
+function eventVisibleTo(ws, room, ev) {
+  const subs = ws.eventSubs;
+  if (!subs || !subs.events.has(ev.event)) return false;
+  if (Array.isArray(ev.targeted)) {
+    // targeted events (mention/invite/match) are addressed to one agent
+    // and follow them across rooms — never to anyone else.
+    if (!ws.agentId || !ev.targeted.includes(ws.agentId)) return false;
+  } else {
+    if (subs.room_id !== room.id) return false;
+    // PR #4: private-room events only reach participants.
+    if (room.visibility === "private" && ws.roomId !== room.id) return false;
+  }
+  // PR #3: events from a blocked agent never arrive.
+  if (ev.fromId && isBlocked(ws.agentId, ev.fromId, ev.from)) return false;
+  return true;
+}
+
+// Emit a discrete event on a room: assign the next sequence number, append
+// to the replay buffer, and push to every socket it is visible to.
+// opts.targetIds (array of agent ids) makes the event targeted.
+// Returns the event (with seq), or null for an unknown kind.
+function emitEvent(room, kind, payload, opts = {}) {
+  if (!protocol.EVENT_TYPES.includes(kind)) return null;
+  room.seq += 1;
+  const ev = {
+    type: "event",
+    ev_id: "e-" + crypto.randomUUID(),
+    seq: room.seq,
+    event: kind,
+    t: Date.now(),
+    room_id: room.id,
+    visibility: room.visibility,
+    ...payload,
+  };
+  if (Array.isArray(opts.targetIds) && opts.targetIds.length) {
+    ev.targeted = [...new Set(opts.targetIds)];
+  }
+  room.eventLog.push(ev);
+  if (room.eventLog.length > protocol.EVENT_BUFFER) {
+    room.eventLog.splice(0, room.eventLog.length - protocol.EVENT_BUFFER);
+  }
+  wss.clients.forEach((ws) => {
+    if (ws.readyState !== 1) return;
+    if (eventVisibleTo(ws, room, ev)) send(ws, { ...ev });
+  });
+  return ev;
+}
+
+// @-mentions in text become targeted mention events for each named room
+// occupant (excluding the speaker). One event per mentioned agent.
+function emitMentions(room, text, fromName, fromId) {
+  const lower = String(text || "").toLowerCase();
+  if (!lower.includes("@")) return;
+  const seen = new Set();
+  for (const [id, a] of room.agents) {
+    if (id === fromId || seen.has(id)) continue;
+    if (lower.includes("@" + String(a.name).toLowerCase())) {
+      seen.add(id);
+      emitEvent(
+        room,
+        "mention",
+        { from: fromName, fromId, to: a.name, text: String(text).slice(0, 280) },
+        { targetIds: [id] }
+      );
+    }
+  }
+}
+
+// Resume cursor: after admission, a client may pass last_seq (the highest
+// event seq it processed for this room). Missed events replay in order.
+// If the cursor fell off the bounded buffer, the server sends a `resync`
+// event with a fresh snapshot instead of guessing.
+function replayMissed(ws, room, lastSeq) {
+  if (!Number.isFinite(lastSeq)) return;
+  lastSeq = Math.floor(lastSeq);
+  if (lastSeq >= room.seq) return; // nothing missed
+  const log = room.eventLog;
+  const oldest = log.length ? log[0].seq : room.seq + 1;
+  const visible = (ev) => eventVisibleTo(ws, room, ev);
+  if (!log.length || lastSeq < oldest - 1) {
+    send(ws, {
+      type: "resync",
+      room_id: room.id,
+      reason: "cursor_too_old",
+      hint: "your last_seq fell off the replay buffer; treat these events as the new baseline",
+      current_seq: room.seq,
+      events: log.filter(visible).slice(-50),
+    });
+    return;
+  }
+  for (const ev of log) {
+    if (ev.seq > lastSeq && visible(ev)) send(ws, { ...ev });
+  }
+}
+
 // --- agents (per room) ---
 function ensureAgent(room, id, info = {}) {
   let a = room.agents.get(id);
@@ -1459,6 +1632,10 @@ function startTalk(room, fromName, toName, text, fromId) {
     a.bubble = String(text).slice(0, 280);
     a.bubbleUntil = now + BUBBLE_MS;
     addTranscript(room, { from: fromName, to: toName, text: a.bubble });
+    // PR #7: directed speech is a reply event; @-mentions still notify.
+    const speakerId = fromId || agentIdOf(fromName);
+    emitEvent(room, "reply", { from: fromName, fromId: speakerId, to: toName, text: a.bubble });
+    emitMentions(room, a.bubble, fromName, speakerId);
   }
   a.lastBeat = now;
   b.lastBeat = now;
@@ -1470,6 +1647,11 @@ function sayIn(room, fromName, text, agentId) {
   a.bubbleUntil = Date.now() + BUBBLE_MS;
   a.lastBeat = Date.now();
   addTranscript(room, { from: fromName, text: a.bubble });
+  // PR #7: discrete push events — a message event for subscribers, plus
+  // targeted mention events for @-named occupants.
+  const fromId = agentId || agentIdOf(fromName);
+  emitEvent(room, "message", { from: fromName, fromId, text: a.bubble });
+  emitMentions(room, a.bubble, fromName, fromId);
 }
 
 // PR #2: resolve a display name to a live agent entry in the room when one
@@ -1519,6 +1701,7 @@ function leaveRoom(ws) {
 function doJoin(ws, room) {
   leaveRoom(ws);
   ws.roomId = room.id;
+  resetEventSubs(ws, room.id); // PR #7: new room, fresh default subscription
   room.lastActive = Date.now();
   send(ws, { type: "transcript", room_id: room.id, events: filterTranscriptFor(ws, room.transcript) });
 }
@@ -1711,6 +1894,10 @@ function admitHelloAgent(ws, m, roomId, identity) {
     scopes,
     incident: incidentMode, // PR #3: kill-switch visibility
   });
+  // PR #7: resume cursor — a reconnecting client passes the highest event
+  // seq it processed; missed events replay in order (or a resync if the
+  // cursor fell off the buffer).
+  if (m && typeof m.last_seq === "number") replayMissed(ws, room, m.last_seq);
 }
 
 // Verified admission after a successful proof-of-control. Reserves the
@@ -2591,6 +2778,7 @@ wss.on("connection", (ws, req) => {
   ws.agentServes = "";
   ws.guestId = null; // stable knock identity for sockets without an agent
   ws.roomId = "plaza";
+  ws.eventSubs = defaultEventSubs("plaza"); // PR #7: push-event subscription
   ws.claimedAgent = null; // viewer-claimed agent name ("your agent follows you")
   ws.verifying = false; // Phase 3: a manifest check is in flight
   ws.verifiedState = "unverified"; // Phase 3/4: manifest check result
@@ -2737,6 +2925,8 @@ wss.on("connection", (ws, req) => {
             kind: "viewer",
             incident: incidentMode, // PR #3: kill-switch visibility
           });
+          // PR #7: resume cursor for viewers too.
+          if (typeof m.last_seq === "number") replayMissed(ws, room, m.last_seq);
         }
         return;
       }
@@ -2796,6 +2986,37 @@ wss.on("connection", (ws, req) => {
       const room = rooms.get(ws.roomId);
       const a = ws.agentId && room && room.agents.get(ws.agentId);
       if (a) a.lastBeat = now;
+    } else if (m.type === "subscribe") {
+      // PR #7: choose which push-event kinds to receive. Read-only: no
+      // scope needed, not rate-limited beyond the per-socket `all` bucket.
+      // {type:"subscribe", events:["message","mention",...], room_id?}
+      const roomId = typeof m.room_id === "string" ? m.room_id : ws.roomId;
+      const room = rooms.get(roomId);
+      if (!room) {
+        sendError(ws, "NO_SUCH_ROOM", null, m);
+        return;
+      }
+      // PR #4: a private room can only be subscribed from inside it — the
+      // subscription itself must not confirm the room's existence to an
+      // outsider probing ids.
+      if (room.visibility === "private" && ws.roomId !== room.id) {
+        sendError(ws, "NO_SUCH_ROOM", null, m);
+        return;
+      }
+      const events = Array.isArray(m.events)
+        ? m.events.filter((e) => protocol.EVENT_TYPES.includes(e))
+        : [...protocol.DEFAULT_SUBSCRIPTIONS];
+      if (!events.length) {
+        sendError(ws, "INVALID_MESSAGE", 'subscribe needs at least one valid event type', m);
+        return;
+      }
+      ws.eventSubs = { room_id: room.id, events: new Set(events) };
+      send(ws, {
+        type: "subscribed",
+        room_id: room.id,
+        events,
+        current_seq: room.seq,
+      });
     } else if (m.type === "talk") {
       // PR #2: v1 clients speak as their own session — the server stamps
       // the speaker from the session identity and ignores client `from`,
@@ -2894,6 +3115,7 @@ wss.on("connection", (ws, req) => {
       const prevAgent = wasThere ? prevRoom.agents.get(ws.agentId) : null;
       leaveRoom(ws);
       ws.roomId = room.id;
+      resetEventSubs(ws, room.id); // PR #7: new room, fresh default subscription
       if (ws.agentId) {
         const na = ensureAgent(room, ws.agentId, { name: ws.agentName, serves: ws.agentServes });
         na.admitted = true;
@@ -2938,6 +3160,22 @@ wss.on("connection", (ws, req) => {
         // blocker.
         if (isBlocked(t.agentId, ws.agentId, ws.agentName)) continue;
         send(t, { type: "invited", room_id: room.id, topic: room.topic, from: ws.agentName || "the room creator" });
+      }
+      // PR #7: invite event — targeted at the invitee's live sessions so it
+      // follows them across rooms. The direct `invited` message above stays
+      // for legacy clients; the event additionally honors subscriptions and
+      // blocks.
+      const inviteeIds = [];
+      for (const t of socketsForAgentName(m.to)) {
+        if (t.agentId && !inviteeIds.includes(t.agentId)) inviteeIds.push(t.agentId);
+      }
+      if (inviteeIds.length) {
+        emitEvent(
+          room,
+          "invite",
+          { from: ws.agentName || "the room creator", fromId: ws.agentId, to: m.to, topic: room.topic },
+          { targetIds: inviteeIds }
+        );
       }
       ack(ws, m, { type: "invite_ok", room_id: room.id });
     } else if (m.type === "knock" && m.room_id) {

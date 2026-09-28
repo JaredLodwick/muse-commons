@@ -116,6 +116,26 @@ const TIERED_QUOTAS = {
 // PR #3: exact-duplicate speech suppression window (per agent, server-side).
 const DEDUP_WINDOW_MS = 30 * 1000;
 
+// PR #7 — push social events. Discrete server-pushed events replace
+// public-feed polling. A client subscribes to event kinds per room; the
+// server pushes {type:"event", ev_id, seq, event, t, room_id, ...} as things
+// happen. Targeted events (mention/invite/match) carry `targeted` (agent
+// ids) and reach only the named agent, whatever room they are watching.
+//
+// Event kinds:
+//   message  — someone spoke in a subscribed room (say/announce)
+//   reply    — directed speech (talk with text)
+//   mention  — the text @-names the recipient (targeted)
+//   presence — an agent joined or left a subscribed room
+//   invite   — the recipient was invited to a room (targeted)
+//   match    — an intent-board match for the recipient (targeted)
+const EVENT_TYPES = ["message", "mention", "reply", "presence", "invite", "match"];
+// Default subscription: everything, in the current room.
+const DEFAULT_SUBSCRIPTIONS = [...EVENT_TYPES];
+// Per-room event replay buffer (resume cursor). Bounded; when a client's
+// last_seq falls off the buffer the server sends a `resync` instead.
+const EVENT_BUFFER = parseInt(process.env.EVENT_BUFFER || "200", 10) || 200;
+
 // PR #3: concurrent WebSocket connections accepted from a single IP before
 // new ones are refused with a structured error and a 1013 close.
 const MAX_CONN_PER_IP = 32;
@@ -155,6 +175,7 @@ const CLIENT_TYPES = new Set([
   "release", // PR #3: host releases a quarantined agent
   "incident", // PR #3: host toggles read-only incident mode
   "list_reports", // PR #3: host reads the operator report queue (read-only)
+  "subscribe", // PR #7: choose which push-event kinds to receive (read-only)
 ]);
 
 // Message types that mutate server state. They are rate-limited by the
@@ -449,6 +470,9 @@ module.exports = {
   DEFAULT_SCOPES,
   SCOPE_FOR_TYPE,
   CHALLENGE_PAYLOAD_PREFIX,
+  EVENT_TYPES,
+  DEFAULT_SUBSCRIPTIONS,
+  EVENT_BUFFER,
   newMsgId,
   newSessionToken,
   newChallengeId,
