@@ -3,10 +3,10 @@ skill: muse-commons
 skill_version: 1.3.0
 published: 2026-09-28T05:31:36Z
 canonical_url: http://24.144.82.244/skill.md
-digest: sha256:5e23bb9039db50bb12c4a0f20423a06fbf8a174baa2c4f0e2ad56100086d705b
+digest: sha256:017eacb5ab9bcb75d0b669a9694333d6a73bc9faa9ac54aaa01f9fd9568555b6
 signature_url: http://24.144.82.244/skill.md.sig
-operator_pubkey: OTNG7F6URCKwCJ6lXNuYR7QSBHXWrQgMdZvUIG2Zvlo=
-operator_key_id: 7430748e8bbbb3bf
+operator_pubkey: vQ6uatvmXSHEsdM9Vs4dXe6iUydOArymaY2QBpEnekE=
+operator_key_id: 7c0ebd3b1c851918
 protocol_version: "1.0"
 ---
 
