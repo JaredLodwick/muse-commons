@@ -75,16 +75,24 @@ body {
 }
 #side li:hover, #knocks li:hover, #invites li:hover { background: rgba(255, 255, 255, 0.055); }
 
-#roster {
-  list-style: none; flex: 1; overflow-y: auto; min-height: 60px;
-  display: flex; flex-direction: column; gap: 2px;
+/* ---------- right panel: people + messages ---------- */
+#people {
+  list-style: none; display: flex; flex-direction: column; gap: 2px;
 }
-#roster li {
+#people li.person {
   display: flex; align-items: center; gap: 9px;
   padding: 7px 9px; border-radius: 9px; font-size: 14px;
   transition: background 0.15s ease;
 }
-#roster li:hover { background: rgba(255, 255, 255, 0.045); }
+#people li.person.here:hover { background: rgba(255, 255, 255, 0.045); }
+#people li.person.away { opacity: 0.55; font-size: 13px; cursor: default; }
+.dot.on { background: #34d399; box-shadow: 0 0 6px rgba(52, 211, 153, 0.7); }
+.dot.off { background: #5b6578; }
+.psec {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 1.4px;
+  color: #5b6578; margin: 12px 6px 3px;
+}
+.lastseen { margin-left: auto; white-space: nowrap; }
 .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .ava {
   width: 24px; height: 24px; border-radius: 50%; object-fit: cover; flex-shrink: 0;
@@ -110,7 +118,7 @@ button.mini.go { border-color: #34d39955; color: #34d399; }
 button.mini.go:hover { background: #1d3a2f; }
 .hint { color: #5b6578; font-size: 12px; line-height: 1.5; margin-top: 12px; }
 
-/* ---------- right panel: presence + recent chatter ---------- */
+/* ---------- right panel ---------- */
 #panel-right {
   width: 216px;
   flex-shrink: 0;
@@ -121,19 +129,6 @@ button.mini.go:hover { background: #1d3a2f; }
   flex-direction: column;
   overflow-y: auto;
 }
-#presence { list-style: none; display: flex; flex-direction: column; gap: 2px; }
-#presence li {
-  padding: 5px 8px; font-size: 12px; white-space: nowrap;
-  overflow: hidden; text-overflow: ellipsis;
-  border-left: 2px solid #2e3a58; margin-left: 6px; padding-left: 8px;
-  border-radius: 0 6px 6px 0;
-}
-#presence li:hover { background: rgba(255, 255, 255, 0.03); }
-#presence li.pev-join { border-left-color: #34d399; }
-#presence li.pev-leave { border-left-color: #5b6578; }
-#presence .pdot { font-size: 10px; }
-#presence .pnm { color: #c7d0e4; font-weight: 600; }
-
 #recent { list-style: none; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
 #recent li.dim { padding: 4px 8px; font-size: 12px; }
 .rc {

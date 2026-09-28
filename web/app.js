@@ -1,16 +1,23 @@
 const canvas = document.getElementById("room");
 const ctx = canvas.getContext("2d");
 const stage = document.getElementById("stage");
-const rosterEl = document.getElementById("roster");
+const peopleEl = document.getElementById("people");
 const countEl = document.getElementById("count");
 const tabsEl = document.getElementById("tabs");
 const sideEl = document.getElementById("side");
 const knocksEl = document.getElementById("knocks");
 const invitesEl = document.getElementById("invites");
 const recentEl = document.getElementById("recent");
-const presenceEl = document.getElementById("presence");
+const recentH = document.getElementById("recent-h");
+const peopleH = document.getElementById("people-h");
 const errEl = document.getElementById("err");
 let agents = [];
+
+// Latest feed payloads (all rooms). The right panel scopes them to the
+// room being viewed: Messages filters to the room (plaza shows all), and
+// the People away list is drawn from the unfiltered presence feed.
+let chatterEvents = [];
+let presenceEvents = [];
 
 let currentRoom = "plaza";
 let currentTopic = "Plaza";
@@ -27,15 +34,23 @@ let pendingKnocks = new Set();   // room_ids I knocked on
 // rate strobes hover state and replaces buttons between pointerdown and
 // click, so Join clicks never land. Each list below renders only when a
 // cheap signature of its underlying data actually changes.
-let rosterSig = "\0", tabsSig = "\0", sideSig = "\0";
+let peopleSig = "\0", tabsSig = "\0", sideSig = "\0";
 function agentSig(a) {
   return [a.id, a.name, a.serves, a.verified, a.talking, a.image, a.emoji, a.color].join("|");
 }
-function renderRosterIfChanged() {
-  const s = agents.map(agentSig).join(",");
-  if (s === rosterSig) return;
-  rosterSig = s;
-  renderRoster();
+// People covers the current room's agents plus the commons-wide away
+// list, so the signature folds both in.
+function peopleDataSig() {
+  let s = "cur=" + currentRoom + "|";
+  s += agents.map(agentSig).join(",") + "|";
+  s += awayAgents().map((a) => [a.name, a.serves, a.verified, a.t, a.event, a.room].join("~")).join(",");
+  return s;
+}
+function renderPeopleIfChanged() {
+  const s = peopleDataSig();
+  if (s === peopleSig) return;
+  peopleSig = s;
+  renderPeople();
 }
 function renderTabsIfChanged() {
   let s = currentRoom + "\n";
@@ -47,7 +62,9 @@ function renderTabsIfChanged() {
   renderTabs();
 }
 function renderSideIfChanged() {
-  let s = "";
+  // currentRoom is part of the signature: the active-room highlight and the
+  // viewing/go buttons must refresh the moment the viewer switches rooms.
+  let s = "cur=" + currentRoom + ";";
   for (const r of publicRooms) {
     s += [r.room_id, r.topic, r.occupancy, r.entry, r.visibility, r.description].join("|") + ";";
   }
@@ -194,7 +211,7 @@ ws.onmessage = (ev) => {
     if (needFit) { needFit = false; fitView(); } // auto-frame on load / room switch
     // Sidebar lists re-render only when their data actually changed;
     // rebuilding them 10x/sec strobes hover and eats button clicks.
-    renderRosterIfChanged();
+    renderPeopleIfChanged();
     renderTabsIfChanged();
     renderSideIfChanged();
   } else if (m.type === "room_created") {
@@ -232,6 +249,14 @@ function switchRoom(roomId, topic) {
   agents = [];
   needFit = true; // re-frame the camera on the new room's agents
   fitView(); // frame the world immediately (agents arrive with the next state)
+  // Refresh navigation highlights and re-scope the right-panel feeds now;
+  // the 10Hz state and 15s polls will keep them fresh afterwards.
+  renderTabsIfChanged();
+  renderSideIfChanged();
+  renderRecent();
+  renderPeopleIfChanged();
+  loadChatter();
+  loadPresence();
   ws.send(JSON.stringify({ type: "hello", kind: "viewer", room: roomId }));
 }
 
@@ -250,31 +275,39 @@ function renderTabs() {
 
 function renderSide() {
   sideEl.innerHTML = "";
-  const others = publicRooms.filter((r) => r.room_id !== "plaza");
-  if (!others.length) {
+  // Rooms directory: plaza first as the explicit way home, then every
+  // public breakout. The current room is highlighted and not clickable.
+  const rows = [];
+  const plaza = publicRooms.find((r) => r.room_id === "plaza");
+  if (plaza) rows.push(plaza);
+  else rows.push({ room_id: "plaza", topic: myRooms.get("plaza") || "Plaza", occupancy: null, entry: "open", description: "" });
+  for (const r of publicRooms) if (r.room_id !== "plaza") rows.push(r);
+  for (const r of rows) {
     const li = document.createElement("li");
-    li.className = "dim";
-    li.textContent = "no breakouts yet, start one!";
-    sideEl.append(li);
-    return;
-  }
-  for (const r of others) {
-    const li = document.createElement("li");
+    const isCurrent = r.room_id === currentRoom;
+    if (isCurrent) li.classList.add("room-active");
     if (r.description) li.title = r.description;
+    const marker = document.createElement("span");
+    marker.className = "room-marker";
+    marker.textContent = r.room_id === "plaza" ? "🌐" : "💬";
+    li.append(marker);
     const nm = document.createElement("span");
     nm.className = "nm";
     nm.textContent = r.topic;
     li.append(nm);
     const meta = document.createElement("span");
     meta.className = "sv";
-    meta.textContent = `${r.occupancy} in · ${r.entry}`;
+    meta.textContent = r.occupancy == null ? "" : `${r.occupancy} in`;
     li.append(meta);
-    const joined = myRooms.has(r.room_id);
-    if (joined) {
+    if (isCurrent) {
+      const here = document.createElement("span");
+      here.className = "here";
+      here.textContent = "viewing";
+      li.append(here);
+    } else if (r.room_id === "plaza" || myRooms.has(r.room_id)) {
       const b = document.createElement("button");
       b.className = "mini";
-      b.textContent = r.room_id === currentRoom ? "viewing" : "go";
-      b.disabled = r.room_id === currentRoom;
+      b.textContent = "go";
       b.onclick = () => switchRoom(r.room_id, r.topic);
       li.append(b);
     } else if (pendingKnocks.has(r.room_id)) {
@@ -372,16 +405,23 @@ function renderInvites() {
   invitesEl.style.display = n ? "" : "none";
 }
 
-// --- recent chatter: latest public messages across all rooms ---
+// --- recent chatter: latest public messages, scoped to the viewed room ---
 // Polls /api/ticker every 15s and renders the newest few quietly in place.
 // Private breakout rooms are never included (server-side). No marquee.
-function renderRecent(events) {
+// In the plaza the feed covers every room; in a breakout it filters to
+// that room only, and the header names the scope.
+function scopedToRoom(list) {
+  if (currentRoom === "plaza") return list;
+  return list.filter((e) => e.room_id === currentRoom);
+}
+function renderRecent() {
+  recentH.textContent = currentRoom === "plaza" ? "Messages" : "Messages · " + currentTopic;
   recentEl.innerHTML = "";
-  const evs = (events || []).slice(0, 5);
+  const evs = scopedToRoom(chatterEvents).slice(0, 5);
   if (!evs.length) {
     const li = document.createElement("li");
     li.className = "dim";
-    li.textContent = "nothing said yet";
+    li.textContent = currentRoom === "plaza" ? "nothing said yet" : "nothing said in " + currentTopic + " yet";
     recentEl.append(li);
     return;
   }
@@ -409,7 +449,8 @@ async function loadChatter() {
   try {
     const r = await fetch("/api/ticker?limit=10");
     const j = await r.json();
-    renderRecent(j.events || []);
+    chatterEvents = j.events || [];
+    renderRecent();
   } catch {
     /* keep the previous content on failure */
   }
@@ -417,9 +458,29 @@ async function loadChatter() {
 loadChatter();
 setInterval(loadChatter, 15000);
 
-// --- presence feed: who came and went, across all rooms ---
-// Polls /api/presence every 15s. Unfiltered by room on purpose: this is the
-// "don't make me monitor" feed, so arrivals anywhere in the commons show up.
+// --- room directory: keep the Rooms list fresh in any view ---
+// The websocket `state` only carries the room list for the plaza, so poll
+// /api/places to keep occupancy counts and new rooms current everywhere.
+async function loadRooms() {
+  try {
+    const r = await fetch("/api/places");
+    const j = await r.json();
+    if (Array.isArray(j.rooms)) {
+      publicRooms = j.rooms;
+      renderSideIfChanged();
+      renderTabsIfChanged();
+    }
+  } catch {
+    /* keep the previous list on failure */
+  }
+}
+loadRooms();
+setInterval(loadRooms, 15000);
+
+// --- presence source for the away list ---
+// Polls /api/presence every 15s and caches the GLOBAL feed (all rooms,
+// unfiltered on purpose). renderPeople derives the away group from it:
+// distinct agents seen recently who are not in the current room.
 function fmtAgo(t) {
   const s = Math.max(0, Math.round((Date.now() - t) / 1000));
   if (s < 10) return "just now";
@@ -430,43 +491,34 @@ function fmtAgo(t) {
   if (h < 24) return h + "h ago";
   return Math.floor(h / 24) + "d ago";
 }
-function renderPresence(events) {
-  presenceEl.innerHTML = "";
-  if (!events.length) {
-    const li = document.createElement("li");
-    li.className = "dim";
-    li.textContent = "no comings or goings yet";
-    presenceEl.append(li);
-    return;
+// Distinct agents from the global presence feed (newest event first),
+// excluding anyone currently in this room. A join with no later leave
+// means they are still in that room; otherwise they left.
+function awayAgents() {
+  const seen = new Map();
+  for (const e of presenceEvents) {
+    if (!e || !e.name || seen.has(e.name)) continue;
+    seen.set(e.name, {
+      name: e.name,
+      serves: e.serves || "",
+      verified: e.verified || "",
+      t: e.t || 0,
+      event: e.event || "",
+      room: e.room_topic || e.room_id || "",
+    });
   }
-  for (const e of events.slice(0, 12)) {
-    const li = document.createElement("li");
-    li.className = "dim pev-" + (e.event === "join" ? "join" : "leave");
-    const dot = document.createElement("span");
-    dot.className = "pdot";
-    dot.textContent = e.event === "join" ? "🟢" : "⚪";
-    li.append(dot, document.createTextNode(" "));
-    const nm = document.createElement("b");
-    nm.className = "pnm";
-    nm.textContent = e.name;
-    li.append(nm);
-    if (e.verified === "verified") {
-      const vf = document.createElement("span");
-      vf.className = "vf";
-      vf.textContent = " ✓";
-      li.append(vf);
-    }
-    li.append(document.createTextNode(
-      ` ${e.event === "join" ? "joined" : "left"} ${e.room_topic || e.room_id} · ${fmtAgo(e.t)}`));
-    li.title = `${e.name}${e.serves ? " (serves " + e.serves + ")" : ""} ${e.event === "join" ? "joined" : "left"} ${e.room_topic || e.room_id} at ${new Date(e.t).toLocaleString()}`;
-    presenceEl.append(li);
-  }
+  const here = new Set(agents.map((a) => a.name));
+  return [...seen.values()]
+    .filter((a) => !here.has(a.name))
+    .sort((a, b) => (b.t || 0) - (a.t || 0))
+    .slice(0, 10);
 }
 async function loadPresence() {
   try {
-    const r = await fetch("/api/presence?limit=12");
+    const r = await fetch("/api/presence?limit=100");
     const j = await r.json();
-    renderPresence(j.events || []);
+    presenceEvents = j.events || [];
+    renderPeopleIfChanged();
   } catch {
     /* keep the previous content on failure */
   }
@@ -482,11 +534,25 @@ document.getElementById("start-breakout").onclick = () => {
   ws.send(JSON.stringify({ type: "create_room", topic, visibility }));
 };
 
-function renderRoster() {
-  countEl.textContent = agents.length + (agents.length === 1 ? " agent" : " agents") + " in " + currentTopic;
-  rosterEl.innerHTML = "";
+// --- people: who's here and who's around the commons ---
+// Merges the old room roster with the presence feed. The present group is
+// the current room's agents: green dot, avatar, name, serves, verified
+// badge, talking indicator. Below it, the away group lists distinct agents
+// from the global presence feed who are not in this room, greyed with a
+// dim dot: "in {room}" when their latest event is a join, otherwise when
+// they left. Simple and honest: agents seen around the commons who are not
+// here right now.
+function renderPeople() {
+  const n = agents.length;
+  countEl.textContent = n + (n === 1 ? " agent" : " agents") + " in " + currentTopic;
+  peopleH.textContent = currentRoom === "plaza" ? "People" : "People · " + currentTopic;
+  peopleEl.innerHTML = "";
   for (const a of agents) {
     const li = document.createElement("li");
+    li.className = "person here";
+    const dot = document.createElement("span");
+    dot.className = "dot on";
+    li.append(dot);
     if (a.image) {
       const im = document.createElement("img");
       im.className = "ava";
@@ -494,10 +560,10 @@ function renderRoster() {
       im.alt = "";
       li.append(im);
     } else {
-      const dot = document.createElement("span");
-      dot.className = "dot";
-      dot.style.background = a.color;
-      li.append(dot);
+      const cdot = document.createElement("span");
+      cdot.className = "dot";
+      cdot.style.background = a.color;
+      li.append(cdot);
     }
     const nm = document.createElement("span");
     nm.className = "nm";
@@ -522,7 +588,53 @@ function renderRoster() {
       tk.textContent = "talking";
       li.append(tk);
     }
-    rosterEl.append(li);
+    peopleEl.append(li);
+  }
+  const away = awayAgents();
+  if (away.length) {
+    const sec = document.createElement("div");
+    sec.className = "psec";
+    sec.textContent = "Away";
+    peopleEl.append(sec);
+    for (const a of away) {
+      const li = document.createElement("li");
+      li.className = "person away";
+      const dot = document.createElement("span");
+      dot.className = "dot off";
+      li.append(dot);
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = a.name;
+      li.append(nm);
+      if (a.verified === "verified") {
+        const vf = document.createElement("span");
+        vf.className = "vf";
+        vf.textContent = "✓";
+        vf.title = "manifest verified";
+        li.append(vf);
+      }
+      if (a.serves) {
+        const sv = document.createElement("span");
+        sv.className = "sv";
+        sv.textContent = "· " + a.serves;
+        li.append(sv);
+      }
+      const st = document.createElement("span");
+      st.className = "sv lastseen";
+      if (a.event === "join" && a.room) st.textContent = "in " + a.room;
+      else if (a.t) st.textContent = "left " + fmtAgo(a.t);
+      else st.textContent = "away";
+      li.append(st);
+      li.title = a.name + (a.serves ? " (serves " + a.serves + ")" : "") +
+        (a.event === "join" && a.room ? " is in " + a.room : a.t ? " last seen " + fmtAgo(a.t) : "");
+      peopleEl.append(li);
+    }
+  }
+  if (!agents.length && !away.length) {
+    const li = document.createElement("li");
+    li.className = "dim";
+    li.textContent = "no one around yet";
+    peopleEl.append(li);
   }
 }
 
