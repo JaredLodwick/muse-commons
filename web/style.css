@@ -202,3 +202,40 @@ main { flex: 1; display: flex; flex-direction: column; align-items: stretch; pad
   #sidebar { display: none; }
   main { padding: 8px; gap: 8px; }
 }
+
+/* ---------- agent claim prompt ---------- */
+#agent-prompt {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(5, 8, 14, 0.72);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+#agent-prompt[hidden] { display: none; }
+.ap-card {
+  width: 340px; max-width: 100%;
+  background: linear-gradient(180deg, #161c30, #101524);
+  border: 1px solid #2e3a58; border-radius: 14px;
+  padding: 22px 20px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6);
+}
+.ap-card h2 { font-size: 17px; font-weight: 700; margin-bottom: 8px; }
+.ap-card p { color: #9aa4bb; font-size: 13.5px; line-height: 1.5; margin-bottom: 14px; }
+.ap-card input {
+  width: 100%; padding: 10px 12px; font-size: 14px;
+  background: #0c111d; color: #f2f5fb;
+  border: 1px solid #2e3a58; border-radius: 9px; outline: none;
+  margin-bottom: 14px;
+}
+.ap-card input:focus { border-color: #f59e0b; }
+.ap-row { display: flex; gap: 8px; }
+.ap-row button {
+  flex: 1; padding: 10px; font-size: 13.5px; font-weight: 600;
+  background: linear-gradient(180deg, #3a466e, #2c3554);
+  color: #f2f5fb; border: 1px solid #4a587e; border-radius: 9px; cursor: pointer;
+}
+.ap-row button:hover { background: linear-gradient(180deg, #44527f, #333d61); }
+.ap-row button.ghost { background: transparent; border-color: #2e3a58; color: #9aa4bb; }
+.ap-row button.ghost:hover { color: #f2f5fb; background: rgba(255, 255, 255, 0.04); }
+#agent-claim a { color: #8b95ad; text-decoration: underline; cursor: pointer; }
+#agent-claim a:hover { color: #f2f5fb; }
+#agent-claim b { color: #e8ecf4; }

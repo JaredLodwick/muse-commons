@@ -161,6 +161,7 @@ function publicRooms() {
       visibility: r.visibility,
       entry: r.entry,
       occupancy: r.agents.size,
+      occupants: [...r.agents.values()].map((a) => a.name),
       description: r.description || "",
       category: r.category || "interest",
     }));
@@ -902,8 +903,7 @@ function doJoin(ws, room) {
 // hello/join with entry-policy enforcement. Joins open rooms freely; for
 // knock rooms registers a knock and notifies the creator; invite-only rooms
 // require a prior invite (or the creator). Viewers go through the same gate.
-function enterOrKnock(ws, room, name, serves) {
-  const id = ws.agentId || ws.guestId ||
+function enterOrKnock(ws, room, name, serves) {  const id = ws.agentId || ws.guestId ||
     (ws.guestId = agentIdOf("guest-" + Math.random().toString(36).slice(2, 7)));
   if (isCreator(room, ws) || room.invited.has(id)) {
     doJoin(ws, room);
@@ -932,6 +932,60 @@ function joinRoom(ws, roomId) {
   return enterOrKnock(ws, room, ws.agentName, ws.agentServes) ? room : null;
 }
 
+// Claim-based agent follow (testing stage): when a viewer who claimed an
+// agent name enters a room, their agent is moved along with them.
+// Trust model: claim-based, NOT authenticated. A viewer can only move the
+// single agent they claimed, and only into rooms they themselves just
+// entered through the entry gate. Skips silently when the agent is offline,
+// already there, or fails the room's entry gate.
+function followClaimedAgent(viewerWs, room) {
+  const claimed = viewerWs.claimedAgent;
+  if (!claimed) return;
+  const id = agentIdOf(claimed);
+  for (const aws of socketsForAgent(id)) {
+    if (aws === viewerWs || aws.readyState !== 1) continue;
+    const cur = rooms.get(aws.roomId);
+    if (cur && cur.id === room.id) continue; // already there
+    moveAgentSocket(aws, room);
+  }
+}
+
+// Server-side room move for one agent socket: runs the same entry gate the
+// viewer passed, then rebuilds the agent entry in the new room preserving
+// its visual state, with presence leave/join logging.
+function moveAgentSocket(aws, room) {
+  const id = aws.agentId;
+  const prevRoom = rooms.get(aws.roomId);
+  const prevAgent = prevRoom && id ? prevRoom.agents.get(id) : null;
+  // same entry gate the viewer passed; knock/invite-only failures skip silently
+  if (!enterOrKnock(aws, room, aws.agentName, aws.agentServes || "")) return false;
+  // doJoin (inside enterOrKnock) already ran leaveRoom and set ws.roomId.
+  if (id) {
+    const na = ensureAgent(room, id, {
+      name: aws.agentName,
+      serves: aws.agentServes || "",
+      avatar: prevAgent
+        ? { color: prevAgent.color, emoji: prevAgent.emoji, image: prevAgent.image }
+        : undefined,
+    });
+    if (prevAgent) {
+      na.verified = prevAgent.verified;
+      na.home = prevAgent.home;
+      na.admitted = prevAgent.admitted;
+      na.x = prevAgent.x; na.y = prevAgent.y;
+      na.tx = prevAgent.tx; na.ty = prevAgent.ty;
+      na.lastBeat = prevAgent.lastBeat;
+    }
+    if (prevRoom && prevRoom.id !== room.id && prevAgent) {
+      logPresence("leave", prevRoom, {
+        name: prevAgent.name, serves: prevAgent.serves, verified: prevAgent.verified,
+      });
+    }
+    logPresence("join", room, { name: na.name, serves: na.serves, verified: na.verified });
+  }
+  return true;
+}
+
 // Shared agent admission for both verified and unverified hellos. A verified
 // manifest's avatar_url (already validated as http(s)) takes precedence over
 // the self-asserted hello avatar image.
@@ -958,14 +1012,18 @@ function admitHelloAgent(ws, m, roomId, proof) {
   a.home = ws.manifestHome;
   a.admitted = true; // marks a real admission (vs entries created by say/talk)
   const info = { name: m.name, serves: m.serves, verified: proof.verified };
+  // A second socket helloing as an already-present agent (e.g. the one-shot
+  // say script while the presence script holds the room) must not log a
+  // phantom join: the agent never left.
+  const alreadyThere = !wasPresent && room.agents.has(newId);
   if (fromRoom && fromRoom.id !== room.id) {
     if (wasPresent) {
       logPresence("leave", fromRoom, {
         name: leftInfo.name, serves: leftInfo.serves, verified: leftInfo.verified,
       });
     }
-    logPresence("join", room, info);
-  } else if (!wasPresent) {
+    if (!alreadyThere) logPresence("join", room, info);
+  } else if (!wasPresent && !alreadyThere) {
     logPresence("join", room, info);
   }
 }
@@ -1255,6 +1313,7 @@ wss.on("connection", (ws, req) => {
   ws.agentServes = "";
   ws.guestId = null; // stable knock identity for sockets without an agent
   ws.roomId = "plaza";
+  ws.claimedAgent = null; // viewer-claimed agent name ("your agent follows you")
   ws.verifying = false; // Phase 3: a manifest check is in flight
   ws.verifiedState = "unverified"; // Phase 3/4: manifest check result
   ws.manifestHome = false; // Phase 4: verified manifest claims home:true for this lobby
@@ -1275,7 +1334,9 @@ wss.on("connection", (ws, req) => {
       if (ws.verifying) return; // a manifest check is already in flight
       if (m.kind === "viewer" || !m.name) {
         // viewers (re)subscribe to a room; they get no avatar. Viewers pass
-        // through the same entry gate as agents.
+        // through the same entry gate as agents. A viewer may claim one
+        // agent name (agent_name); their agent follows them into rooms they
+        // enter. Claim-based, not authenticated (see followClaimedAgent).
         ws.agentId = null;
         ws.agentName = null;
         const room = rooms.get(roomId);
@@ -1283,7 +1344,11 @@ wss.on("connection", (ws, req) => {
           send(ws, { type: "error", message: "no such room", room_id: roomId });
           return;
         }
-        enterOrKnock(ws, room, null, "");
+        if (typeof m.agent_name === "string") {
+          const claimed = m.agent_name.trim().slice(0, 60);
+          ws.claimedAgent = claimed || null; // empty string clears the claim
+        }
+        if (enterOrKnock(ws, room, null, "")) followClaimedAgent(ws, room);
         return;
       }
       const manifestUrl = typeof m.manifest_url === "string" ? m.manifest_url.trim() : "";

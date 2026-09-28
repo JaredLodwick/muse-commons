@@ -23,6 +23,68 @@ let currentRoom = "plaza";
 let currentTopic = "Plaza";
 let publicRooms = [];            // from plaza state: {room_id,topic,visibility,entry,occupancy}
 let myRooms = new Map([["plaza", "Plaza"]]); // room_id -> topic (joined/created)
+
+// --- claimed agent ("your agent follows you") ---
+// First visit asks for the agent's name, stored in localStorage. The viewer
+// hello carries it as agent_name so the server moves the claimed agent along,
+// and page load lands in the agent's current room instead of the plaza.
+const AGENT_KEY = "mc_agent_name";
+function storedAgentName() { return localStorage.getItem(AGENT_KEY) || ""; }
+function setStoredAgentName(n) { localStorage.setItem(AGENT_KEY, n ? n : ""); }
+function helloPayload(roomId) {
+  const p = { type: "hello", kind: "viewer", room: roomId, agent_name: storedAgentName() };
+  return p;
+}
+async function findAgentRoom(name) {
+  try {
+    const r = await fetch("/api/places");
+    const j = await r.json();
+    const hit = (j.rooms || []).find((rm) =>
+      (rm.occupants || []).some((n) => n.toLowerCase() === name.toLowerCase()));
+    return hit || null;
+  } catch { return null; }
+}
+
+// First-visit prompt: "What's your agent's name?" with a "Just looking"
+// skip. Reopened anytime via the sidebar footer link.
+function openAgentPrompt() {
+  const box = document.getElementById("agent-prompt");
+  const input = document.getElementById("ap-name");
+  input.value = storedAgentName();
+  box.hidden = false;
+  const close = () => { box.hidden = true; renderAgentClaim(); };
+  const save = () => {
+    const v = input.value.trim().slice(0, 60);
+    if (!v) { input.focus(); return; }
+    setStoredAgentName(v);
+    close();
+    // re-hello so the server picks up the claim immediately
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(helloPayload(currentRoom)));
+  };
+  document.getElementById("ap-save").onclick = save;
+  input.onkeydown = (e) => { if (e.key === "Enter") save(); };
+  document.getElementById("ap-skip").onclick = () => { setStoredAgentName(""); close(); };
+  setTimeout(() => input.focus(), 60);
+}
+function renderAgentClaim() {
+  const el = document.getElementById("agent-claim");
+  if (!el) return;
+  el.innerHTML = "";
+  const name = storedAgentName();
+  const a = document.createElement("a");
+  a.href = "#";
+  a.onclick = (e) => { e.preventDefault(); openAgentPrompt(); };
+  if (name) {
+    el.append("your agent: ");
+    const b = document.createElement("b");
+    b.textContent = name;
+    el.append(b, " ");
+    a.textContent = "change";
+  } else {
+    a.textContent = "claim your agent";
+  }
+  el.append(a);
+}
 let createdRooms = new Set();    // room_ids this client created
 let knocks = new Map();          // room_id -> [{id,name,serves}]
 let invites = new Map();         // room_id -> {topic, from}
@@ -200,9 +262,12 @@ function showErr(msg) {
   showErr._t = setTimeout(() => { errEl.style.display = "none"; }, 4000);
 }
 
-const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host);
-ws.onopen = () => ws.send(JSON.stringify({ type: "hello", kind: "viewer", room: currentRoom }));
-ws.onmessage = (ev) => {
+let ws = null;
+function connect() {
+const _ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host);
+ws = _ws;
+_ws.onopen = () => _ws.send(JSON.stringify(helloPayload(currentRoom)));
+_ws.onmessage = (ev) => {
   const m = JSON.parse(ev.data);
   if (m.type === "state") {
     if (m.room_id !== currentRoom) return; // scoped per room by the server
@@ -240,7 +305,8 @@ ws.onmessage = (ev) => {
     showErr(m.message || "error");
   }
 };
-ws.onclose = () => { countEl.textContent = "disconnected, retrying…"; setTimeout(() => location.reload(), 3000); };
+_ws.onclose = () => { countEl.textContent = "disconnected, retrying…"; setTimeout(() => location.reload(), 3000); };
+}
 
 function switchRoom(roomId, topic) {
   currentRoom = roomId;
@@ -257,7 +323,7 @@ function switchRoom(roomId, topic) {
   renderPeopleIfChanged();
   loadChatter();
   loadPresence();
-  ws.send(JSON.stringify({ type: "hello", kind: "viewer", room: roomId }));
+  ws.send(JSON.stringify(helloPayload(roomId)));
 }
 
 function renderTabs() {
@@ -1142,3 +1208,22 @@ function drawBubble(a, cy, t) {
 
 // start the render loop (defined above in the camera section)
 requestAnimationFrame(frame);
+
+// boot: land in the claimed agent's current room when known, otherwise the
+// plaza; then open the socket. The agent prompt shows on first visit only.
+(async function boot() {
+  if (localStorage.getItem(AGENT_KEY) === null) openAgentPrompt();
+  const name = storedAgentName();
+  if (name) {
+    const hit = await findAgentRoom(name);
+    if (hit) {
+      currentRoom = hit.room_id;
+      currentTopic = hit.topic || hit.room_id;
+      myRooms.set(hit.room_id, currentTopic);
+    }
+  }
+  renderAgentClaim();
+  renderTabsIfChanged();
+  renderSideIfChanged();
+  connect();
+})();
