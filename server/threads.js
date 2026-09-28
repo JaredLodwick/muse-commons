@@ -57,7 +57,6 @@ function newThread(room, st, ev) {
     participants: new Set(),
   };
   st.byId.set(id, th);
-  st.current = id;
   return th;
 }
 
@@ -73,27 +72,32 @@ function touch(th, ev) {
  * Assign ev.thread_id. Mutates room._threadState. Requires ev.tseq and
  * ev.t to be set. Pure function of (room state, ev) — replaying stored
  * events in order reproduces the same threads.
+ *
+ * An event only continues a thread it chronologically follows. A
+ * past-dated (out-of-order) event gets its own thread and leaves the
+ * room's live pointers (current thread, pair map) undisturbed.
  */
 function assign(room, ev) {
   const st = stateOf(room);
+  const pk = ev.to ? pairKey(ev.from, ev.to) : null;
+  const pairTh = pk ? st.byId.get(st.openPair.get(pk)) : null;
+  const curTh = st.current ? st.byId.get(st.current) : null;
+  const continues = (cand, window) => {
+    if (!cand) return false;
+    const dt = ev.t - cand.last_t;
+    return dt >= 0 && dt <= window;
+  };
   let th = null;
-  if (ev.to) {
-    const pk = pairKey(ev.from, ev.to);
-    const pid = st.openPair.get(pk);
-    if (pid) {
-      const cand = st.byId.get(pid);
-      if (cand && ev.t - cand.last_t <= PAIR_WINDOW_MS) th = cand;
-      else st.openPair.delete(pk);
-    }
+  if (ev.to && continues(pairTh, PAIR_WINDOW_MS)) th = pairTh;
+  if (!th && continues(curTh, THREAD_GAP_MS)) th = curTh;
+  if (!th) {
+    th = newThread(room, st, ev);
+    // Expire a pair mapping only when a live event runs past its window.
+    if (pk && pairTh && ev.t - pairTh.last_t > PAIR_WINDOW_MS) st.openPair.delete(pk);
   }
-  if (!th && st.current) {
-    const cand = st.byId.get(st.current);
-    if (cand && ev.t - cand.last_t <= THREAD_GAP_MS) th = cand;
-    else st.current = null;
-  }
-  if (!th) th = newThread(room, st, ev);
-  if (ev.to) st.openPair.set(pairKey(ev.from, ev.to), th.id);
-  st.current = th.id;
+  // Past-dated events never hijack the pair map or the current pointer.
+  if (pk && (!pairTh || ev.t >= pairTh.last_t)) st.openPair.set(pk, th.id);
+  if (!curTh || ev.t >= curTh.last_t) st.current = th.id;
   touch(th, ev);
   ev.thread_id = th.id;
   return th.id;
@@ -217,7 +221,7 @@ function renderThreadPage(room, th, events) {
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Thread in #${esc(room.id)} &mdash; Muse Commons</title>
+<title>Thread in #${esc(room.id)} | Muse Commons</title>
 <style>
   body{font-family:Georgia,serif;max-width:640px;margin:0 auto;padding:24px 16px;color:#1a1a1a;line-height:1.5}
   header{border-bottom:2px solid #1a1a1a;padding-bottom:12px;margin-bottom:20px}

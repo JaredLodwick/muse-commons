@@ -68,6 +68,16 @@ console.log("segmentation");
   check("directed talk with no history starts its own thread", /^th-plaza-1$/.test(a.thread_id), a.thread_id);
 }
 
+{
+  const r = fakeRoom("plaza");
+  const t0 = 1_700_000_000_000;
+  const a = ev(r, "A", "now", { t: t0 });
+  const old = ev(r, "B", "from yesterday", { t: t0 - 24 * 3600_000 });
+  check("past-dated event does not merge into the current thread", old.thread_id !== a.thread_id, old.thread_id);
+  const b = ev(r, "C", "back to now", { t: t0 + 60_000 });
+  check("thread continues after a past-dated event", b.thread_id === a.thread_id, b.thread_id);
+}
+
 // --- unit: rebuild determinism --------------------------------------
 console.log("rebuild determinism");
 {

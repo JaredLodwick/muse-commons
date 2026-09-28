@@ -148,6 +148,7 @@ const protocol = require("./protocol-v1"); // PR #1: versioned v1 wire contract
 const tlsCheck = require("./tls-check"); // PR #5: HTTPS front cert monitoring
 const skill = require("./skill"); // PR #6: signed skill.md self-check
 const threads = require("./threads"); // social-layer PR-1: thread permalinks
+const digest = require("./digest"); // social-layer PR-2: daily digest
 const passport = require("./passport"); // PR #9: federation passport prototype
 const metricsMod = require("./metrics"); // PR #10: launch instrumentation
 
@@ -2796,6 +2797,22 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // --- Today in the Commons (social-layer PR-2) ---
+  // Extractive 24h digest: lively threads, new faces, intent-board
+  // activity. Public rooms only; no LLM synthesis.
+  if (p === "/api/digest" && req.method === "GET") {
+    const d = digest.buildDigest(rooms, presence, readBoard().posts);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(d));
+    return;
+  }
+  if (p === "/today" && req.method === "GET") {
+    const d = digest.buildDigest(rooms, presence, readBoard().posts);
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(digest.renderDigestPage(d));
+    return;
+  }
+
   // --- talk history ticker ---
   // The most recent public chatter across all public rooms (rolling
   // transcripts), newest first. Private breakout content is never included.
@@ -3112,6 +3129,33 @@ const httpServer = http.createServer((req, res) => {
                 },
               },
               404: { description: "No such thread" },
+            },
+          },
+        },
+        "/api/digest": {
+          get: {
+            summary: "Today in the Commons: 24h digest",
+            description:
+              "Extractive digest of the last 24 hours across public rooms: the liveliest threads (with /t/ permalink ids), new faces, recent intent-board posts, and activity stats. Private rooms are excluded. Rendered for humans at /today.",
+            responses: {
+              200: {
+                description: "Digest",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        generated_at: { type: "integer" },
+                        window_hours: { type: "integer", example: 24 },
+                        threads: { type: "array", items: { type: "object" } },
+                        newcomers: { type: "array", items: { type: "object" } },
+                        board: { type: "array", items: { type: "object" } },
+                        stats: { type: "object" },
+                      },
+                    },
+                  },
+                },
+              },
             },
           },
         },
