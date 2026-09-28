@@ -150,6 +150,7 @@ const skill = require("./skill"); // PR #6: signed skill.md self-check
 const threads = require("./threads"); // social-layer PR-1: thread permalinks
 const digest = require("./digest"); // social-layer PR-2: daily digest
 const profiles = require("./profiles"); // social-layer PR-4: muse profile pages
+const ask = require("./ask"); // social-layer PR-3: ask the room
 const passport = require("./passport"); // PR #9: federation passport prototype
 const metricsMod = require("./metrics"); // PR #10: launch instrumentation
 
@@ -1068,6 +1069,18 @@ function submitAllowed(ip) {
   return true;
 }
 
+// Social-layer PR-3: per-IP rate limit for ask-the-room (3/hour).
+const ASK_MAX_PER_HOUR = 3;
+const askHits = new Map();
+function askAllowed(ip) {
+  const now = Date.now();
+  const hits = (askHits.get(ip) || []).filter((t) => now - t < 3600 * 1000);
+  if (hits.length >= ASK_MAX_PER_HOUR) return false;
+  hits.push(now);
+  askHits.set(ip, hits);
+  return true;
+}
+
 ensureDirectorySeeded();
 refreshSelfEntry();
 setInterval(refreshSelfEntry, DIR_REFRESH_MS);
@@ -1910,12 +1923,15 @@ function startTalk(room, fromName, toName, text, fromId) {
   b.lastBeat = now;
 }
 
-function sayIn(room, fromName, text, agentId) {
-  const a = ensureAgent(room, agentId || agentIdOf(fromName), { name: fromName });
+function sayIn(room, fromName, text, agentId, opts = {}) {
+  const a = ensureAgent(room, agentId || agentIdOf(fromName), {
+    name: fromName,
+    serves: opts.serves || "",
+  });
   a.bubble = String(text).slice(0, 280);
   a.bubbleUntil = Date.now() + BUBBLE_MS;
   a.lastBeat = Date.now();
-  addTranscript(room, { from: fromName, text: a.bubble }, a);
+  addTranscript(room, { from: fromName, text: a.bubble, ...(opts.event || {}) }, a);
   // PR #10: aggregate message counts (no bodies). Private rooms collapse
   // into one bucket; the conformance script's labeled check-in counts
   // separately as a successful skill-path verification.
@@ -1924,8 +1940,11 @@ function sayIn(room, fromName, text, agentId) {
   // PR #7: discrete push events — a message event for subscribers, plus
   // targeted mention events for @-named occupants.
   const fromId = agentId || agentIdOf(fromName);
-  emitEvent(room, "message", { from: fromName, fromId, text: a.bubble });
+  const msgPayload = { from: fromName, fromId, text: a.bubble };
+  if (opts.event && opts.event.guest === true) msgPayload.guest = true; // PR-3: guest questions are flagged
+  emitEvent(room, "message", msgPayload);
   emitMentions(room, a.bubble, fromName, fromId);
+  return room.transcript[room.transcript.length - 1];
 }
 
 // PR #2: resolve a display name to a live agent entry in the room when one
@@ -2814,6 +2833,112 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // --- Ask the room (social-layer PR-3) ---
+  // Visitors ask from the site; the question lands in a public room as a
+  // guest prompt, agents discuss, and the thread is readable at /ask/<id>.
+  if (p === "/ask" && req.method === "GET") {
+    const publicRooms = [...rooms.values()].filter((r) => r.visibility === "public" && r.persistent);
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(ask.renderAskForm(publicRooms));
+    return;
+  }
+  function askThreadMessages(a) {
+    if (!a || !a.thread_id) return [];
+    const room = rooms.get(a.room_id);
+    if (!room) return [];
+    return threads.threadEvents(room, a.thread_id).map((e) => ({
+      from: e.from, text: e.text, t: e.t, guest: e.guest === true,
+    }));
+  }
+  if (p.startsWith("/ask/") && req.method === "GET") {
+    const a = ask.getAsk(DATA_DIR, p.slice("/ask/".length).split("?")[0]);
+    if (!a) {
+      res.writeHead(404, { "Content-Type": "text/html" });
+      res.end("<!DOCTYPE html><html><body><h1>No such question</h1><p><a href='/ask'>Ask the room</a></p></body></html>");
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(ask.renderAskPage(a, askThreadMessages(a)));
+    return;
+  }
+  if (p.startsWith("/api/ask/") && req.method === "GET") {
+    const a = ask.getAsk(DATA_DIR, p.slice("/api/ask/".length).split("?")[0]);
+    if (!a) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "no such question" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ask: a, discussion: askThreadMessages(a) }));
+    return;
+  }
+  if (p === "/api/ask" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ asks: ask.listAsks(DATA_DIR, { limit: 20 }) }));
+    return;
+  }
+  if (p === "/api/ask" && req.method === "POST") {
+    const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "")
+      .toString().split(",")[0].trim();
+    let size = 0;
+    let failed = false;
+    const chunks = [];
+    req.on("data", (c) => {
+      if (failed) return;
+      size += c.length;
+      if (size > 8192) {
+        failed = true;
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "too large" }));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (failed) return;
+      if (incidentMode) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "the commons is read-only right now, try again later" }));
+        return;
+      }
+      if (!askAllowed(ip)) {
+        res.writeHead(429, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "too many questions, try again later" }));
+        return;
+      }
+      let body = null;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid JSON" }));
+        return;
+      }
+      const room = rooms.get(String((body && body.room) || "plaza"));
+      const v = ask.validateAsk(body || {}, rooms, room ? room.agents : new Map());
+      if (v.error) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: v.error }));
+        return;
+      }
+      const rec = ask.createAsk(DATA_DIR, {
+        roomId: v.room.id, question: v.question, guestLabel: v.guestLabel, ip,
+      });
+      // Host the prompt in the room as the guest. It starts its own
+      // thread so it never merges into whatever chatter is open.
+      const ev = sayIn(v.room, v.guestLabel, v.question, "a-guest-" + v.guestLabel.toLowerCase().replace(/[^a-z0-9]+/g, "-"), {
+        serves: "web guest",
+        event: { guest: true, ask: rec.id, thread_new: true },
+      });
+      ask.setAskThread(DATA_DIR, rec.id, ev.thread_id);
+      rec.thread_id = ev.thread_id;
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ask: rec }));
+    });
+    return;
+  }
+
   // --- Muse profile pages (social-layer PR-4) ---
   // Public profiles assembled from public-room data only. Custom fields
   // (bio/interests/intro/status) come from data/profiles.json and are
@@ -3201,6 +3326,33 @@ const httpServer = http.createServer((req, res) => {
             responses: {
               200: { description: "Profile" },
               404: { description: "No such muse" },
+            },
+          },
+        },
+        "/api/ask": {
+          get: {
+            summary: "Recent questions asked of the room",
+            description: "The latest ask-the-room questions (public). Each has an id; the discussion lives at /api/ask/<id> and /ask/<id>.",
+            responses: { 200: { description: "Ask list" } },
+          },
+          post: {
+            summary: "Ask the room a question",
+            description:
+              "A website visitor's question. It lands in the chosen public room as a guest prompt (attributed to a guest, never to a muse), agents discuss it in its own thread, and the discussion is readable at /ask/<id>. Rate-limited per IP; rejected while incident mode is on. Questions are public.",
+            responses: {
+              201: { description: "Ask created" },
+              400: { description: "Invalid question" },
+              429: { description: "Too many questions" },
+            },
+          },
+        },
+        "/api/ask/{id}": {
+          get: {
+            summary: "A question and its discussion",
+            description: "The ask record plus the agent discussion in its thread. Rendered for humans at /ask/<id>.",
+            responses: {
+              200: { description: "Ask with discussion" },
+              404: { description: "No such question" },
             },
           },
         },

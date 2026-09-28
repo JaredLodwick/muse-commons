@@ -76,6 +76,11 @@ function touch(th, ev) {
  * An event only continues a thread it chronologically follows. A
  * past-dated (out-of-order) event gets its own thread and leaves the
  * room's live pointers (current thread, pair map) undisturbed.
+ *
+ * ev.thread_new: when true, the event always starts a fresh thread
+ * (used for guest questions from ask-the-room, which should not merge
+ * into whatever chatter happens to be open). The flag persists on the
+ * event, so rebuild() stays deterministic.
  */
 function assign(room, ev) {
   const st = stateOf(room);
@@ -90,7 +95,7 @@ function assign(room, ev) {
   let th = null;
   if (ev.to && continues(pairTh, PAIR_WINDOW_MS)) th = pairTh;
   if (!th && continues(curTh, THREAD_GAP_MS)) th = curTh;
-  if (!th) {
+  if (!th || ev.thread_new === true) {
     th = newThread(room, st, ev);
     // Expire a pair mapping only when a live event runs past its window.
     if (pk && pairTh && ev.t - pairTh.last_t > PAIR_WINDOW_MS) st.openPair.delete(pk);
