@@ -9,11 +9,35 @@
 const http = require("http");
 const { spawn } = require("child_process");
 const path = require("path");
+const crypto = require("crypto");
 const WebSocket = require("ws");
 
 const REPO = path.join(__dirname, "..");
 const LOBBY = path.join(REPO, "server", "lobby.js");
 const PORT = 18781;
+const HOST_FIXTURE_PORT = 18782;
+
+// PR #2: the host-muse tests use a proof-verified host. The fixture
+// manifest carries a real Ed25519 identity key; HOST_MUSE names the
+// manifest's verified name, and a bare display-name claim no longer
+// grants host authority.
+const { privateKey: HOST_PRIV, publicKey: HOST_PUB } = crypto.generateKeyPairSync("ed25519");
+const HOST_PUB_B64 = Buffer.from(HOST_PUB.export({ format: "jwk" }).x, "base64url").toString("base64");
+const HOST_MANIFEST_URL = `http://127.0.0.1:${HOST_FIXTURE_PORT}/.well-known/muse-protocol.json`;
+const hostFixture = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(
+    JSON.stringify({
+      muse: { name: "HostMuse", serves: "Host" },
+      signing_key: { alg: "ed25519", key_id: "host-fixture-1", pubkey: HOST_PUB_B64 },
+    })
+  );
+});
+function signHostChallenge(nonce) {
+  return crypto
+    .sign(null, Buffer.from("muse-commons/v1/challenge:" + nonce, "utf8"), HOST_PRIV)
+    .toString("base64");
+}
 
 const RUN = Math.random().toString(36).slice(2, 8); // unique topics per run
 const T = (s) => `${s}-${RUN}`;
@@ -35,6 +59,7 @@ function startLobby() {
       PORT: String(PORT),
       LOBBY_PUBLIC_URL: `http://127.0.0.1:${PORT}/`,
       HOST_MUSE: "HostMuse",
+      MANIFEST_ALLOW_PRIVATE: "1", // the host fixture manifest is loopback
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -92,6 +117,49 @@ function openAgent(name, extra = {}) {
   });
 }
 
+// Connect as a manifest-verified agent: answer the proof-of-control
+// challenge with the fixture key, resolve once the verified name appears.
+function openVerifiedAgent(name, manifestUrl, extra = {}) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
+    const rec = { ws, name, msgs: [] };
+    const timer = setTimeout(() => reject(new Error(`hello timeout for ${name}`)), 15000);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "hello", name, manifest_url: manifestUrl, ...extra })));
+    ws.on("message", (raw) => {
+      let m;
+      try {
+        m = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      rec.msgs.push(m);
+      if (m.type === "challenge") {
+        ws.send(
+          JSON.stringify({
+            type: "challenge_response",
+            challenge_id: m.challenge_id,
+            signature: signHostChallenge(m.nonce),
+          })
+        );
+        return;
+      }
+      if (m.type === "state" && m.agents && m.agents.some((a) => a.name === name)) {
+        clearTimeout(timer);
+        resolve(rec);
+      }
+      if (m.type === "error" && !rec.helloDone) {
+        // hello rejected — still resolve, caller inspects
+        clearTimeout(timer);
+        resolve(rec);
+      }
+    });
+    ws.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
 function waitFor(rec, pred, timeoutMs = 6000) {
   return new Promise((resolve) => {
     const found = rec.msgs.find(pred);
@@ -127,6 +195,7 @@ function getJson(p) {
 }
 
 async function main() {
+  await new Promise((r) => hostFixture.listen(HOST_FIXTURE_PORT, "127.0.0.1", r));
   const server = startLobby();
   await waitForListening(server);
 
@@ -231,8 +300,10 @@ async function main() {
   check("/board page loads", page.status === 200 && page.body.includes("Intent board"));
 
   console.log("host-muse role");
-  // 7. host (HOST_MUSE env) admits a knocker to someone else's room
-  const host = await openAgent("HostMuse");
+  // 7. verified host (HOST_MUSE env names the manifest's verified name)
+  // admits a knocker to someone else's room. A bare display-name claim
+  // does NOT grant host authority (PR #2).
+  const host = await openVerifiedAgent("HostMuse", HOST_MANIFEST_URL);
   const creator = await openAgent("RoomCreator");
   creator.ws.send(JSON.stringify({ type: "create_room", topic: "host-test-room", entry: "knock" }));
   const created = await waitFor(creator, (m) => m.type === "room_created");
@@ -241,7 +312,9 @@ async function main() {
   guest.ws.send(JSON.stringify({ type: "hello", name: "GuestOne", room: roomId }));
   const knockReq = await waitFor(host, (m) => m.type === "knock_request" && m.room_id === roomId);
   check("host sees knock requests on others' rooms", !!knockReq);
-  const guestId = "a-" + "guestone";
+  // PR #2: session ids are server-minted and random — admit with the real
+  // id from the knock request, never a derived one.
+  const guestId = knockReq && knockReq.agent && knockReq.agent.id;
   host.ws.send(JSON.stringify({ type: "admit", room_id: roomId, agent: guestId }));
   const admitted = await waitFor(guest, (m) => m.type === "admitted" && m.room_id === roomId);
   check("host can admit to a room they did not create", !!admitted);
@@ -249,21 +322,28 @@ async function main() {
   // 8. host rejects; non-host cannot admit
   const guest2 = await openAgent("GuestTwo");
   guest2.ws.send(JSON.stringify({ type: "hello", name: "GuestTwo", room: roomId }));
-  await waitFor(host, (m) => m.type === "knock_request" && m.agent && m.agent.id === "a-guesttwo");
+  const knockReq2 = await waitFor(host, (m) => m.type === "knock_request" && m.agent && m.agent.name === "GuestTwo");
+  const guest2Id = knockReq2 && knockReq2.agent && knockReq2.agent.id;
   const regular = await openAgent("RegularMuse");
-  regular.ws.send(JSON.stringify({ type: "admit", room_id: roomId, agent: "a-guesttwo" }));
+  regular.ws.send(JSON.stringify({ type: "admit", room_id: roomId, agent: guest2Id }));
   const e5 = await waitFor(regular, (m) => m.type === "error" && /creator or host/.test(m.message || ""));
   check("non-host cannot admit", !!e5);
-  host.ws.send(JSON.stringify({ type: "reject", room_id: roomId, agent: "a-guesttwo" }));
+  host.ws.send(JSON.stringify({ type: "reject", room_id: roomId, agent: guest2Id }));
   const rejected = await waitFor(guest2, (m) => m.type === "rejected" && m.room_id === roomId);
   check("host can reject a knocker", !!rejected);
 
-  // 9. announce: host ok, non-host denied
+  // 9. announce: verified host ok (moderate scope is granted to the host
+  // identity), non-host denied with a structured scope error
   host.ws.send(JSON.stringify({ type: "announce", text: "test announcement" }));
-  await new Promise((r) => setTimeout(r, 800));
+  const announced = await waitFor(
+    regular,
+    (m) => m.type === "state" && m.agents && m.agents.some((a) => (a.bubble || "").includes("test announcement")),
+    8000
+  );
+  check("host announce succeeds", !!announced);
   regular.ws.send(JSON.stringify({ type: "announce", text: "i should not be allowed" }));
-  const e6 = await waitFor(regular, (m) => m.type === "error" && /only the host/.test(m.message || ""));
-  check("non-host announce denied", !!e6);
+  const e6 = await waitFor(regular, (m) => m.type === "error" && m.code === "INSUFFICIENT_SCOPE");
+  check("non-host announce denied", !!e6, JSON.stringify(regular.msgs.slice(-2)));
 
   // 10. marketplace room exists and is public
   const viewer = new WebSocket(`ws://127.0.0.1:${PORT}`);
@@ -289,6 +369,7 @@ async function main() {
   for (const r of [seller, buyer, stranger, other, host, creator, guest, guest2, regular]) r.ws.close();
   viewer.close();
   server.kill();
+  hostFixture.close();
   console.log(failures ? `\n${failures} FAILURE(S)` : "\nALL PASS");
   process.exit(failures ? 1 : 0);
 }

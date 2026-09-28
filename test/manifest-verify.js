@@ -9,6 +9,7 @@
 const http = require("http");
 const { spawn } = require("child_process");
 const path = require("path");
+const crypto = require("crypto");
 const WebSocket = require("ws");
 
 const REPO = path.join(__dirname, "..");
@@ -16,6 +17,19 @@ const LOBBY = path.join(REPO, "server", "lobby.js");
 const PORT1 = 18771; // MANIFEST_ALLOW_PRIVATE=1 (fixture manifests are loopback)
 const PORT2 = 18772; // strict SSRF (no private IPs)
 const FIXTURE_PORT = 18770;
+
+// PR #2: the fixture manifests carry a real Ed25519 identity key so the
+// proof-of-control challenge can be answered like a genuine client.
+const { privateKey: FIX_PRIV, publicKey: FIX_PUB } = crypto.generateKeyPairSync("ed25519");
+const FIX_PUB_B64 = FIX_PUB.export({ format: "jwk" }).x
+  ? Buffer.from(FIX_PUB.export({ format: "jwk" }).x, "base64url").toString("base64")
+  : null;
+const FIX_SIGNING_KEY = { alg: "ed25519", key_id: "fixture-1", pubkey: FIX_PUB_B64 };
+
+function signChallenge(nonce) {
+  const payload = Buffer.from("muse-commons/v1/challenge:" + nonce, "utf8");
+  return crypto.sign(null, payload, FIX_PRIV).toString("base64");
+}
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -45,9 +59,10 @@ const fixture = http.createServer((req, res) => {
         avatar_url: `http://127.0.0.1:${FIXTURE_PORT}/ava.png`,
         lobbies: [{ url: lobbyUrl, name: "muse-commons", home: true }],
       },
+      signing_key: FIX_SIGNING_KEY,
     });
   } else if (p === "/nolobbies/.well-known/muse-protocol.json") {
-    send(200, { muse: { name: "NoLobbyMuse", serves: "Tester" } });
+    send(200, { muse: { name: "NoLobbyMuse", serves: "Tester" }, signing_key: FIX_SIGNING_KEY });
   } else if (p === "/wronglobby/.well-known/muse-protocol.json") {
     send(200, {
       muse: {
@@ -96,8 +111,9 @@ function waitForListening(child, port) {
   });
 }
 
-// Connect, send hello, resolve with {ok:true, agent} once the agent shows up
-// in a state broadcast, or {ok:false, error} on the first error message.
+// Connect, send hello, answer any proof-of-control challenge like a real
+// client, then resolve with {ok:true, agent} once the agent shows up in a
+// state broadcast, or {ok:false, error} on the first error message.
 function helloAndWait(port, helloMsg, timeoutMs = 12000) {
   return new Promise((resolve) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}`);
@@ -120,7 +136,18 @@ function helloAndWait(port, helloMsg, timeoutMs = 12000) {
       } catch {
         return;
       }
-      if (m.type === "error") finish({ ok: false, error: m.message });
+      // PR #2: answer proof-of-control challenges with the fixture key
+      if (m.type === "challenge") {
+        ws.send(
+          JSON.stringify({
+            type: "challenge_response",
+            challenge_id: m.challenge_id,
+            signature: signChallenge(m.nonce),
+          })
+        );
+        return;
+      }
+      if (m.type === "error") finish({ ok: false, error: m.message, code: m.code });
       else if (m.type === "state" && m.agents && m.agents.some((a) => a.name === name)) {
         finish({ ok: true, agent: m.agents.find((a) => a.name === name) });
       }
@@ -170,8 +197,10 @@ async function main() {
   console.log("manifest verification");
 
   // 1. good manifest -> verified, badge present, avatar_url used
+  // PR #2: the admitted name is the manifest's verified name (the hello
+  // name is just a claim until proof-of-control succeeds).
   let r = await helloAndWait(PORT1, {
-    type: "hello", name: "GoodMuse", serves: "Tester",
+    type: "hello", name: "FixtureMuse", serves: "Tester",
     manifest_url: fix("/good/.well-known/muse-protocol.json"),
   });
   check("good manifest admitted", r.ok, JSON.stringify(r).slice(0, 200));

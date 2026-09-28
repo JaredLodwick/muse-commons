@@ -24,6 +24,50 @@ const crypto = require("crypto");
 const PROTOCOL_VERSION = "1.0";
 const SUPPORTED_VERSIONS = new Set(["1", "1.0"]);
 
+// PR #2 — secure write identity.
+// Sessions are capability tokens: short-lived, scope-limited, bound to the
+// connection that minted them. Every mutating action is authorized against
+// the token's scopes; v1 clients must attach their session_token to every
+// mutating message. Legacy clients (no protocol_version) are authorized
+// against socket-bound scopes instead — the grandfathered claim-based path.
+const SESSION_TTL_MS = 30 * 60 * 1000; // capability lifetime; re-hello to rotate
+const CHALLENGE_TTL_MS = 60 * 1000; // proof-of-control window per hello
+
+const SCOPES = ["speak", "board", "rooms", "moderate"];
+const DEFAULT_SCOPES = ["speak", "board", "rooms"];
+
+// Which scope each mutating message type requires.
+const SCOPE_FOR_TYPE = {
+  say: "speak",
+  talk: "speak",
+  post: "board",
+  close_post: "board",
+  create_room: "rooms",
+  invite: "rooms",
+  knock: "rooms",
+  admit: "rooms",
+  reject: "rooms",
+  announce: "moderate", // + the host role, checked separately
+};
+
+// Proof-of-control: the client signs the UTF-8 bytes of
+//   CHALLENGE_PAYLOAD_PREFIX + nonce
+// with the Ed25519 private key matching its manifest's signing_key, and
+// sends the base64 signature as `signature` in challenge_response.
+// The prefix domain-separates the signature so it can't be replayed as
+// some other protocol's signature.
+const CHALLENGE_PAYLOAD_PREFIX = "muse-commons/v1/challenge:";
+
+function newSessionToken() {
+  return "t-" + crypto.randomBytes(24).toString("base64url");
+}
+function newChallengeId() {
+  return "ch-" + crypto.randomBytes(12).toString("base64url");
+}
+function newNonce() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
 // Per-socket rate limits. Generous enough that the web UI, bridge, and test
 // suite never trip them in normal use; tight enough to contain floods.
 const RATE_LIMITS = {
@@ -49,6 +93,7 @@ const CLIENT_TYPES = new Set([
   "announce",
   "post",
   "close_post",
+  "challenge_response", // PR #2: answer to a proof-of-control challenge
 ]);
 
 // Message types that mutate server state. They are rate-limited by the
@@ -158,6 +203,72 @@ const ERRORS = {
       "check that the manifest URL is reachable over HTTPS and serves valid " +
       "JSON with a name field; do not disable verification to work around this",
   },
+  // PR #2 — secure write identity. Hints stay actionable and never advise
+  // weakening verification or sharing private key material.
+  IDENTITY_KEY_MISSING: {
+    message: "manifest has no usable Ed25519 identity key",
+    hint:
+      'add a signing_key {"alg":"ed25519","pubkey":"<base64>"} (or identity_key) ' +
+      "to the manifest, then re-hello with manifest_url; the lobby never " +
+      "admits a claimed manifest without proof of control",
+  },
+  CHALLENGE_PENDING: {
+    message: "a proof-of-control challenge is pending on this connection",
+    hint:
+      'answer it with {type:"challenge_response", challenge_id, signature}, ' +
+      "or wait for it to expire and re-hello",
+  },
+  CHALLENGE_EXPIRED: {
+    message: "the proof-of-control challenge expired",
+    hint: "re-hello with manifest_url to get a fresh challenge",
+  },
+  CHALLENGE_UNKNOWN: {
+    message: "no matching pending challenge",
+    hint: "hello with manifest_url first, then answer the challenge you receive",
+  },
+  PROOF_OF_CONTROL_FAILED: {
+    message: "the challenge signature did not verify",
+    hint:
+      'sign the UTF-8 bytes of "muse-commons/v1/challenge:<nonce>" with the ' +
+      "Ed25519 private key matching the manifest's signing_key, and send the " +
+      "base64 signature; never share or transmit the private key itself",
+  },
+  NAME_RESERVED: {
+    message: "that name is reserved by another verified identity",
+    hint:
+      "choose a different display name, or prove control of the manifest " +
+      "that reserved it",
+  },
+  SESSION_TOKEN_REQUIRED: {
+    message: "this action needs a session token (protocol v1)",
+    hint:
+      "put the session_token from your hello_ok on every mutating message; " +
+      "re-hello if you lost it",
+  },
+  SESSION_TOKEN_INVALID: {
+    message: "session token not recognized for this connection",
+    hint:
+      "re-hello to get a fresh token; tokens are bound to the connection " +
+      "that created them and cannot be replayed elsewhere",
+  },
+  SESSION_TOKEN_EXPIRED: {
+    message: "session token expired",
+    hint: "re-hello to get a fresh token (tokens live 30 minutes)",
+  },
+  SESSION_TOKEN_REVOKED: {
+    message: "session token was revoked",
+    hint: "re-hello to get a fresh token",
+  },
+  INSUFFICIENT_SCOPE: {
+    message: "this action needs a scope your session lacks",
+    hint:
+      're-hello requesting the needed scope in the scopes field (e.g. "rooms" ' +
+      'for invites, "moderate" for announcements)',
+  },
+  INVALID_MESSAGE: {
+    message: "message failed validation",
+    hint: "check the documented fields for this message type and retry",
+  },
 };
 
 function errorPayload(code, opts) {
@@ -243,7 +354,16 @@ module.exports = {
   MUTATING_TYPES,
   IDEMPOTENCY_TTL_MS,
   IDEMPOTENCY_MAX_KEYS,
+  SESSION_TTL_MS,
+  CHALLENGE_TTL_MS,
+  SCOPES,
+  DEFAULT_SCOPES,
+  SCOPE_FOR_TYPE,
+  CHALLENGE_PAYLOAD_PREFIX,
   newMsgId,
+  newSessionToken,
+  newChallengeId,
+  newNonce,
   normalizeVersion,
   idemKey,
   ERRORS,

@@ -84,12 +84,23 @@ function hello(ws, extra) {
       if (m.type === "hello_ok" || (m.type === "error" && m.code)) {
         clearTimeout(timer);
         ws.removeListener("message", onMsg);
+        // PR #2: v1 hello_ok carries the session token; mutating sends
+        // must present it.
+        if (m.type === "hello_ok" && m.session_token) ws._sessionToken = m.session_token;
         resolve(m);
       }
     };
     ws.on("message", onMsg);
     ws.send(JSON.stringify({ type: "hello", name: T("ProtoBot"), ...extra }));
   });
+}
+
+// v1-aware send: attaches the session token to mutating messages.
+function vsend(ws, obj) {
+  if (ws._sessionToken && PROTO.MUTATING_TYPES.has(obj.type) && !obj.session_token) {
+    obj = { ...obj, session_token: ws._sessionToken };
+  }
+  ws.send(JSON.stringify(obj));
 }
 
 // --- unit tests: protocol-v1 module (no server needed) ---
@@ -150,7 +161,7 @@ async function msgIdTest() {
     try { seen.push(JSON.parse(raw.toString())); } catch { /* ignore */ }
   });
   await hello(ws, { protocol_version: "1.0", msg_id: "hello-1" });
-  ws.send(JSON.stringify({ type: "say", from: T("ProtoBot"), text: "id-test", msg_id: "say-1" }));
+  vsend(ws, { type: "say", text: "id-test", msg_id: "say-1" });
   await new Promise((r) => setTimeout(r, 1200)); // let state ticks arrive
   ws.close();
   const withId = seen.filter((m) => typeof m.msg_id === "string" && m.msg_id);
@@ -170,8 +181,8 @@ async function idempotencyTest() {
   // say, twice with the same key
   const text = T("idem-say");
   const key = T("key-say");
-  ws.send(JSON.stringify({ type: "say", from: T("ProtoBot"), text, idempotency_key: key }));
-  ws.send(JSON.stringify({ type: "say", from: T("ProtoBot"), text, idempotency_key: key }));
+  vsend(ws, { type: "say", text, idempotency_key: key });
+  vsend(ws, { type: "say", text, idempotency_key: key });
   await new Promise((r) => setTimeout(r, 800));
   const acks = inbox.filter((m) => m.type === "say_ok");
   check("both says acked", acks.length === 2, `got ${acks.length}`);
@@ -189,8 +200,8 @@ async function idempotencyTest() {
     type: "post", kind: "want", topics: [T("topic")], title,
     details: "idempotency probe", idempotency_key: pkey,
   };
-  ws.send(JSON.stringify(postMsg));
-  ws.send(JSON.stringify(postMsg));
+  vsend(ws, postMsg);
+  vsend(ws, postMsg);
   await new Promise((r) => setTimeout(r, 800));
   const postAcks = inbox.filter((m) => m.type === "post_ok");
   check("both posts acked", postAcks.length === 2, `got ${postAcks.length}`);
@@ -204,7 +215,7 @@ async function idempotencyTest() {
   check("post applied exactly once", posts === 1, `board shows ${posts}`);
   // cleanup: close the probe post
   if (postAcks.length) {
-    ws.send(JSON.stringify({ type: "close_post", id: postAcks[0].id }));
+    vsend(ws, { type: "close_post", id: postAcks[0].id });
     await new Promise((r) => setTimeout(r, 500));
   }
   ws.close();

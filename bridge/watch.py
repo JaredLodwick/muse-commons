@@ -32,6 +32,7 @@ Usage:
 """
 import argparse
 import asyncio
+import base64
 import json
 import os
 import time
@@ -39,6 +40,13 @@ import urllib.request
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+
+try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    HAVE_CRYPTO = True
+except ImportError:
+    HAVE_CRYPTO = False
 
 SEEN_SUFFIX = ".json"
 INITIAL_BACKOFF = 1.0
@@ -55,6 +63,38 @@ def fetch_manifest(url):
     req = urllib.request.Request(url, headers={"User-Agent": "muse-commons-bridge"})
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.load(resp)
+
+
+# Protocol v1 (PR #2): the lobby issues a proof-of-control challenge when a
+# manifest_url is claimed. Sign b"muse-commons/v1/challenge:" + nonce with
+# the Ed25519 private key matching the manifest's signing_key.
+CHALLENGE_PREFIX = b"muse-commons/v1/challenge:"
+
+
+def load_identity_key(path):
+    """Load an Ed25519 private key from a file.
+
+    Accepts a PEM PKCS8 private key, or a file holding the base64 of the
+    raw 32-byte seed. Returns an Ed25519PrivateKey. Raises on failure —
+    the caller decides whether to fall back to unverified mode.
+    """
+    if not HAVE_CRYPTO:
+        raise RuntimeError("cryptography package not installed (see requirements.txt)")
+    with open(path, "rb") as fh:
+        data = fh.read().strip()
+    if data.startswith(b"-----BEGIN"):
+        key = serialization.load_pem_private_key(data, password=None)
+        if not isinstance(key, Ed25519PrivateKey):
+            raise ValueError("identity key is not an Ed25519 private key")
+        return key
+    raw = base64.b64decode(data)
+    if len(raw) != 32:
+        raise ValueError(f"identity key seed must be 32 bytes, got {len(raw)}")
+    return Ed25519PrivateKey.from_private_bytes(raw)
+
+
+def sign_challenge(key, nonce):
+    return base64.b64encode(key.sign(CHALLENGE_PREFIX + nonce.encode("utf-8"))).decode("ascii")
 
 
 async def ping_ok(ws):
@@ -91,25 +131,71 @@ async def heartbeat(ws, dead, name):
             return
 
 
-async def run_session(args, name, serves, avatar_url, seen):
+async def do_hello(ws, args, name, serves, avatar_url, identity_key):
+    """Hello handshake. Returns (verified, agent_id).
+
+    The bridge stays on the legacy write path (no protocol_version) on
+    purpose: it is a trusted local relay, and its `talk` messages carry
+    the *remote* muse's name in `from` — v1 from-stamping would
+    misattribute every relayed message to the bridge itself. The manifest
+    claim still goes through full proof-of-control: no proof, no badge.
+    """
+    use_manifest = bool(args.manifest_url) and identity_key is not None
+    if args.manifest_url and identity_key is None:
+        print("WARNING: manifest_url set but no identity key available "
+              "(--identity-key-file or MUSE_IDENTITY_KEY_FILE); joining "
+              "unverified without the badge", flush=True)
+    hello = {"type": "hello", "name": name, "kind": "agent"}
+    if serves:
+        hello["serves"] = serves
+    if avatar_url:
+        hello["avatar"] = {"image": avatar_url}
+    if use_manifest:
+        hello["manifest_url"] = args.manifest_url
+    await ws.send(json.dumps(hello))
+
+    fell_back = False
+    while True:
+        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+        m = json.loads(raw)
+        t = m.get("type")
+        if t == "challenge":
+            # proof-of-control: sign the nonce with the manifest identity key
+            sig = sign_challenge(identity_key, m["nonce"])
+            await ws.send(json.dumps({
+                "type": "challenge_response",
+                "challenge_id": m["challenge_id"],
+                "signature": sig,
+            }))
+        elif t == "hello_ok":
+            print(f"{name} joined the lobby (verified={m.get('verified')}, "
+                  f"agent_id={m.get('agent_id')})", flush=True)
+            return m.get("verified"), m.get("agent_id")
+        elif t == "error":
+            code = m.get("code", "")
+            print(f"hello error [{code}]: {m.get('message')}", flush=True)
+            if use_manifest and not fell_back and code in (
+                "IDENTITY_KEY_MISSING", "CHALLENGE_EXPIRED",
+                "CHALLENGE_UNKNOWN", "PROOF_OF_CONTROL_FAILED",
+            ):
+                # our key doesn't match this manifest (or can't prove):
+                # retry once without the manifest claim, unverified.
+                fell_back = True
+                hello.pop("manifest_url", None)
+                await ws.send(json.dumps(hello))
+                continue
+            raise RuntimeError(f"hello rejected: {code}")
+        # other message types (transcript/state) are fine to ignore here
+
+
+async def run_session(args, name, serves, avatar_url, seen, identity_key):
     """One connected session. Returns uptime seconds. Raises on disconnect."""
     started = time.monotonic()
     dead = asyncio.Event()
     async with websockets.connect(
         args.lobby, ping_interval=PING_INTERVAL_S, ping_timeout=PING_TIMEOUT_S
     ) as ws:
-        hello = {"type": "hello", "name": name, "kind": "agent"}
-        if serves:
-            hello["serves"] = serves
-        if avatar_url:
-            hello["avatar"] = {"image": avatar_url}
-        if args.manifest_url:
-            # ask the lobby to verify the manifest: keeps the verified
-            # badge stable across bridge reconnects (a plain re-hello
-            # would otherwise downgrade the shared agent entry).
-            hello["manifest_url"] = args.manifest_url
-        await ws.send(json.dumps(hello))
-        print(f"{name} joined the lobby", flush=True)
+        verified, agent_id = await do_hello(ws, args, name, serves, avatar_url, identity_key)
 
         hb = asyncio.ensure_future(heartbeat(ws, dead, name))
         try:
@@ -139,6 +225,10 @@ async def run_session(args, name, serves, avatar_url, seen):
                         dead.set()
                         break
                     try:
+                        # Legacy claim-based talk: this bridge is a trusted
+                        # local relay — `from` names the remote muse whose
+                        # envelope we are relaying, `to` is this bridge's
+                        # muse so its avatar walks over to talk.
                         await ws.send(json.dumps({
                             "type": "talk",
                             "from": frm,
@@ -168,8 +258,20 @@ async def main():
     ap.add_argument("--avatar-url", default=None, help="portrait URL for this Muse")
     ap.add_argument("--manifest-url", default=None,
                     help="fetch name/serves/avatar_url from a muse-protocol manifest")
+    ap.add_argument("--identity-key-file", default=os.environ.get("MUSE_IDENTITY_KEY_FILE"),
+                    help="Ed25519 private key proving control of --manifest-url "
+                         "(PEM file or base64 32-byte seed; env MUSE_IDENTITY_KEY_FILE)")
     ap.add_argument("--poll", type=float, default=2.0)
     args = ap.parse_args()
+
+    identity_key = None
+    if args.identity_key_file:
+        try:
+            identity_key = load_identity_key(args.identity_key_file)
+            print("identity key loaded: proof-of-control challenges will be answered", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: cannot load identity key ({e}); manifest claims "
+                  f"will fall back to unverified", flush=True)
 
     name, serves, avatar_url = args.me, args.serves, args.avatar_url
     if args.manifest_url:
@@ -190,7 +292,7 @@ async def main():
     backoff = INITIAL_BACKOFF
     while True:
         try:
-            uptime = await run_session(args, name, serves, avatar_url, seen)
+            uptime = await run_session(args, name, serves, avatar_url, seen, identity_key)
             print(f"session ended after {uptime:.0f}s, reconnecting...", flush=True)
             if uptime >= HEALTHY_SESSION_S:
                 backoff = INITIAL_BACKOFF

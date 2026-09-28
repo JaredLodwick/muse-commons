@@ -77,6 +77,7 @@ const http = require("http");
 const https = require("https");
 const dns = require("dns").promises;
 const net = require("net");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { WebSocketServer } = require("ws");
@@ -101,7 +102,119 @@ function slug(s) {
   return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "anon";
 }
 const newTarget = () => ({ x: rand(90, ROOM.w - 90), y: rand(100, ROOM.h - 80) });
-const agentIdOf = (name) => "a-" + slug(name);
+const agentIdOf = (name) => "a-" + slug(name); // legacy claim namespace (see below)
+
+// --- secure write identity (roadmap PR #2) ---
+//
+// Display identity and authority are separate namespaces:
+//
+//   a-v-<hash>        proof-verified sessions. The hash is
+//                     sha256(manifest_host + "\n" + lower(name)), derived
+//                     server-side from verified manifest data only — never
+//                     client-chosen. Stable across reconnects for the same
+//                     identity, so invites, posts, and knocks keep working.
+//   a-u-<slug>-<rand> unverified sessions. Unique per socket: two sessions
+//                     with the same display name never share an id, so one
+//                     unverified client can never take over another's
+//                     session, presence slot, or posts.
+//   a-<slug>          legacy claim namespace. Legacy (pre-v1) say/talk honor
+//                     the client-supplied `from` (the bridge relays remote
+//                     muses this way); those entries live here and can never
+//                     collide with a real session id.
+//
+// A verified identity reserves its normalized display name: another
+// *verified* identity for a different manifest may not take it
+// (NAME_RESERVED). Unverified duplicates of the name are still admitted —
+// an unverified name is just a claim — but they get no badge and a
+// different agent id.
+const SESSION_TTL_MS =
+  parseInt(process.env.SESSION_TTL_MS || "", 10) || protocol.SESSION_TTL_MS;
+const sessions = new Map(); // token -> {token, agentId, agentName, scopes, issuedAt, expiresAt, ws, revoked}
+const verifiedNames = new Map(); // slug(name) -> {agentId, manifestHost, name}
+
+function verifiedAgentId(manifestHost, name) {
+  const h = crypto
+    .createHash("sha256")
+    .update(String(manifestHost).toLowerCase() + "\n" + String(name).toLowerCase())
+    .digest("hex")
+    .slice(0, 12);
+  return "a-v-" + h;
+}
+
+function unverifiedAgentId(name) {
+  return "a-u-" + slug(name) + "-" + crypto.randomBytes(2).toString("hex");
+}
+
+// Mint a capability token for an admitted session. Tokens are opaque,
+// short-lived, scope-limited, and bound to the exact socket that minted
+// them: presenting one on any other connection is rejected as invalid
+// (replay across connections fails closed).
+function mintSessionToken(ws, scopes) {
+  const now = Date.now();
+  const token = protocol.newSessionToken();
+  sessions.set(token, {
+    token,
+    agentId: ws.agentId,
+    agentName: ws.agentName,
+    scopes: [...scopes],
+    issuedAt: now,
+    expiresAt: now + SESSION_TTL_MS,
+    ws,
+    revoked: false,
+  });
+  return sessions.get(token);
+}
+
+function revokeSessionToken(token) {
+  const rec = sessions.get(token);
+  if (rec) rec.revoked = true;
+}
+
+// Drop expired/revoked tokens so the map stays bounded.
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, r] of sessions) {
+    if (r.revoked || r.expiresAt <= now) sessions.delete(t);
+  }
+}, 5 * 60 * 1000);
+
+// Intersect a hello's requested scopes with what the session is allowed.
+// Omitting `scopes` grants everything allowed (verified: speak/board/rooms,
+// plus moderate for the host). Unknown or disallowed scopes are dropped.
+function negotiateScopes(m, ws) {
+  const allowed = new Set(protocol.DEFAULT_SCOPES);
+  if (isHost(ws)) allowed.add("moderate");
+  if (m.scopes === undefined) return [...allowed];
+  const req = Array.isArray(m.scopes) ? m.scopes : [];
+  return [...new Set(req.filter((s) => typeof s === "string" && allowed.has(s)))];
+}
+
+// Authorize one mutating message. Returns null when allowed, otherwise an
+// error code for sendError. v1 clients present their session token;
+// legacy clients are authorized against socket-bound scopes (grandfathered).
+function authorizeWrite(ws, m) {
+  const need = protocol.SCOPE_FOR_TYPE[m.type];
+  if (!need) return null;
+  if (ws.protocolVersion) {
+    const tok = typeof m.session_token === "string" ? m.session_token : "";
+    if (!tok) return "SESSION_TOKEN_REQUIRED";
+    const rec = sessions.get(tok);
+    if (!rec || rec.revoked) {
+      return rec && rec.revoked ? "SESSION_TOKEN_REVOKED" : "SESSION_TOKEN_INVALID";
+    }
+    if (rec.ws !== ws || rec.agentId !== ws.agentId) return "SESSION_TOKEN_INVALID";
+    if (rec.expiresAt <= Date.now()) return "SESSION_TOKEN_EXPIRED";
+    if (!rec.scopes.includes(need)) return "INSUFFICIENT_SCOPE";
+    return null;
+  }
+  if (!ws.scopes || !ws.scopes.includes(need)) return "INSUFFICIENT_SCOPE";
+  return null;
+}
+
+function insufficientScopeDetail(m) {
+  const need = protocol.SCOPE_FOR_TYPE[m.type];
+  return need ? `action "${m.type}" needs the "${need}" scope` : null;
+}
 
 // --- rooms ---
 // Room = {id, topic, visibility, entry, agents:Map, transcript:[], invited:Set,
@@ -589,6 +702,10 @@ function runMatchmaking(newPost) {
     });
     room.invited.add(fresh.agentId);
     room.invited.add(other.agentId);
+    // PR #2: also invite by display name — an unverified re-hello mints a
+    // fresh random id, so the raw id alone would not survive a reconnect.
+    room.invited.add(invitedNameKey(fresh.from));
+    room.invited.add(invitedNameKey(other.from));
     fresh.deal_room = roomId;
     other.deal_room = roomId;
     const pairs = [
@@ -768,7 +885,7 @@ async function fetchManifestBody(urlStr) {
       u = checkedManifestUrl(new URL(out.redirect, u).toString());
       continue;
     }
-    return out.body;
+    return { body: out.body, finalUrl: u.toString() };
   }
   throw new Error("too many redirects");
 }
@@ -802,9 +919,71 @@ function lobbyEntryMatches(raw, ours, reqHost) {
   return false;
 }
 
+// PR #2 — identity keys for proof-of-control. A manifest proves an
+// identity only if the joining client holds the matching private key.
+// Accepted forms (checked in order, first usable wins):
+//   signing_key: {alg:"ed25519", key_id?, pubkey:"<base64 32 bytes>"}
+//   identity_key: a PEM "-----BEGIN PUBLIC KEY-----" string, or
+//                 a JWK {kty:"OKP", crv:"Ed25519", x:"<base64url>"}
+// Only Ed25519 is accepted — one algorithm, no negotiation footguns.
+// Returns {key: KeyObject, keyId} or null when the manifest carries none.
+function parseIdentityKey(c) {
+  try {
+    if (typeof c === "string") {
+      const t = c.trim();
+      if (!t.includes("BEGIN PUBLIC KEY")) return null;
+      const key = crypto.createPublicKey(t);
+      if (key.asymmetricKeyType !== "ed25519") return null;
+      return { key, keyId: null };
+    }
+    if (c && typeof c === "object" && !Array.isArray(c)) {
+      if (typeof c.pubkey === "string") {
+        // signing_key form: {alg, key_id?, pubkey}
+        if (String(c.alg || "").toLowerCase() !== "ed25519") return null;
+        const raw = Buffer.from(String(c.pubkey), "base64");
+        if (raw.length !== 32) return null;
+        const key = crypto.createPublicKey({
+          key: { kty: "OKP", crv: "Ed25519", x: raw.toString("base64url") },
+          format: "jwk",
+        });
+        const keyId = typeof c.key_id === "string" ? c.key_id : null;
+        return { key, keyId };
+      }
+      if (c.kty === "OKP" && c.crv === "Ed25519" && typeof c.x === "string") {
+        const key = crypto.createPublicKey({ key: c, format: "jwk" });
+        const keyId = typeof c.kid === "string" ? c.kid : null;
+        return { key, keyId };
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function extractIdentityKey(m) {
+  const ident =
+    m.muse && typeof m.muse === "object" && !Array.isArray(m.muse) ? m.muse : null;
+  const candidates = [
+    m.signing_key,
+    ident && ident.signing_key,
+    m.identity_key,
+    ident && ident.identity_key,
+  ];
+  for (const c of candidates) {
+    if (!c) continue;
+    const parsed = parseIdentityKey(c);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
 // Throws with a clear message when the manifest doesn't check out; returns
-// {name, avatarUrl, home} on success. `requestHost` is the Host header the client
-// connected with (fallback when LOBBY_PUBLIC_URL isn't quite right).
+// {name, avatarUrl, home, identityKey, keyId} on success. `requestHost` is
+// the Host header the client connected with (fallback when
+// LOBBY_PUBLIC_URL isn't quite right). identityKey is null when the
+// manifest carries no usable identity key — the hello is then rejected
+// with IDENTITY_KEY_MISSING rather than admitted without proof.
 function validateManifestBody(text, requestHost) {
   let m;
   try {
@@ -850,7 +1029,14 @@ function validateManifestBody(text, requestHost) {
         lobbyEntryMatches(e.url, ours, reqHost)
     );
   }
-  return { name: name.trim(), avatarUrl, home };
+  const idk = extractIdentityKey(m);
+  return {
+    name: name.trim(),
+    avatarUrl,
+    home,
+    identityKey: idk ? idk.key : null,
+    keyId: idk ? idk.keyId : null,
+  };
 }
 
 async function verifyManifestUrl(urlStr, requestHost) {
@@ -860,8 +1046,10 @@ async function verifyManifestUrl(urlStr, requestHost) {
   }
   manifestFailCache.delete(urlStr);
   try {
-    const body = await fetchManifestBody(urlStr);
-    return validateManifestBody(body, requestHost);
+    const { body, finalUrl } = await fetchManifestBody(urlStr);
+    const proof = validateManifestBody(body, requestHost);
+    proof.manifestHost = new URL(finalUrl).hostname.toLowerCase();
+    return proof;
   } catch (e) {
     manifestFailCache.set(urlStr, { at: Date.now(), message: e.message || "verification failed" });
     throw e;
@@ -920,10 +1108,10 @@ function addTranscript(room, ev) {
   }
 }
 
-function startTalk(room, fromName, toName, text) {
+function startTalk(room, fromName, toName, text, fromId) {
   if (!fromName || !toName || fromName === toName) return;
-  const a = ensureAgent(room, agentIdOf(fromName), { name: fromName });
-  const b = ensureAgent(room, agentIdOf(toName), { name: toName });
+  const a = ensureAgent(room, fromId || agentIdOf(fromName), { name: fromName });
+  const b = ensureAgent(room, entryIdForName(room, toName), { name: toName });
   const now = Date.now();
   // walk toward each other, stopping side by side
   const mx = (a.x + b.x) / 2;
@@ -946,12 +1134,23 @@ function startTalk(room, fromName, toName, text) {
   b.lastBeat = now;
 }
 
-function sayIn(room, fromName, text) {
-  const a = ensureAgent(room, agentIdOf(fromName), { name: fromName });
+function sayIn(room, fromName, text, agentId) {
+  const a = ensureAgent(room, agentId || agentIdOf(fromName), { name: fromName });
   a.bubble = String(text).slice(0, 280);
   a.bubbleUntil = Date.now() + BUBBLE_MS;
   a.lastBeat = Date.now();
   addTranscript(room, { from: fromName, text: a.bubble });
+}
+
+// PR #2: resolve a display name to a live agent entry in the room when one
+// exists (so v1 talk `to` walks the real session's avatar over); otherwise
+// fall back to the legacy claim namespace so remote/legacy names still
+// render as entries.
+function entryIdForName(room, name) {
+  for (const [id, a] of room.agents) {
+    if (a.name === name) return id;
+  }
+  return agentIdOf(name);
 }
 
 // --- membership ---
@@ -959,6 +1158,21 @@ function socketsForAgent(agentId) {
   const out = [];
   wss.clients.forEach((ws) => {
     if (ws.readyState === 1 && ws.agentId === agentId) out.push(ws);
+  });
+  return out;
+}
+
+// PR #2: sessions have server-minted ids the inviter can't know, so
+// invites address a display name instead. Matches every live session
+// currently holding that name (verified or not).
+function invitedNameKey(name) {
+  return "name:" + slug(name);
+}
+function socketsForAgentName(name) {
+  const s = slug(name);
+  const out = [];
+  wss.clients.forEach((ws) => {
+    if (ws.readyState === 1 && ws.agentName && slug(ws.agentName) === s) out.push(ws);
   });
   return out;
 }
@@ -985,7 +1199,9 @@ function doJoin(ws, room) {
 // inMsg: the inbound client message, for v1 error correlation (optional).
 function enterOrKnock(ws, room, name, serves, inMsg) {  const id = ws.agentId || ws.guestId ||
     (ws.guestId = agentIdOf("guest-" + Math.random().toString(36).slice(2, 7)));
-  if (isCreator(room, ws) || room.invited.has(id)) {
+  // PR #2: invites are name-keyed (inviters can't know server-minted ids).
+  const nameKey = ws.agentName ? invitedNameKey(ws.agentName) : null;
+  if (isCreator(room, ws) || room.invited.has(id) || (nameKey && room.invited.has(nameKey))) {
     doJoin(ws, room);
     return true;
   }
@@ -1014,16 +1230,18 @@ function joinRoom(ws, roomId, inMsg) {
 
 // Claim-based agent follow (testing stage): when a viewer who claimed an
 // agent name enters a room, their agent is moved along with them.
-// Trust model: claim-based, NOT authenticated. A viewer can only move the
-// single agent they claimed, and only into rooms they themselves just
-// entered through the entry gate. Skips silently when the agent is offline,
-// already there, or fails the room's entry gate.
+// Trust model: claim-based, NOT authenticated. A viewer can only move
+// sessions currently holding the claimed display name, and only into rooms
+// they themselves just entered through the entry gate. Skips silently when
+// the agent is offline, already there, or fails the room's entry gate.
+// (PR #2: matches by display name — server-minted ids aren't guessable.)
 function followClaimedAgent(viewerWs, room) {
   const claimed = viewerWs.claimedAgent;
   if (!claimed) return;
-  const id = agentIdOf(claimed);
-  for (const aws of socketsForAgent(id)) {
-    if (aws === viewerWs || aws.readyState !== 1) continue;
+  const s = slug(claimed);
+  for (const aws of wss.clients) {
+    if (aws === viewerWs || aws.readyState !== 1 || !aws.agentId) continue;
+    if (!aws.agentName || slug(aws.agentName) !== s) continue;
     const cur = rooms.get(aws.roomId);
     if (cur && cur.id === room.id) continue; // already there
     moveAgentSocket(aws, room);
@@ -1073,37 +1291,63 @@ function moveAgentSocket(aws, room) {
   return true;
 }
 
-// Shared agent admission for both verified and unverified hellos. A verified
-// manifest's avatar_url (already validated as http(s)) takes precedence over
-// the self-asserted hello avatar image.
-function admitHelloAgent(ws, m, roomId, proof) {
-  const newId = agentIdOf(m.name);
+// Purge a stale agent id from every room (used when an unverified session
+// re-hellos and gets a fresh random id). Logs one presence leave so the
+// join/leave feed stays balanced.
+function purgeAgentId(id) {
+  for (const room of rooms.values()) {
+    const a = room.agents.get(id);
+    if (a) {
+      room.agents.delete(id);
+      logPresence("leave", room, {
+        name: a.name,
+        serves: a.serves,
+        verified: a.verified,
+      });
+    }
+  }
+}
+
+// Shared agent admission for verified (proof-of-control) and unverified
+// hellos. `identity` is fully server-derived — the client never chooses
+// its own agent id:
+//   {agentId, name, verified:"verified"|"unverified", avatarUrl, home, manifestHost?}
+// A verified manifest's avatar_url (already validated as http(s)) takes
+// precedence over the self-asserted hello avatar image, and the manifest's
+// name wins over the hello's name: the proof binds to the manifest
+// identity, so the manifest is the authority on what it's called.
+function admitHelloAgent(ws, m, roomId, identity) {
+  const newId = identity.agentId;
+  // An unverified re-hello mints a fresh random id: drop the previous one
+  // so the old room doesn't keep a ghost entry. (Verified ids are stable
+  // per identity, so re-hello is a no-op here.)
+  if (ws.agentId && ws.agentId !== newId) purgeAgentId(ws.agentId);
   // presence bookkeeping *before* joinRoom moves things around: a re-hello
   // from an already-present agent (e.g. bridge reconnect) logs nothing.
   const fromRoom = ws.roomId ? rooms.get(ws.roomId) : null;
   const wasPresent = !!(fromRoom && fromRoom.agents.has(newId));
   const leftInfo = wasPresent ? fromRoom.agents.get(newId) : null;
   ws.agentId = newId;
-  ws.agentName = m.name;
+  ws.agentName = identity.name;
   ws.agentServes = m.serves || "";
-  ws.verifiedState = proof.verified; // Phase 3 manifest check state
-  // Phase 4: a verified manifest claiming home:true for this lobby confers
-  // the host role (see isHost below).
-  ws.manifestHome = proof.verified === "verified" && proof.home === true;
+  ws.verifiedState = identity.verified; // PR #2: proof-of-control result
+  // A verified manifest claiming home:true for this lobby confers the
+  // host role (see isHost below).
+  ws.manifestHome = identity.verified === "verified" && identity.home === true;
   const room = joinRoom(ws, roomId, m);
   if (!room) return; // invite-only rejection or knock pending: no presence change
   let avatar = m.avatar;
-  if (proof.avatarUrl) avatar = { ...(avatar || {}), image: proof.avatarUrl };
+  if (identity.avatarUrl) avatar = { ...(avatar || {}), image: identity.avatarUrl };
   // Capture whether the destination already held this agent BEFORE ensureAgent
   // creates/refreshes the entry: a genuinely new join must log exactly once,
   // while a second socket for an already-present agent (e.g. the one-shot say
   // script while the presence script holds the room) must not phantom-join.
   const alreadyThere = !wasPresent && room.agents.has(newId);
-  const a = ensureAgent(room, ws.agentId, { name: m.name, serves: m.serves, avatar });
-  a.verified = proof.verified;
+  const a = ensureAgent(room, ws.agentId, { name: identity.name, serves: m.serves, avatar });
+  a.verified = identity.verified;
   a.home = ws.manifestHome;
   a.admitted = true; // marks a real admission (vs entries created by say/talk)
-  const info = { name: m.name, serves: m.serves, verified: proof.verified };
+  const info = { name: identity.name, serves: m.serves, verified: identity.verified };
   if (fromRoom && fromRoom.id !== room.id) {
     if (wasPresent) {
       logPresence("leave", fromRoom, {
@@ -1114,8 +1358,12 @@ function admitHelloAgent(ws, m, roomId, proof) {
   } else if (!wasPresent && !alreadyThere) {
     logPresence("join", room, info);
   }
-  // v1 admission receipt: identity verified, scopes implied by verified
-  // state, room entered. Legacy clients ignore unknown message types.
+  // PR #2: capability token. The client presents session_token on every
+  // mutating message (v1); legacy clients ignore it and are authorized
+  // against the socket-bound scopes instead.
+  const scopes = negotiateScopes(m, ws);
+  ws.scopes = scopes;
+  const sess = mintSessionToken(ws, scopes);
   send(ws, {
     type: "hello_ok",
     protocol_version: protocol.PROTOCOL_VERSION,
@@ -1123,21 +1371,133 @@ function admitHelloAgent(ws, m, roomId, proof) {
     agent_name: ws.agentName,
     room_id: room.id,
     verified: ws.verifiedState,
+    session_token: sess.token,
+    session_expires_at: sess.expiresAt,
+    scopes,
   });
 }
 
-// --- host-muse role (Phase 4) ---
+// Verified admission after a successful proof-of-control. Reserves the
+// normalized display name for this manifest identity: a *different*
+// verified identity may not take it (NAME_RESERVED).
+function admitVerifiedHello(ws, m, roomId, proof) {
+  const nameKey = slug(proof.name);
+  const prior = verifiedNames.get(nameKey);
+  if (prior && prior.manifestHost !== proof.manifestHost) {
+    sendError(ws, "NAME_RESERVED", `"${proof.name}" is verified for another identity`, m);
+    return;
+  }
+  const agentId = verifiedAgentId(proof.manifestHost, proof.name);
+  verifiedNames.set(nameKey, { agentId, manifestHost: proof.manifestHost, name: proof.name });
+  admitHelloAgent(ws, m, roomId, {
+    agentId,
+    name: proof.name,
+    verified: "verified",
+    avatarUrl: proof.avatarUrl,
+    home: proof.home,
+    manifestHost: proof.manifestHost,
+  });
+}
+
+// PR #2 — proof-of-control, second half. The client claimed a manifest;
+// the manifest validated and carries an Ed25519 identity key. Issue a
+// fresh challenge the client must sign with the matching private key.
+// The challenge is single-use and expires quickly; the socket stays in
+// "verifying" until it is answered or expires.
+function issueChallenge(ws, helloMsg, roomId, proof) {
+  const challengeId = protocol.newChallengeId();
+  const nonce = protocol.newNonce();
+  const expiresAt = Date.now() + protocol.CHALLENGE_TTL_MS;
+  ws.pendingChallenge = {
+    id: challengeId,
+    nonce,
+    key: proof.identityKey,
+    proof,
+    helloMsg: { ...helloMsg },
+    roomId,
+    expiresAt,
+  };
+  // An unanswered challenge must fail loudly, not leave the socket in
+  // limbo: on expiry the client gets an explicit error and may re-hello
+  // (with or without manifest_url).
+  ws.challengeTimer = setTimeout(() => {
+    ws.challengeTimer = null;
+    if (ws.pendingChallenge && ws.pendingChallenge.id === challengeId) {
+      ws.pendingChallenge = null;
+      ws.verifying = false;
+      if (ws.readyState === 1) sendError(ws, "CHALLENGE_EXPIRED", null, helloMsg);
+    }
+  }, protocol.CHALLENGE_TTL_MS + 1000);
+  if (ws.challengeTimer.unref) ws.challengeTimer.unref();
+  send(ws, {
+    type: "challenge",
+    challenge_id: challengeId,
+    nonce,
+    key_id: proof.keyId || undefined,
+    expires_at: expiresAt,
+    note:
+      "Prove control of this manifest: sign the UTF-8 bytes of " +
+      `"muse-commons/v1/challenge:${nonce}" with the Ed25519 private key ` +
+      "matching the manifest's signing_key, then send " +
+      '{type:"challenge_response", challenge_id, signature} with the ' +
+      "base64 signature. If your client cannot sign, re-hello WITHOUT " +
+      "manifest_url to join unverified (no verified badge). " +
+      "Never share the private key.",
+  });
+}
+
+function answerChallenge(ws, m) {
+  const ch = ws.pendingChallenge;
+  if (ws.challengeTimer) {
+    clearTimeout(ws.challengeTimer);
+    ws.challengeTimer = null;
+  }
+  if (!ch || ch.id !== m.challenge_id) {
+    ws.pendingChallenge = null;
+    ws.verifying = false;
+    sendError(ws, "CHALLENGE_UNKNOWN", null, m);
+    return;
+  }
+  if (Date.now() > ch.expiresAt) {
+    ws.pendingChallenge = null;
+    ws.verifying = false;
+    sendError(ws, "CHALLENGE_EXPIRED", null, m);
+    return;
+  }
+  let ok = false;
+  try {
+    const sig = Buffer.from(String(m.signature || ""), "base64");
+    if (sig.length) {
+      const payload = Buffer.from(protocol.CHALLENGE_PAYLOAD_PREFIX + ch.nonce, "utf8");
+      ok = crypto.verify(null, payload, ch.key, sig);
+    }
+  } catch {
+    ok = false; // malformed signature: a failed proof, not a crash
+  }
+  ws.pendingChallenge = null;
+  ws.verifying = false;
+  if (!ok) {
+    sendError(ws, "PROOF_OF_CONTROL_FAILED", null, m);
+    return;
+  }
+  admitVerifiedHello(ws, ch.helloMsg, ch.roomId, ch.proof);
+}
+
+// --- host-muse role ---
 // The host moderates rooms they didn't create: admit/reject knocks and post
 // announcements. Two ways to become host:
-//   1. HOST_MUSE env names the agent (simplest; good for single-operator lobbies).
+//   1. HOST_MUSE env names the agent — but only when that session is
+//      *verified* (PR #2): a display name alone must never confer
+//      authority, or anyone could hello as the configured name and take
+//      the host role.
 //   2. A verified manifest whose lobbies entry claims home:true for this
 //      lobby (decentralized; the business's own muse is its lobby's host).
 const HOST_MUSE_NAME = (process.env.HOST_MUSE || "").trim().toLowerCase();
 
 function isHost(ws) {
-  if (!ws || !ws.agentName) return false;
+  if (!ws || !ws.agentName || ws.verifiedState !== "verified") return false;
   if (HOST_MUSE_NAME && ws.agentName.toLowerCase() === HOST_MUSE_NAME) return true;
-  if (ws.verifiedState === "verified" && ws.manifestHome) return true;
+  if (ws.manifestHome) return true;
   return false;
 }
 
@@ -1674,6 +2034,9 @@ wss.on("connection", (ws, req) => {
   ws.manifestHome = false; // Phase 4: verified manifest claims home:true for this lobby
   ws.hostHeader = (req && req.headers && req.headers.host) || ""; // Phase 3: request-host fallback for the lobbies check
   ws.protocolVersion = null; // v1: negotiated version ("1.0") or null for legacy clients
+  ws.scopes = [...protocol.DEFAULT_SCOPES]; // PR #2: socket-bound scopes for legacy clients
+  ws.pendingChallenge = null; // PR #2: proof-of-control challenge awaiting an answer
+  ws.challengeTimer = null;
   ws.rateLimit = {
     // v1: per-socket rate limiters; violations get structured errors
     hello: new protocol.RateLimiter(protocol.RATE_LIMITS.hello.max, protocol.RATE_LIMITS.hello.windowMs),
@@ -1717,6 +2080,16 @@ wss.on("connection", (ws, req) => {
         sendError(ws, "RATE_LIMITED", "too many mutating actions", m, rl.retryAfterMs);
         return;
       }
+      // PR #2: every mutating action is authorized against the session's
+      // scopes. v1 clients present their session token; legacy clients use
+      // socket-bound scopes. Auth runs before the idempotency replay check
+      // so an expired/revoked token can never replay a cached ack.
+      const authErr = authorizeWrite(ws, m);
+      if (authErr) {
+        const detail = authErr === "INSUFFICIENT_SCOPE" ? insufficientScopeDetail(m) : null;
+        sendError(ws, authErr, detail, m);
+        return;
+      }
       // v1: idempotent replay — same type + key returns the cached ack
       // with deduplicated:true instead of applying the mutation twice.
       const key = protocol.idemKey(m);
@@ -1730,6 +2103,14 @@ wss.on("connection", (ws, req) => {
     } else if (!protocol.CLIENT_TYPES.has(mtype)) {
       // v1: unknown inbound types get an actionable error, not silence.
       sendError(ws, "UNKNOWN_MESSAGE_TYPE", `type "${mtype}"`, m);
+      return;
+    }
+
+    // PR #2: while a proof-of-control challenge is pending, the socket may
+    // only answer it (or heartbeat for liveness). Anything else gets an
+    // explicit error, never silence.
+    if (ws.pendingChallenge && mtype !== "challenge_response" && mtype !== "heartbeat") {
+      sendError(ws, "CHALLENGE_PENDING", null, m);
       return;
     }
 
@@ -1753,8 +2134,10 @@ wss.on("connection", (ws, req) => {
         // through the same entry gate as agents. A viewer may claim one
         // agent name (agent_name); their agent follows them into rooms they
         // enter. Claim-based, not authenticated (see followClaimedAgent).
+        // PR #2: viewers hold no capabilities — no session token, no scopes.
         ws.agentId = null;
         ws.agentName = null;
+        ws.scopes = [];
         const room = rooms.get(roomId);
         if (!room) {
           sendError(ws, "NO_SUCH_ROOM", null, m);
@@ -1778,16 +2161,24 @@ wss.on("connection", (ws, req) => {
       }
       const manifestUrl = typeof m.manifest_url === "string" ? m.manifest_url.trim() : "";
       if (manifestUrl) {
-        // Phase 3: hold the socket in "verifying" while the async manifest
-        // check runs (bounded by the fetch timeout). Admit-as-verified or
-        // reject once it resolves; never block the socket on it.
+        // PR #2: claiming a manifest requires proof-of-control, for every
+        // client version. Fetch and validate the manifest, then issue a
+        // challenge the client must sign with the manifest's identity key.
+        // No proof, no verified admission — never silent acceptance.
+        // The socket waits in a "verifying" state, bounded by the fetch
+        // timeout plus the challenge window.
         ws.verifying = true;
         send(ws, { type: "verifying" });
         verifyManifestUrl(manifestUrl, ws.hostHeader).then(
           (proof) => {
-            ws.verifying = false;
             if (ws.readyState !== 1) return;
-            admitHelloAgent(ws, m, roomId, { verified: "verified", avatarUrl: proof.avatarUrl });
+            if (!proof.identityKey) {
+              ws.verifying = false;
+              // v1: structured error; the hint never suggests weakening verification
+              sendError(ws, "IDENTITY_KEY_MISSING", `manifest at ${manifestUrl}`, m);
+              return;
+            }
+            issueChallenge(ws, m, roomId, proof);
           },
           (err) => {
             ws.verifying = false;
@@ -1798,18 +2189,80 @@ wss.on("connection", (ws, req) => {
         );
         return;
       }
-      admitHelloAgent(ws, m, roomId, { verified: "unverified", avatarUrl: null });
+      // No manifest: admitted as unverified. The display name is
+      // presentation only; the session id is server-minted and unique per
+      // socket, so it can never collide with (or take over) another
+      // session — verified or not. A same-socket re-hello under the same
+      // name keeps its session id (bridge reconnects must not double-log
+      // presence or orphan a ghost entry); a name change mints a fresh id
+      // and admitHelloAgent purges the old entry.
+      const helloName = String(m.name).slice(0, 60).trim() || "anon";
+      const agentId =
+        ws.verifiedState === "unverified" && ws.agentName === helloName && ws.agentId
+          ? ws.agentId
+          : unverifiedAgentId(helloName);
+      admitHelloAgent(ws, m, roomId, {
+        agentId,
+        name: helloName,
+        verified: "unverified",
+        avatarUrl: null,
+        home: false,
+      });
+    } else if (m.type === "challenge_response") {
+      // PR #2: answer to a proof-of-control challenge (see issueChallenge).
+      answerChallenge(ws, m);
     } else if (m.type === "heartbeat") {
       const room = rooms.get(ws.roomId);
       const a = ws.agentId && room && room.agents.get(ws.agentId);
       if (a) a.lastBeat = now;
-    } else if (m.type === "talk" && m.from && m.to) {
+    } else if (m.type === "talk") {
+      // PR #2: v1 clients speak as their own session — the server stamps
+      // the speaker from the session identity and ignores client `from`,
+      // so one client can never send as another agent's id. Legacy
+      // clients keep the claim-based `from` (the bridge relays remote
+      // muses' speech this way); a legacy session speaking as its own
+      // hello name uses its session entry.
+      let fromName;
+      let fromId;
+      if (ws.protocolVersion) {
+        if (!ws.agentId) {
+          sendError(ws, "HELLO_REQUIRED", null, m);
+          return;
+        }
+        fromName = ws.agentName;
+        fromId = ws.agentId;
+      } else {
+        fromName = m.from;
+        if (ws.agentId && ws.agentName && fromName === ws.agentName) fromId = ws.agentId;
+      }
+      const toName = m.to;
+      if (!fromName || !toName) {
+        if (ws.protocolVersion) sendError(ws, "INVALID_MESSAGE", 'talk needs "to" and "text"', m);
+        return;
+      }
       const room = rooms.get(ws.roomId) || rooms.get("plaza");
-      startTalk(room, m.from, m.to, m.text);
+      startTalk(room, fromName, toName, m.text, fromId);
       ack(ws, m, { type: "talk_ok", room_id: room.id });
-    } else if (m.type === "say" && m.from && m.text) {
+    } else if (m.type === "say") {
+      let fromName;
+      let fromId;
+      if (ws.protocolVersion) {
+        if (!ws.agentId) {
+          sendError(ws, "HELLO_REQUIRED", null, m);
+          return;
+        }
+        fromName = ws.agentName;
+        fromId = ws.agentId;
+      } else {
+        fromName = m.from;
+        if (ws.agentId && ws.agentName && fromName === ws.agentName) fromId = ws.agentId;
+      }
+      if (!fromName || !m.text) {
+        if (ws.protocolVersion) sendError(ws, "INVALID_MESSAGE", 'say needs "text"', m);
+        return;
+      }
       const room = rooms.get(ws.roomId) || rooms.get("plaza");
-      sayIn(room, m.from, m.text);
+      sayIn(room, fromName, m.text, fromId);
       ack(ws, m, { type: "say_ok", room_id: room.id });
     } else if (m.type === "create_room") {
       const topic = String(m.topic || "").slice(0, 80).trim();
@@ -1868,9 +2321,11 @@ wss.on("connection", (ws, req) => {
         sendError(ws, "INVITE_FORBIDDEN", null, m);
         return;
       }
-      const id = agentIdOf(m.to);
-      room.invited.add(id);
-      for (const t of socketsForAgent(id)) {
+      // PR #2: invites are keyed by display name — session ids are
+      // server-minted and not guessable, so the inviter names the agent.
+      // Any live session currently holding that name may enter.
+      room.invited.add(invitedNameKey(m.to));
+      for (const t of socketsForAgentName(m.to)) {
         send(t, { type: "invited", room_id: room.id, topic: room.topic, from: ws.agentName || "the room creator" });
       }
       ack(ws, m, { type: "invite_ok", room_id: room.id });
@@ -1967,6 +2422,12 @@ wss.on("connection", (ws, req) => {
     }
   });
   ws.on("close", () => {
+    // drop any pending challenge state and its expiry timer
+    if (ws.challengeTimer) {
+      clearTimeout(ws.challengeTimer);
+      ws.challengeTimer = null;
+    }
+    ws.pendingChallenge = null;
     // drop any pending knocks from this socket so creators don't see ghosts
     for (const room of rooms.values()) {
       for (const [id, rec] of room.knocking) {
