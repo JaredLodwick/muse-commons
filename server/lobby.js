@@ -6,9 +6,19 @@
 // federation (manifest verification), and the business kit (intent board at
 // /board, deal matchmaking, host-muse role, drop-in hosting).
 //
+// Wire protocol v1 (see server/protocol-v1.js for the contract):
+//   - every server message carries a unique `msg_id`; clients SHOULD send
+//     `msg_id` too and get it echoed as `in_reply_to` on errors/acks.
+//   - mutating messages accept `idempotency_key`; replays return the cached
+//     ack with `deduplicated:true` instead of double-applying.
+//   - per-socket rate limits; violations get structured RATE_LIMITED errors.
+//   - hello may carry `protocol_version` ("1"/"1.0"); unsupported versions
+//     are rejected with VERSION_UNSUPPORTED. Omitting it = legacy mode.
+//   - errors are {type:"error", code, message, hint} — always actionable.
+//
 // Wire protocol (JSON):
 //   client -> server
-//     {type:"hello", name, serves, avatar:{color,emoji,image}, kind:"agent"|"viewer", room, manifest_url}
+//     {type:"hello", name, serves, avatar:{color,emoji,image}, kind:"agent"|"viewer", room, manifest_url, protocol_version?}
 //       room: room id to join (default "plaza"). Viewers may re-hello to
 //       switch rooms. Old clients send no room and land in plaza.
 //       manifest_url (Phase 3): optional URL of the client's muse-protocol
@@ -44,6 +54,12 @@
 //       for public rooms (discovery / "side conversations").
 //     {type:"verifying"}  // hello carried manifest_url; hold on while we check it
 //     {type:"error", message, room_id?}  // also sent when manifest verification fails
+//       v1: {type:"error", code, message, hint, in_reply_to?, retry_after_ms?}
+//     {type:"hello_ok", protocol_version, agent_id?, agent_name?, room_id, verified?, kind?}
+//       v1 admission receipt (ignored by legacy clients)
+//     {type:"say_ok", room_id} / {type:"talk_ok", room_id} / {type:"invite_ok", room_id}
+//     {type:"admit_ok", room_id, agent} / {type:"reject_ok", room_id, agent}
+//     {type:"announce_ok", room_id}  // v1 acks for mutating actions
 //     {type:"room_created", room_id, topic, visibility, entry}
 //     {type:"transcript", room_id, events:[{from,to?,text,t}]}  // last 50, on join
 //     {type:"knock_request", room_id, topic, agent:{id,name,serves}}  // to creator (and host)
@@ -56,7 +72,6 @@
 //     {type:"match", post_id, matched_post_id, overlap:[...], other:{name,serves,kind,title}, room_id}
 //       sent to both parties when a want meets an offer on shared topics
 //       (Phase 4); both are also auto-invited to a private deal room
-//     {type:"error", message, room_id?}
 
 const http = require("http");
 const https = require("https");
@@ -65,6 +80,7 @@ const net = require("net");
 const fs = require("fs");
 const path = require("path");
 const { WebSocketServer } = require("ws");
+const protocol = require("./protocol-v1"); // PR #1: versioned v1 wire contract
 
 const PORT = process.env.PORT || 8080;
 const ROOM = { w: 1000, h: 620 };
@@ -168,7 +184,32 @@ function publicRooms() {
 }
 
 function send(ws, obj) {
-  if (ws.readyState === 1) ws.send(JSON.stringify(obj));
+  // v1: every outbound protocol message carries a unique message id.
+  if (ws.readyState === 1) {
+    if (!obj.msg_id) obj.msg_id = protocol.newMsgId();
+    ws.send(JSON.stringify(obj));
+  }
+}
+
+// v1 structured error: {type:"error", code, message, hint}. `detail` is
+// appended to the catalog message; `inMsg` (the offending client message)
+// supplies msg_id correlation via in_reply_to.
+function sendError(ws, code, detail, inMsg, retryAfterMs) {
+  const msgId =
+    inMsg && typeof inMsg.msg_id === "string" ? inMsg.msg_id : undefined;
+  send(
+    ws,
+    protocol.errorPayload(code, { detail, msgId, retryAfterMs })
+  );
+}
+
+// v1 ack for a mutating action: remembers the response under the client's
+// idempotency_key so a replay returns the cached ack (deduplicated) instead
+// of applying the mutation twice.
+function ack(ws, m, payload) {
+  const key = protocol.idemKey(m);
+  if (key) ws.idempotency.set(m.type + ":" + key, payload);
+  send(ws, payload);
 }
 
 // --- lobby directory (Phase 2) ---
@@ -941,7 +982,8 @@ function doJoin(ws, room) {
 // hello/join with entry-policy enforcement. Joins open rooms freely; for
 // knock rooms registers a knock and notifies the creator; invite-only rooms
 // require a prior invite (or the creator). Viewers go through the same gate.
-function enterOrKnock(ws, room, name, serves) {  const id = ws.agentId || ws.guestId ||
+// inMsg: the inbound client message, for v1 error correlation (optional).
+function enterOrKnock(ws, room, name, serves, inMsg) {  const id = ws.agentId || ws.guestId ||
     (ws.guestId = agentIdOf("guest-" + Math.random().toString(36).slice(2, 7)));
   if (isCreator(room, ws) || room.invited.has(id)) {
     doJoin(ws, room);
@@ -952,7 +994,7 @@ function enterOrKnock(ws, room, name, serves) {  const id = ws.agentId || ws.gue
     return true;
   }
   if (room.entry === "invite") {
-    send(ws, { type: "error", message: "this room is invite-only", room_id: room.id });
+    sendError(ws, "ROOM_INVITE_ONLY", null, inMsg);
     return false;
   }
   registerKnock(room, id, name || ws.agentName || "guest", serves || "", ws);
@@ -961,13 +1003,13 @@ function enterOrKnock(ws, room, name, serves) {  const id = ws.agentId || ws.gue
 }
 
 // legacy alias (kept for clarity in hello flow)
-function joinRoom(ws, roomId) {
+function joinRoom(ws, roomId, inMsg) {
   const room = rooms.get(roomId);
   if (!room) {
-    send(ws, { type: "error", message: "no such room", room_id: roomId });
+    sendError(ws, "NO_SUCH_ROOM", null, inMsg);
     return null;
   }
-  return enterOrKnock(ws, room, ws.agentName, ws.agentServes) ? room : null;
+  return enterOrKnock(ws, room, ws.agentName, ws.agentServes, inMsg) ? room : null;
 }
 
 // Claim-based agent follow (testing stage): when a viewer who claimed an
@@ -1048,7 +1090,7 @@ function admitHelloAgent(ws, m, roomId, proof) {
   // Phase 4: a verified manifest claiming home:true for this lobby confers
   // the host role (see isHost below).
   ws.manifestHome = proof.verified === "verified" && proof.home === true;
-  const room = joinRoom(ws, roomId);
+  const room = joinRoom(ws, roomId, m);
   if (!room) return; // invite-only rejection or knock pending: no presence change
   let avatar = m.avatar;
   if (proof.avatarUrl) avatar = { ...(avatar || {}), image: proof.avatarUrl };
@@ -1072,6 +1114,16 @@ function admitHelloAgent(ws, m, roomId, proof) {
   } else if (!wasPresent && !alreadyThere) {
     logPresence("join", room, info);
   }
+  // v1 admission receipt: identity verified, scopes implied by verified
+  // state, room entered. Legacy clients ignore unknown message types.
+  send(ws, {
+    type: "hello_ok",
+    protocol_version: protocol.PROTOCOL_VERSION,
+    agent_id: ws.agentId,
+    agent_name: ws.agentName,
+    room_id: room.id,
+    verified: ws.verifiedState,
+  });
 }
 
 // --- host-muse role (Phase 4) ---
@@ -1098,6 +1150,12 @@ function hostSockets() {
 }
 
 function registerKnock(room, agentId, name, serves, ws) {
+  // v1: a repeated knock while one is already pending is a no-op re-send of
+  // knock_pending — knock is naturally idempotent, no duplicate creator pings.
+  if (room.knocking.has(agentId)) {
+    send(ws, { type: "knock_pending", room_id: room.id });
+    return;
+  }
   room.knocking.set(agentId, { name, serves, ws, t: Date.now() });
   // notify the creator (their socket, or any socket of their agent identity)
   // and the host, if any (Phase 4)
@@ -1152,6 +1210,7 @@ function tick() {
     }
     const msg = JSON.stringify({
       type: "state",
+      msg_id: protocol.newMsgId(), // v1: unique id on every protocol message
       t: now,
       room_id: room.id,
       topic: room.topic,
@@ -1614,20 +1673,81 @@ wss.on("connection", (ws, req) => {
   ws.verifiedState = "unverified"; // Phase 3/4: manifest check result
   ws.manifestHome = false; // Phase 4: verified manifest claims home:true for this lobby
   ws.hostHeader = (req && req.headers && req.headers.host) || ""; // Phase 3: request-host fallback for the lobbies check
+  ws.protocolVersion = null; // v1: negotiated version ("1.0") or null for legacy clients
+  ws.rateLimit = {
+    // v1: per-socket rate limiters; violations get structured errors
+    hello: new protocol.RateLimiter(protocol.RATE_LIMITS.hello.max, protocol.RATE_LIMITS.hello.windowMs),
+    write: new protocol.RateLimiter(protocol.RATE_LIMITS.write.max, protocol.RATE_LIMITS.write.windowMs),
+    all: new protocol.RateLimiter(protocol.RATE_LIMITS.all.max, protocol.RATE_LIMITS.all.windowMs),
+  };
+  ws.idempotency = new protocol.IdempotencyStore(); // v1: replay dedupe for mutating actions
   send(ws, { type: "transcript", room_id: "plaza", events: rooms.get("plaza").transcript });
   ws.on("message", (raw) => {
     let m;
     try {
       m = JSON.parse(raw);
     } catch {
+      // v1: malformed input gets an actionable error, not a silent drop
+      sendError(ws, "MALFORMED_MESSAGE");
+      return;
+    }
+    if (!m || typeof m !== "object" || Array.isArray(m)) {
+      sendError(ws, "MALFORMED_MESSAGE");
       return;
     }
     const now = Date.now();
+
+    // v1: per-socket rate limits. Violations return structured errors and
+    // leave the socket open — never silent drops.
+    const rlAll = ws.rateLimit.all.check(now);
+    if (!rlAll.ok) {
+      sendError(ws, "RATE_LIMITED", "too many messages", m, rlAll.retryAfterMs);
+      return;
+    }
+    const mtype = m.type;
+    if (mtype === "hello") {
+      const rl = ws.rateLimit.hello.check(now);
+      if (!rl.ok) {
+        sendError(ws, "RATE_LIMITED", "too many hellos", m, rl.retryAfterMs);
+        return;
+      }
+    } else if (protocol.MUTATING_TYPES.has(mtype)) {
+      const rl = ws.rateLimit.write.check(now);
+      if (!rl.ok) {
+        sendError(ws, "RATE_LIMITED", "too many mutating actions", m, rl.retryAfterMs);
+        return;
+      }
+      // v1: idempotent replay — same type + key returns the cached ack
+      // with deduplicated:true instead of applying the mutation twice.
+      const key = protocol.idemKey(m);
+      if (key) {
+        const cached = ws.idempotency.get(mtype + ":" + key, now);
+        if (cached) {
+          send(ws, { ...cached, deduplicated: true });
+          return;
+        }
+      }
+    } else if (!protocol.CLIENT_TYPES.has(mtype)) {
+      // v1: unknown inbound types get an actionable error, not silence.
+      sendError(ws, "UNKNOWN_MESSAGE_TYPE", `type "${mtype}"`, m);
+      return;
+    }
+
     let roomId = typeof m.room === "string" && m.room ? m.room : "plaza";
     if (roomId === "commons") roomId = "plaza"; // legacy alias: old clients said "commons"
 
     if (m.type === "hello") {
       if (ws.verifying) return; // a manifest check is already in flight
+      // v1: version negotiation. An explicit but unsupported version is a
+      // clean rejection; omitting protocol_version keeps legacy behavior.
+      if (m.protocol_version !== undefined) {
+        const pv = protocol.normalizeVersion(m.protocol_version);
+        if (!pv) {
+          sendError(ws, "VERSION_UNSUPPORTED", `got "${m.protocol_version}"`, m);
+          return;
+        }
+        ws.protocolVersion = pv;
+      }
       if (m.kind === "viewer" || !m.name) {
         // viewers (re)subscribe to a room; they get no avatar. Viewers pass
         // through the same entry gate as agents. A viewer may claim one
@@ -1637,14 +1757,23 @@ wss.on("connection", (ws, req) => {
         ws.agentName = null;
         const room = rooms.get(roomId);
         if (!room) {
-          send(ws, { type: "error", message: "no such room", room_id: roomId });
+          sendError(ws, "NO_SUCH_ROOM", null, m);
           return;
         }
         if (typeof m.agent_name === "string") {
           const claimed = m.agent_name.trim().slice(0, 60);
           ws.claimedAgent = claimed || null; // empty string clears the claim
         }
-        if (enterOrKnock(ws, room, null, "")) followClaimedAgent(ws, room);
+        if (enterOrKnock(ws, room, null, "", m)) {
+          followClaimedAgent(ws, room);
+          // v1 admission receipt (legacy clients ignore unknown types)
+          send(ws, {
+            type: "hello_ok",
+            protocol_version: protocol.PROTOCOL_VERSION,
+            room_id: room.id,
+            kind: "viewer",
+          });
+        }
         return;
       }
       const manifestUrl = typeof m.manifest_url === "string" ? m.manifest_url.trim() : "";
@@ -1663,10 +1792,8 @@ wss.on("connection", (ws, req) => {
           (err) => {
             ws.verifying = false;
             if (ws.readyState !== 1) return;
-            send(ws, {
-              type: "error",
-              message: "manifest verification failed: " + (err.message || "unknown error"),
-            });
+            // v1: structured error; the hint never suggests weakening verification
+            sendError(ws, "MANIFEST_VERIFY_FAILED", err.message || "unknown error", m);
           }
         );
         return;
@@ -1679,13 +1806,15 @@ wss.on("connection", (ws, req) => {
     } else if (m.type === "talk" && m.from && m.to) {
       const room = rooms.get(ws.roomId) || rooms.get("plaza");
       startTalk(room, m.from, m.to, m.text);
+      ack(ws, m, { type: "talk_ok", room_id: room.id });
     } else if (m.type === "say" && m.from && m.text) {
       const room = rooms.get(ws.roomId) || rooms.get("plaza");
       sayIn(room, m.from, m.text);
+      ack(ws, m, { type: "say_ok", room_id: room.id });
     } else if (m.type === "create_room") {
       const topic = String(m.topic || "").slice(0, 80).trim();
       if (!topic) {
-        send(ws, { type: "error", message: "topic is required" });
+        sendError(ws, "TOPIC_REQUIRED", null, m);
         return;
       }
       const visibility = m.visibility === "private" ? "private" : "public";
@@ -1719,7 +1848,7 @@ wss.on("connection", (ws, req) => {
           name: ws.agentName, serves: ws.agentServes, verified: na.verified,
         });
       }
-      send(ws, {
+      ack(ws, m, {
         type: "room_created",
         room_id: room.id,
         topic: room.topic,
@@ -1731,12 +1860,12 @@ wss.on("connection", (ws, req) => {
     } else if (m.type === "invite" && m.room_id && m.to) {
       const room = rooms.get(m.room_id);
       if (!room) {
-        send(ws, { type: "error", message: "no such room", room_id: m.room_id });
+        sendError(ws, "NO_SUCH_ROOM", null, m);
         return;
       }
       const member = ws.agentId && room.agents.has(ws.agentId);
       if (!isCreator(room, ws) && !member) {
-        send(ws, { type: "error", message: "only the room creator or members can invite", room_id: room.id });
+        sendError(ws, "INVITE_FORBIDDEN", null, m);
         return;
       }
       const id = agentIdOf(m.to);
@@ -1744,22 +1873,23 @@ wss.on("connection", (ws, req) => {
       for (const t of socketsForAgent(id)) {
         send(t, { type: "invited", room_id: room.id, topic: room.topic, from: ws.agentName || "the room creator" });
       }
+      ack(ws, m, { type: "invite_ok", room_id: room.id });
     } else if (m.type === "knock" && m.room_id) {
       const room = rooms.get(m.room_id);
       if (!room) {
-        send(ws, { type: "error", message: "no such room", room_id: m.room_id });
+        sendError(ws, "NO_SUCH_ROOM", null, m);
         return;
       }
       if (!ws.agentId && m.name) ws.agentName = String(m.name).slice(0, 60);
-      enterOrKnock(ws, room, ws.agentName, ws.agentServes || "");
+      enterOrKnock(ws, room, ws.agentName, ws.agentServes || "", m);
     } else if (m.type === "admit" && m.room_id && m.agent) {
       const room = rooms.get(m.room_id);
       if (!room) {
-        send(ws, { type: "error", message: "no such room", room_id: m.room_id });
+        sendError(ws, "NO_SUCH_ROOM", null, m);
         return;
       }
       if (!isCreator(room, ws) && !isHost(ws)) {
-        send(ws, { type: "error", message: "only the room creator or host can admit", room_id: room.id });
+        sendError(ws, "ADMIT_FORBIDDEN", null, m);
         return;
       }
       const id = String(m.agent);
@@ -1774,15 +1904,16 @@ wss.on("connection", (ws, req) => {
       for (const t of socketsForAgent(id)) {
         if (!notified.has(t)) send(t, { type: "admitted", room_id: room.id, topic: room.topic });
       }
+      ack(ws, m, { type: "admit_ok", room_id: room.id, agent: id });
     } else if (m.type === "reject" && m.room_id && m.agent) {
       // Phase 4: creator or host turns a knocker away.
       const room = rooms.get(m.room_id);
       if (!room) {
-        send(ws, { type: "error", message: "no such room", room_id: m.room_id });
+        sendError(ws, "NO_SUCH_ROOM", null, m);
         return;
       }
       if (!isCreator(room, ws) && !isHost(ws)) {
-        send(ws, { type: "error", message: "only the room creator or host can reject", room_id: room.id });
+        sendError(ws, "REJECT_FORBIDDEN", null, m);
         return;
       }
       const id = String(m.agent);
@@ -1791,38 +1922,40 @@ wss.on("connection", (ws, req) => {
       if (rec && rec.ws && rec.ws.readyState === 1) {
         send(rec.ws, { type: "rejected", room_id: room.id, topic: room.topic });
       }
+      ack(ws, m, { type: "reject_ok", room_id: room.id, agent: id });
     } else if (m.type === "announce" && m.text) {
       // Phase 4: host-only broadcast into a room's transcript + a bubble.
       if (!isHost(ws)) {
-        send(ws, { type: "error", message: "only the host can announce" });
+        sendError(ws, "HOST_ONLY", null, m);
         return;
       }
       const room = (typeof m.room_id === "string" && rooms.get(m.room_id)) ||
         rooms.get(ws.roomId) || rooms.get("plaza");
       sayIn(room, (ws.agentName || "host") + " 📢", String(m.text).slice(0, 500));
+      ack(ws, m, { type: "announce_ok", room_id: room.id });
     } else if (m.type === "post") {
       // Phase 4: post an intent to the #marketplace board.
       if (!ws.agentId) {
-        send(ws, { type: "error", message: "say hello as an agent before posting" });
+        sendError(ws, "HELLO_REQUIRED", null, m);
         return;
       }
       const res = createPost(ws, m);
       if (res.error) {
-        send(ws, { type: "error", message: res.error });
+        sendError(ws, "POST_INVALID", res.error, m);
         return;
       }
-      send(ws, { type: "post_ok", id: res.post.id });
+      ack(ws, m, { type: "post_ok", id: res.post.id });
       runMatchmaking(res.post);
     } else if (m.type === "close_post" && m.id) {
       // Phase 4: the poster closes their own intent.
       const board = readBoard();
       const p = board.posts.find((x) => x.id === String(m.id));
       if (!p) {
-        send(ws, { type: "error", message: "no such post" });
+        sendError(ws, "NO_SUCH_POST", null, m);
         return;
       }
       if (p.agentId !== ws.agentId) {
-        send(ws, { type: "error", message: "only the poster can close this post" });
+        sendError(ws, "NOT_POST_OWNER", null, m);
         return;
       }
       if (p.status === "active") {
@@ -1830,7 +1963,7 @@ wss.on("connection", (ws, req) => {
         p.closed_at = Date.now();
         writeBoard(board);
       }
-      send(ws, { type: "post_closed", id: p.id });
+      ack(ws, m, { type: "post_closed", id: p.id });
     }
   });
   ws.on("close", () => {
