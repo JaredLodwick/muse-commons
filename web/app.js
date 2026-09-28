@@ -523,8 +523,12 @@ function hexA(hex, a) {
 const roomStatic = document.createElement("canvas");
 roomStatic.width = WORLD.w * 2;
 roomStatic.height = WORLD.h * 2;
-const LAMPS = [150, 850];
-const FLOOR_Y = 430;
+// Near-top-down lounge: the wooden floor fills the world and the wall is
+// only a thin strip along the top edge, so agents always read as walking
+// on the floor, never on walls. Furniture is drawn from above.
+const LAMPS = [230, 770];
+const POOL_Y = 300;
+const WALL_H = 64;
 
 function pictureFrame(c, x, y, w, h, seed) {
   c.fillStyle = "#4a3826";
@@ -547,63 +551,27 @@ function pictureFrame(c, x, y, w, h, seed) {
   }
 }
 
-function plantC(c, x, y) {
-  // leaves behind the pot
-  for (let k = 0; k < 7; k++) {
-    const a = (-90 + (k - 3) * 22) * Math.PI / 180;
-    const len = 36 + prand(k * 3.3 + x) * 24;
-    c.save();
-    c.translate(x, y - 12);
-    c.rotate(a);
-    c.fillStyle = k % 2 ? "#2f7d4f" : "#3aa05c";
-    c.beginPath(); c.ellipse(0, -len / 2, 9, len / 2, 0, 0, 6.2832); c.fill();
-    // leaf vein highlight
-    c.strokeStyle = "rgba(255,255,255,.14)";
-    c.lineWidth = 1.5;
-    c.beginPath(); c.moveTo(0, -6); c.lineTo(0, -len + 8); c.stroke();
-    c.restore();
-  }
-  // terracotta pot
+function plantTop(c, x, y) {
+  // potted plant seen from above: terracotta pot with a leaf canopy
+  c.fillStyle = "rgba(0,0,0,.30)";
+  c.beginPath(); c.ellipse(x + 4, y + 8, 46, 36, 0, 0, 6.2832); c.fill();
   c.fillStyle = "#8a4a30";
-  c.beginPath();
-  c.moveTo(x - 20, y - 6); c.lineTo(x + 20, y - 6);
-  c.lineTo(x + 14, y + 22); c.lineTo(x - 14, y + 22);
-  c.closePath(); c.fill();
-  c.fillStyle = "rgba(255,220,180,.16)";
-  c.beginPath();
-  c.moveTo(x - 20, y - 6); c.lineTo(x - 14, y - 6);
-  c.lineTo(x - 11, y + 22); c.lineTo(x - 14, y + 22);
-  c.closePath(); c.fill();
-  c.fillStyle = "#a35c3c";
-  c.fillRect(x - 23, y - 13, 46, 8);
-}
-
-function lampFixture(c, x) {
-  c.strokeStyle = "#0b0b10";
-  c.lineWidth = 3;
-  c.beginPath(); c.moveTo(x, 0); c.lineTo(x, 66); c.stroke();
-  // shade
-  c.fillStyle = "#6b4a34";
-  c.beginPath();
-  c.moveTo(x - 36, 66); c.lineTo(x + 36, 66);
-  c.lineTo(x + 24, 106); c.lineTo(x - 24, 106);
-  c.closePath(); c.fill();
-  c.fillStyle = "rgba(255,220,170,.22)";
-  c.beginPath();
-  c.moveTo(x - 36, 66); c.lineTo(x + 36, 66);
-  c.lineTo(x + 30, 80); c.lineTo(x - 30, 80);
-  c.closePath(); c.fill();
-  // bulb
-  c.fillStyle = "#ffe3b0";
-  c.beginPath(); c.arc(x, 110, 7, 0, 6.2832); c.fill();
-  // baked halo + floor pool (flicker is drawn live on top)
-  const hg = c.createRadialGradient(x, 110, 4, x, 110, 120);
-  hg.addColorStop(0, "rgba(255,196,110,.20)");
-  hg.addColorStop(1, "rgba(255,196,110,0)");
-  c.fillStyle = hg;
-  c.beginPath(); c.arc(x, 110, 120, 0, 6.2832); c.fill();
-  c.fillStyle = "rgba(255,190,110,.08)";
-  c.beginPath(); c.ellipse(x, 580, 130, 26, 0, 0, 6.2832); c.fill();
+  c.beginPath(); c.arc(x, y, 30, 0, 6.2832); c.fill();
+  c.fillStyle = "#6e3a24";
+  c.beginPath(); c.arc(x, y, 22, 0, 6.2832); c.fill();
+  c.fillStyle = "#2e1f16";
+  c.beginPath(); c.arc(x, y, 18, 0, 6.2832); c.fill();
+  const greens = ["#2f7d4f", "#3aa05c", "#276b42", "#46b46a"];
+  for (let k = 0; k < 9; k++) {
+    const a = (k / 9) * 6.2832 + prand(x + k * 7.7) * 0.7;
+    const rad = 6 + prand(x * 1.3 + k * 3.1) * 12;
+    c.fillStyle = greens[k % greens.length];
+    c.beginPath();
+    c.arc(x + Math.cos(a) * rad, y + Math.sin(a) * rad, 10 + prand(k * 5.9 + y) * 6, 0, 6.2832);
+    c.fill();
+  }
+  c.fillStyle = "rgba(255,255,255,.10)";
+  c.beginPath(); c.arc(x - 7, y - 8, 9, 0, 6.2832); c.fill();
 }
 
 function buildRoomStatic() {
@@ -611,35 +579,10 @@ function buildRoomStatic() {
   c.scale(2, 2);
   const W = WORLD.w, H = WORLD.h;
 
-  // warm wall
-  let g = c.createLinearGradient(0, 0, 0, FLOOR_Y);
-  g.addColorStop(0, "#2e2840");
-  g.addColorStop(0.6, "#282334");
-  g.addColorStop(1, "#221c2c");
-  c.fillStyle = g;
-  c.fillRect(0, 0, W, FLOOR_Y);
-
-  // framed art on the wall
-  pictureFrame(c, 268, 96, 150, 112, 11);
-  pictureFrame(c, 668, 118, 120, 150, 47);
-
-  // wainscot + chair rail
-  c.fillStyle = "#1c1725";
-  c.fillRect(0, 378, W, FLOOR_Y - 378);
-  c.strokeStyle = "rgba(0,0,0,.35)";
-  c.lineWidth = 1;
-  for (let x = 45; x < W; x += 90) {
-    c.beginPath(); c.moveTo(x, 384); c.lineTo(x, FLOOR_Y - 4); c.stroke();
-  }
-  c.fillStyle = "#54402c";
-  c.fillRect(0, 372, W, 10);
-  c.fillStyle = "rgba(255,225,180,.22)";
-  c.fillRect(0, 372, W, 2);
-
-  // wooden plank floor with per-plank tone variation
-  const plankH = (H - FLOOR_Y) / 6;
-  for (let i = 0; i < 6; i++) {
-    const y0 = FLOOR_Y + i * plankH;
+  // wooden plank floor fills the whole world, with per-plank tone variation
+  const plankN = 9, plankH = (H - WALL_H) / plankN;
+  for (let i = 0; i < plankN; i++) {
+    const y0 = WALL_H + i * plankH;
     const l = 21 + prand(i * 1.7) * 7;
     c.fillStyle = `hsl(${26 + prand(i * 3.1) * 6},${30 + prand(i * 5.3) * 8}%,${l}%)`;
     c.fillRect(0, y0, W, plankH);
@@ -654,15 +597,15 @@ function buildRoomStatic() {
     }
   }
   // floor sheen
-  g = c.createLinearGradient(0, FLOOR_Y, 0, H);
-  g.addColorStop(0, "rgba(255,220,160,.07)");
+  let g = c.createLinearGradient(0, WALL_H, 0, H);
+  g.addColorStop(0, "rgba(255,220,160,.06)");
   g.addColorStop(0.5, "rgba(255,220,160,0)");
-  g.addColorStop(1, "rgba(0,0,0,.14)");
+  g.addColorStop(1, "rgba(0,0,0,.16)");
   c.fillStyle = g;
-  c.fillRect(0, FLOOR_Y, W, H - FLOOR_Y);
+  c.fillRect(0, WALL_H, W, H - WALL_H);
 
-  // rug with patterned double border
-  const rx = 500, ry = 528, rrX = 295, rrY = 82;
+  // rug with patterned double border, seen from above
+  const rx = 500, ry = 400, rrX = 300, rrY = 195;
   c.fillStyle = "#472b33";
   c.beginPath(); c.ellipse(rx, ry, rrX, rrY, 0, 0, 6.2832); c.fill();
   c.lineWidth = 7; c.strokeStyle = "#2a1a20";
@@ -684,37 +627,83 @@ function buildRoomStatic() {
   c.strokeRect(-26, -26, 52, 52);
   c.restore();
 
-  // coffee table in wood tones
-  const tx = 500, ty = 470;
-  c.fillStyle = "#3a2614";
-  c.fillRect(tx - 66, ty + 22, 12, 30);
-  c.fillRect(tx + 54, ty + 22, 12, 30);
-  c.fillStyle = "#5f3f24";
-  rr(c, tx - 80, ty - 6, 160, 30, 9); c.fill();
-  c.fillStyle = "#7a5330";
-  rr(c, tx - 80, ty - 14, 160, 18, 9); c.fill();
-  c.fillStyle = "rgba(255,225,180,.20)";
-  rr(c, tx - 72, ty - 12, 144, 6, 3); c.fill();
-  // books
+  // coffee table seen from above
+  const tx = 500, ty = 400;
+  c.fillStyle = "rgba(0,0,0,.35)";
+  c.beginPath(); c.ellipse(tx, ty + 10, 122, 76, 0, 0, 6.2832); c.fill();
+  const tg = c.createLinearGradient(0, ty - 66, 0, ty + 66);
+  tg.addColorStop(0, "#7a5330");
+  tg.addColorStop(1, "#5a3d24");
+  c.fillStyle = tg;
+  rr(c, tx - 105, ty - 66, 210, 132, 18); c.fill();
+  c.strokeStyle = "rgba(0,0,0,.35)";
+  c.lineWidth = 2;
+  rr(c, tx - 105, ty - 66, 210, 132, 18); c.stroke();
+  c.fillStyle = "rgba(255,225,180,.22)";
+  rr(c, tx - 97, ty - 60, 194, 5, 2.5); c.fill();
+  c.strokeStyle = "rgba(255,220,170,.16)";
+  c.lineWidth = 2;
+  rr(c, tx - 90, ty - 51, 180, 102, 12); c.stroke();
+  // books (top-down)
   c.fillStyle = "#7a4a5e";
-  rr(c, tx - 34, ty - 26, 46, 11, 2); c.fill();
+  rr(c, tx - 78, ty - 34, 66, 46, 3); c.fill();
   c.fillStyle = "#47617e";
-  rr(c, tx - 28, ty - 37, 38, 11, 2); c.fill();
-  c.fillStyle = "rgba(255,255,255,.25)";
-  c.fillRect(tx - 28, ty - 37, 3, 11);
-  // mug
-  c.fillStyle = "#8a6a4a";
-  c.beginPath(); c.arc(tx + 48, ty - 24, 5.5, 0, 6.2832); c.fill();
+  rr(c, tx - 72, ty - 28, 54, 34, 3); c.fill();
+  c.fillStyle = "rgba(255,255,255,.28)";
+  c.fillRect(tx - 72, ty - 28, 4, 34);
+  // mug (top-down)
   c.fillStyle = "#c9d4e2";
-  c.beginPath(); c.arc(tx + 48, ty - 24, 8, 0.3, 5.9); c.fill();
-  c.fillStyle = "#8a6a4a";
-  c.beginPath(); c.arc(tx + 48, ty - 24, 5, 0, 6.2832); c.fill();
-  c.lineWidth = 2.5; c.strokeStyle = "#c9d4e2";
-  c.beginPath(); c.arc(tx + 57, ty - 24, 5, -1.2, 1.2); c.stroke();
+  c.beginPath(); c.arc(tx + 62, ty - 18, 13, 0, 6.2832); c.fill();
+  c.fillStyle = "#4a2e1c";
+  c.beginPath(); c.arc(tx + 62, ty - 18, 8.5, 0, 6.2832); c.fill();
+  c.strokeStyle = "#c9d4e2";
+  c.lineWidth = 3;
+  c.beginPath(); c.arc(tx + 76, ty - 18, 7, -1.2, 1.2); c.stroke();
+  // tiny succulent (top-down)
+  c.fillStyle = "#8a4a30";
+  c.beginPath(); c.arc(tx + 30, ty + 38, 11, 0, 6.2832); c.fill();
+  c.fillStyle = "#2e1f16";
+  c.beginPath(); c.arc(tx + 30, ty + 38, 7, 0, 6.2832); c.fill();
+  c.fillStyle = "#3aa05c";
+  for (let i = 0; i < 5; i++) {
+    const a = (i / 5) * 6.2832;
+    c.beginPath(); c.arc(tx + 30 + Math.cos(a) * 5, ty + 38 + Math.sin(a) * 5, 3.2, 0, 6.2832); c.fill();
+  }
 
-  plantC(c, 90, 556);
-  plantC(c, 912, 556);
-  for (const lx of LAMPS) lampFixture(c, lx);
+  // corner plants, seen from above
+  plantTop(c, 80, 122);
+  plantTop(c, 920, 122);
+  plantTop(c, 80, 548);
+  plantTop(c, 920, 548);
+
+  // warm light pools baked into the floor (live flicker drawn on top)
+  for (const lx of LAMPS) {
+    const pg = c.createRadialGradient(lx, POOL_Y, 10, lx, POOL_Y, 200);
+    pg.addColorStop(0, "rgba(255,196,110,.12)");
+    pg.addColorStop(1, "rgba(255,196,110,0)");
+    c.fillStyle = pg;
+    c.beginPath(); c.arc(lx, POOL_Y, 200, 0, 6.2832); c.fill();
+  }
+
+  // thin wall strip along the top edge: warm wall, small art, chair rail.
+  // Agents never walk above y=100, so nothing living touches this strip.
+  g = c.createLinearGradient(0, 0, 0, WALL_H);
+  g.addColorStop(0, "#2e2840");
+  g.addColorStop(1, "#221c2c");
+  c.fillStyle = g;
+  c.fillRect(0, 0, W, WALL_H);
+  pictureFrame(c, 200, 10, 104, 40, 11);
+  pictureFrame(c, 700, 14, 88, 36, 47);
+  c.fillStyle = "#54402c";
+  c.fillRect(0, WALL_H - 8, W, 8);
+  c.fillStyle = "rgba(255,225,180,.22)";
+  c.fillRect(0, WALL_H - 8, W, 2);
+  // soft shadow where the wall meets the floor
+  g = c.createLinearGradient(0, WALL_H, 0, WALL_H + 26);
+  g.addColorStop(0, "rgba(0,0,0,.28)");
+  g.addColorStop(1, "rgba(0,0,0,0)");
+  c.fillStyle = g;
+  c.fillRect(0, WALL_H, W, 26);
 }
 buildRoomStatic();
 
@@ -737,8 +726,8 @@ const MOTES = [];
 for (let i = 0; i < 44; i++) {
   const cx = (i % 2 === 0) ? LAMPS[0] : LAMPS[1];
   MOTES.push({
-    bx: cx + (prand(i * 3 + 1) - 0.5) * 340,
-    by: 110 + prand(i * 3 + 2) * 400,
+    bx: cx + (prand(i * 3 + 1) - 0.5) * 360,
+    by: POOL_Y + (prand(i * 3 + 2) - 0.5) * 380,
     r: 0.8 + prand(i * 3 + 3) * 1.7,
     ph: prand(i * 7 + 0.5) * 6.2832,
     sp: 0.00010 + prand(i * 11 + 0.3) * 0.00022,
@@ -765,13 +754,13 @@ function draw(t) {
   ctx.lineWidth = 2 / cam.zoom;
   ctx.strokeRect(0, 0, WORLD.w, WORLD.h);
 
-  // lamp flicker: warm halo + floor pool, very subtle
+  // lamp light: warm pools breathing on the floor, very subtle
   for (const lx of LAMPS) {
     const fl = 0.9 + 0.06 * Math.sin(t / 640 + lx * 0.13) + 0.04 * Math.sin(t / 173 + lx);
-    ctx.globalAlpha = 0.5 * fl;
-    ctx.drawImage(glowSprite, lx - 95, 110 - 95, 190, 190);
     ctx.globalAlpha = 0.30 * fl;
-    ctx.drawImage(glowSprite, lx - 130, 580 - 27, 260, 54);
+    ctx.drawImage(glowSprite, lx - 115, POOL_Y - 115, 230, 230);
+    ctx.globalAlpha = 0.20 * fl;
+    ctx.drawImage(glowSprite, lx - 175, POOL_Y - 95, 350, 190);
   }
   ctx.globalAlpha = 1;
 
