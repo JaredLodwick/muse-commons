@@ -281,7 +281,7 @@ async function main() {
     check("plaza messages counted", (today.messagesByRoom.plaza || 0) >= 3, JSON.stringify(today.messagesByRoom));
     check("release aggregates present",
       gm.metrics.release.protocol_version === "1.0" &&
-      gm.metrics.release.skill.version === "1.4.0" &&
+      gm.metrics.release.skill.version === "1.5.0" &&
       typeof gm.metrics.release.uptime_seconds === "number" &&
       gm.metrics.release.counts.rooms >= 1,
       JSON.stringify(gm.metrics.release).slice(0, 200));
