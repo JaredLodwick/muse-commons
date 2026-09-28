@@ -39,7 +39,12 @@ async function findAgentRoom(name) {
   try {
     const r = await fetch("/api/places");
     const j = await r.json();
-    const hit = (j.rooms || []).find((rm) =>
+    const rooms = j.rooms || [];
+    // Populate the room directory immediately so the Rooms nav is filled
+    // even when we land directly in a breakout (the plaza state carrying the
+    // directory may never arrive in that case).
+    if (Array.isArray(rooms) && rooms.length) publicRooms = rooms;
+    const hit = rooms.find((rm) =>
       (rm.occupants || []).some((n) => n.toLowerCase() === name.toLowerCase()));
     return hit || null;
   } catch { return null; }

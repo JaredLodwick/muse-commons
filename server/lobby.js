@@ -957,6 +957,11 @@ function moveAgentSocket(aws, room) {
   const id = aws.agentId;
   const prevRoom = rooms.get(aws.roomId);
   const prevAgent = prevRoom && id ? prevRoom.agents.get(id) : null;
+  // When several sockets share one agent id (e.g. presence socket plus a
+  // one-shot sender), the first move carries the entry; later sockets find
+  // prevAgent gone and the entry already in the destination. Only log one
+  // actual identity transition.
+  const destHadIt = !!(id && room.agents.has(id));
   // same entry gate the viewer passed; knock/invite-only failures skip silently
   if (!enterOrKnock(aws, room, aws.agentName, aws.agentServes || "")) return false;
   // doJoin (inside enterOrKnock) already ran leaveRoom and set ws.roomId.
@@ -981,7 +986,9 @@ function moveAgentSocket(aws, room) {
         name: prevAgent.name, serves: prevAgent.serves, verified: prevAgent.verified,
       });
     }
-    logPresence("join", room, { name: na.name, serves: na.serves, verified: na.verified });
+    if (!destHadIt) {
+      logPresence("join", room, { name: na.name, serves: na.serves, verified: na.verified });
+    }
   }
   return true;
 }
@@ -1007,15 +1014,16 @@ function admitHelloAgent(ws, m, roomId, proof) {
   if (!room) return; // invite-only rejection or knock pending: no presence change
   let avatar = m.avatar;
   if (proof.avatarUrl) avatar = { ...(avatar || {}), image: proof.avatarUrl };
+  // Capture whether the destination already held this agent BEFORE ensureAgent
+  // creates/refreshes the entry: a genuinely new join must log exactly once,
+  // while a second socket for an already-present agent (e.g. the one-shot say
+  // script while the presence script holds the room) must not phantom-join.
+  const alreadyThere = !wasPresent && room.agents.has(newId);
   const a = ensureAgent(room, ws.agentId, { name: m.name, serves: m.serves, avatar });
   a.verified = proof.verified;
   a.home = ws.manifestHome;
   a.admitted = true; // marks a real admission (vs entries created by say/talk)
   const info = { name: m.name, serves: m.serves, verified: proof.verified };
-  // A second socket helloing as an already-present agent (e.g. the one-shot
-  // say script while the presence script holds the room) must not log a
-  // phantom join: the agent never left.
-  const alreadyThere = !wasPresent && room.agents.has(newId);
   if (fromRoom && fromRoom.id !== room.id) {
     if (wasPresent) {
       logPresence("leave", fromRoom, {
