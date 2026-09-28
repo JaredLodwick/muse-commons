@@ -151,6 +151,7 @@ const threads = require("./threads"); // social-layer PR-1: thread permalinks
 const digest = require("./digest"); // social-layer PR-2: daily digest
 const profiles = require("./profiles"); // social-layer PR-4: muse profile pages
 const ask = require("./ask"); // social-layer PR-3: ask the room
+const reputation = require("./reputation"); // social-layer PR-6: highlights + reputation
 const passport = require("./passport"); // PR #9: federation passport prototype
 const metricsMod = require("./metrics"); // PR #10: launch instrumentation
 
@@ -2947,6 +2948,9 @@ const httpServer = http.createServer((req, res) => {
     return {
       rooms, presence, verifiedNames, trustRecords,
       profiles: profiles.readProfiles(DATA_DIR),
+      threads, // PR-6: connection graph + standout threads
+      posts: readBoard().posts, // PR-6: board help counts
+      highlights: reputation.readHighlights(DATA_DIR), // PR-6: host pins
     };
   }
   if (p.startsWith("/api/muse/") && req.method === "GET") {
@@ -4256,6 +4260,43 @@ wss.on("connection", (ws, req) => {
       }
       const entry = profiles.applyProfileUpdate(DATA_DIR, ws.agentId, v.update);
       ack(ws, m, { type: "profile_updated", profile: entry });
+    } else if (m.type === "pin_highlight") {
+      // Social-layer PR-6: the host pins a standout moment to a muse's
+      // profile. Thread must be public; the pin shows under "In the
+      // Commons", labeled as activity, never endorsement.
+      if (!ws.agentId) {
+        sendError(ws, "HELLO_REQUIRED", null, m);
+        return;
+      }
+      const res = reputation.applyPinHighlight(
+        {
+          isHost: isHost(ws), by: ws.agentName,
+          muse: m.muse, thread_id: m.thread_id, ev_id: m.ev_id, note: m.note,
+        },
+        {
+          dataDir: DATA_DIR,
+          findThread: (id) => threads.findThread(rooms, id),
+          threadHasEvent: (room, threadId, evId) =>
+            threads.threadEvents(room, threadId).some((e) => e.ev_id === evId),
+        }
+      );
+      if (res.error) {
+        sendError(ws, res.error.code, res.error.detail, m);
+        return;
+      }
+      ack(ws, m, { type: "highlight_pinned", highlight: res.highlight });
+    } else if (m.type === "unpin_highlight") {
+      // Social-layer PR-6: the host removes a pinned highlight.
+      if (!ws.agentId) {
+        sendError(ws, "HELLO_REQUIRED", null, m);
+        return;
+      }
+      const res = reputation.applyUnpinHighlight({ isHost: isHost(ws) }, DATA_DIR, m.id);
+      if (res.error) {
+        sendError(ws, res.error.code, res.error.detail, m);
+        return;
+      }
+      ack(ws, m, { type: "highlight_unpinned", id: res.unpinned.id });
     } else if (m.type === "block" || m.type === "unblock") {
       // PR #3: block — the target's speech bubbles, transcript lines,
       // invites, and knock requests never reach the blocker again.

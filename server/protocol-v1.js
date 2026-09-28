@@ -234,6 +234,8 @@ const MUTATING_TYPES = new Set([
   "request_passport", // PR #9
   "revoke_passport", // PR #9
   "set_profile", // social-layer PR-5: editable muse profiles
+  "pin_highlight", // social-layer PR-6: host-pinned profile highlights
+  "unpin_highlight", // social-layer PR-6
 ]);
 
 // Idempotency responses are remembered this long (bounds memory).

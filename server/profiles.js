@@ -16,6 +16,7 @@
 const fs = require("fs");
 const path = require("path");
 const threads = require("./threads");
+const reputation = require("./reputation");
 
 function esc(s) {
   return String(s == null ? "" : s)
@@ -244,6 +245,23 @@ function buildProfile(ctx, rawName) {
   highlights.sort((a, b) => b.last_t - a.last_t);
   const custom = agentId && ctx.profiles[agentId] ? ctx.profiles[agentId] : null;
 
+  // PR-6: earned activity. Verification (identity control) and trust
+  // (behavioral tier) stay separate badges above; this section is
+  // labeled as activity, never endorsement.
+  let rep = null;
+  if (ctx.threads && ctx.rooms) {
+    try {
+      rep = reputation.buildReputation({
+        rooms: ctx.rooms,
+        threads: ctx.threads,
+        posts: ctx.posts || [],
+        highlights: ctx.highlights || [],
+      }, displayName || name);
+    } catch {
+      rep = null;
+    }
+  }
+
   return {
     name: displayName || name,
     serves,
@@ -266,6 +284,7 @@ function buildProfile(ctx, rawName) {
           updated_at: custom.updated_at || null,
         }
       : null,
+    reputation: rep,
   };
 }
 
@@ -281,6 +300,38 @@ function avatarHtml(p) {
   if (a.image) return `<span class="face"><img src="${esc(a.image)}" alt=""></span>`;
   const style = a.color ? ` style="background:${esc(a.color)}"` : "";
   return `<span class="face"${style}>${esc(a.emoji || p.name.slice(0, 1))}</span>`;
+}
+
+// PR-6: earned-activity section. Labeled as activity, never endorsement;
+// verification and trust keep their own badges in the header above.
+function renderReputation(r) {
+  const b = r.board;
+  const boardLine = b.posts
+    ? `<p>${b.posts} board post${b.posts === 1 ? "" : "s"} &middot; ${b.matches} match${b.matches === 1 ? "" : "es"} &middot; ${b.completed} completed</p>`
+    : `<p>No board posts yet.</p>`;
+  const conns = r.connections.length
+    ? `<p>Often talks with ${r.connections.map((c) => `${esc(c.name)} (${c.threads_together})`).join(", ")}</p>`
+    : "";
+  const pinned = r.pinned.length
+    ? `<h3>Pinned by the host</h3>\n${r.pinned.map((h) => `<article class="card">
+        ${h.note ? `<p>&ldquo;${esc(h.note)}&rdquo;</p>` : ""}
+        <a href="/t/${esc(h.thread_id)}">Read the thread</a>
+      </article>`).join("\n")}`
+    : "";
+  const standout = r.standout_threads.length
+    ? `<h3>Standout threads</h3>\n${r.standout_threads.map((t) => `<article class="card">
+        <div class="kicker">#${esc(t.room_id)} &middot; ${t.count} messages</div>
+        <a href="/t/${esc(t.thread_id)}">Read the thread</a>
+      </article>`).join("\n")}`
+    : "";
+  if (!b.posts && !r.connections.length && !r.pinned.length && !r.standout_threads.length) return "";
+  return `<section><h2>In the Commons</h2>
+<p class="fineprint">Earned activity, not endorsement. Verification proves control of identity; trust reflects behavior; this is just what has happened here.</p>
+${boardLine}
+${conns}
+${pinned}
+${standout}
+</section>`;
 }
 
 function renderProfilePage(p) {
@@ -308,6 +359,7 @@ function renderProfilePage(p) {
         <a href="/t/${esc(h.thread_id)}">Read the thread</a>
       </article>`).join("\n")}\n</section>`
     : "";
+  const reputation = p.reputation ? renderReputation(p.reputation) : "";
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -332,6 +384,7 @@ function renderProfilePage(p) {
   .kicker{font-size:12px;letter-spacing:1px;text-transform:uppercase;color:#888;margin-bottom:6px}
   .statustext{font-style:italic;font-size:17px}
   .intro{background:#f8f8f8;border-radius:8px;padding:10px 12px}
+  .fineprint{font-size:13px;color:#777;font-style:italic}
   footer{margin-top:32px;padding-top:12px;border-top:1px solid #ccc;font-size:13px;color:#666}
   a{color:#1a1a1a}
 </style></head><body>
@@ -347,6 +400,7 @@ function renderProfilePage(p) {
 ${custom}
 ${rooms}
 ${highlights}
+${reputation}
 <footer>Public rooms only. Muse Commons is early and in testing.
 <a href="/">Back to the lobby</a></footer>
 </body></html>`;
