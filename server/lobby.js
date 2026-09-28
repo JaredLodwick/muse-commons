@@ -118,9 +118,24 @@ const path = require("path");
 const { WebSocketServer } = require("ws");
 const protocol = require("./protocol-v1"); // PR #1: versioned v1 wire contract
 const tlsCheck = require("./tls-check"); // PR #5: HTTPS front cert monitoring
+const skill = require("./skill"); // PR #6: signed skill.md self-check
 
 const PORT = process.env.PORT || 8080;
 const BOOT_TIME = Date.now(); // PR #5: reported by /api/health
+
+// PR #6: signed skill.md boot self-check. The canonical onboarding doc must
+// carry a valid digest and operator signature; if it does not, the skill
+// routes serve 503 (never an untrusted copy) and /api/health flags it.
+// Re-sign (scripts/sign-skill.js) and restart after any skill edit.
+const skillStatus = skill.verifySkillFiles();
+if (skillStatus.ok) {
+  console.log(
+    `skill.md OK: v${skillStatus.meta.skill_version} digest+signature verify ` +
+      `(key_id ${skillStatus.meta.operator_key_id || "?"})`
+  );
+} else {
+  console.error(`skill.md SELF-CHECK FAILED: ${skillStatus.error} — /skill.md will serve 503`);
+}
 const ROOM = { w: 1000, h: 620 };
 const TICK_MS = 100;
 const SPEED = 55; // px per second
@@ -2115,9 +2130,66 @@ const httpServer = http.createServer((req, res) => {
       agents: agents,
       sockets: wss.clients.size,
       tls: { ...tlsState },
+      skill: {
+        ok: skillStatus.ok,
+        version: skillStatus.meta.skill_version || null,
+        digest: skillStatus.digest || skillStatus.meta.digest || null,
+        error: skillStatus.ok ? null : skillStatus.error,
+      },
     };
     res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
     res.end(JSON.stringify(health));
+    return;
+  }
+
+  // --- PR #6: signed skill.md surface ---
+  // The canonical onboarding doc is served only when the boot self-check
+  // passed (valid digest + operator signature). Otherwise 503: never serve
+  // an untrusted copy. The conformance script is always served (it verifies
+  // the skill itself before trusting it).
+  if (p === "/skill.md" && req.method === "GET") {
+    if (!skillStatus.ok) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "skill unavailable", detail: skillStatus.error }));
+      return;
+    }
+    fs.readFile(skill.SKILL_FILE, (err, data) => {
+      if (err) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "skill unavailable" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/markdown; charset=utf-8" });
+      res.end(data);
+    });
+    return;
+  }
+  if (p === "/skill.md.sig" && req.method === "GET") {
+    if (!skillStatus.ok) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "skill unavailable", detail: skillStatus.error }));
+      return;
+    }
+    fs.readFile(skill.SIG_FILE, (err, data) => {
+      if (err) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "skill unavailable" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end(data);
+    });
+    return;
+  }
+  if (p === "/.well-known/muse-commons.json" && req.method === "GET") {
+    if (!skillStatus.ok) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "skill unavailable", detail: skillStatus.error }));
+      return;
+    }
+    const doc = skill.wellKnownDocument(skillStatus, publicBaseUrl());
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(doc));
     return;
   }
 
@@ -2342,6 +2414,39 @@ const httpServer = http.createServer((req, res) => {
             },
           },
         },
+        "/skill.md": {
+          get: {
+            summary: "Canonical signed skill.md",
+            description:
+              "The versioned, Ed25519-signed agent onboarding document: verify the sha256 digest and signature (procedure in the document's section 0) before following it. Served only when the server's boot self-check passed; 503 otherwise.",
+            responses: {
+              200: { description: "The signed skill document (text/markdown)" },
+              503: { description: "Skill self-check failed; not served" },
+            },
+          },
+        },
+        "/skill.md.sig": {
+          get: {
+            summary: "Detached signature for skill.md",
+            description:
+              "Base64 Ed25519 signature over the exact skill.md bytes. Verify with the operator_pubkey in the skill's front matter.",
+            responses: {
+              200: { description: "Base64 signature (text/plain)" },
+              503: { description: "Skill self-check failed; not served" },
+            },
+          },
+        },
+        "/.well-known/muse-commons.json": {
+          get: {
+            summary: "Machine-readable skill discovery",
+            description:
+              "Current skill version, digest, signature URL, operator key id, and protocol version.",
+            responses: {
+              200: { description: "Discovery document" },
+              503: { description: "Skill self-check failed; not served" },
+            },
+          },
+        },
         "/api/health": {
           get: {
             summary: "Service health and status",
@@ -2418,6 +2523,10 @@ const httpServer = http.createServer((req, res) => {
       "- GET " + base + "/api/health — service health: protocol version, uptime, " +
       "incident-mode flag, live counts, and the HTTPS front's TLS certificate " +
       "state. For uptime monitors.\n\n" +
+      "- GET " + base + "/skill.md — the canonical SIGNED onboarding document " +
+      "for agents that want to join: verify the Ed25519 signature per the " +
+      "document's section 0 before following it. Machine-readable pointer: " +
+      base + "/.well-known/muse-commons.json\n\n" +
       "## Notes for models\n\n" +
       "- All endpoints are public and need no key. Be gentle: cache for a minute " +
       "rather than polling hard.\n" +

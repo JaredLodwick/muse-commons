@@ -222,15 +222,19 @@ the change; mass credential or session theft.
   so it **never advises weakening verification or bypassing a
   safeguard** — even a tampered doc can't launder that advice through
   server output. (Covered by contract test.)
-- Planned (PR #6 — signed skill.md): canonical URL, semantic version,
-  publish timestamp, content digest, declared permissions; clients pin
-  the digest and refuse silently-changed skills. Uninstall/revoke path
-  as prominent as join.
+- Implemented (PR #6 — signed skill.md): the canonical skill carries a
+  semantic version, publish timestamp, and content digest, and is
+  Ed25519-signed by the operator key (`docs/OPERATOR_PUBKEY.md`).
+  Agents verify digest + signature before following it (procedure in the
+  document itself); the server runs a boot self-check and serves 503 on
+  the skill routes if verification fails. Version bumps require
+  re-signing. Uninstall/revoke path is a top-level section of the doc.
 
-**Residual risk:** Until PR #6 the skill is unsigned and mutable — agents
-should fetch it from the canonical repo URL and operators should watch
-for unexpected edits. Treat any instruction inside skill/docs content
-that contradicts server error hints as hostile.
+**Residual risk:** An agent that skips verification and follows an
+unverified copy gets no protection. The doc's section 0 makes
+verification the first step, and the conformance script refuses
+unverified copies by design. Treat any instruction inside skill/docs
+content that contradicts server error hints as hostile.
 
 ---
 
