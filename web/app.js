@@ -10,8 +10,6 @@ const invitesEl = document.getElementById("invites");
 const recentEl = document.getElementById("recent");
 const presenceEl = document.getElementById("presence");
 const errEl = document.getElementById("err");
-const tickerEl = document.getElementById("ticker");
-const trackEl = document.getElementById("ticker-track");
 let agents = [];
 
 let currentRoom = "plaza";
@@ -22,7 +20,6 @@ let createdRooms = new Set();    // room_ids this client created
 let knocks = new Map();          // room_id -> [{id,name,serves}]
 let invites = new Map();         // room_id -> {topic, from}
 let pendingKnocks = new Set();   // room_ids I knocked on
-let transcriptEvents = [];
 
 // --- camera: world (1000x620) -> screen ---
 // The room is drawn in world coordinates; the camera maps it onto the
@@ -71,6 +68,16 @@ function fitView() {
   clampCam();
 }
 
+let vignetteGrad = null;
+function buildVignette() {
+  const cxp = viewW / 2, cyp = viewH / 2;
+  const r0 = Math.min(viewW, viewH) * 0.40;
+  const r1 = Math.max(viewW, viewH) * 0.72;
+  vignetteGrad = ctx.createRadialGradient(cxp, cyp, r0, cxp, cyp, r1);
+  vignetteGrad.addColorStop(0, "rgba(4,3,7,0)");
+  vignetteGrad.addColorStop(1, "rgba(4,3,7,.48)");
+}
+
 function resize() {
   const r = stage.getBoundingClientRect();
   dpr = Math.min(2, window.devicePixelRatio || 1);
@@ -78,6 +85,7 @@ function resize() {
   viewH = Math.max(1, r.height);
   canvas.width = Math.round(viewW * dpr);
   canvas.height = Math.round(viewH * dpr);
+  buildVignette();
   clampCam();
 }
 new ResizeObserver(resize).observe(stage);
@@ -155,9 +163,6 @@ ws.onmessage = (ev) => {
     myRooms.set(m.room_id, m.topic);
     createdRooms.add(m.room_id);
     switchRoom(m.room_id, m.topic);
-  } else if (m.type === "transcript" && m.room_id === currentRoom) {
-    transcriptEvents = m.events || [];
-    renderRecent();
   } else if (m.type === "knock_request") {
     if (!createdRooms.has(m.room_id)) return;
     const list = knocks.get(m.room_id) || [];
@@ -180,17 +185,15 @@ ws.onmessage = (ev) => {
     showErr(m.message || "error");
   }
 };
-ws.onclose = () => { countEl.textContent = "disconnected — retrying…"; setTimeout(() => location.reload(), 3000); };
+ws.onclose = () => { countEl.textContent = "disconnected, retrying…"; setTimeout(() => location.reload(), 3000); };
 
 function switchRoom(roomId, topic) {
   currentRoom = roomId;
   if (topic) { currentTopic = topic; myRooms.set(roomId, topic); }
   else currentTopic = myRooms.get(roomId) || roomId;
   agents = [];
-  transcriptEvents = [];
   needFit = true; // re-frame the camera on the new room's agents
   fitView(); // frame the world immediately (agents arrive with the next state)
-  renderRecent();
   ws.send(JSON.stringify({ type: "hello", kind: "viewer", room: roomId }));
 }
 
@@ -213,7 +216,7 @@ function renderSide() {
   if (!others.length) {
     const li = document.createElement("li");
     li.className = "dim";
-    li.textContent = "no breakouts yet — start one!";
+    li.textContent = "no breakouts yet, start one!";
     sideEl.append(li);
     return;
   }
@@ -331,9 +334,12 @@ function renderInvites() {
   invitesEl.style.display = n ? "" : "none";
 }
 
-function renderRecent() {
+// --- recent chatter: latest public messages across all rooms ---
+// Polls /api/ticker every 15s and renders the newest few quietly in place.
+// Private breakout rooms are never included (server-side). No marquee.
+function renderRecent(events) {
   recentEl.innerHTML = "";
-  const evs = transcriptEvents.slice(-6).reverse();
+  const evs = (events || []).slice(0, 5);
   if (!evs.length) {
     const li = document.createElement("li");
     li.className = "dim";
@@ -343,56 +349,35 @@ function renderRecent() {
   }
   for (const e of evs) {
     const li = document.createElement("li");
-    li.className = "dim";
-    li.textContent = e.to ? `${e.from} → ${e.to}: ${e.text}` : `${e.from}: ${e.text}`;
-    li.title = e.text;
+    li.className = "rc";
+    const head = document.createElement("div");
+    head.className = "rc-head";
+    const room = document.createElement("span");
+    room.className = "rc-room";
+    room.textContent = e.topic || e.room_id;
+    const nm = document.createElement("b");
+    nm.className = "rc-nm";
+    nm.textContent = e.from + (e.to ? " → " + e.to : "");
+    head.append(room, nm);
+    const tx = document.createElement("div");
+    tx.className = "rc-tx";
+    tx.textContent = e.text;
+    li.append(head, tx);
+    li.title = `${e.from}${e.to ? " to " + e.to : ""} in ${e.topic || e.room_id}: ${e.text}`;
     recentEl.append(li);
   }
 }
-
-// --- talk history ticker: recent public chatter across all rooms ---
-// Polls /api/ticker every 15s. Content scrolls marquee-style and pauses on
-// hover. Private breakout rooms are never included (server-side).
-function renderTicker(events) {
-  trackEl.innerHTML = "";
-  const add = (evs) => {
-    for (const e of evs) {
-      const s = document.createElement("span");
-      s.className = "tick";
-      const room = document.createElement("b");
-      room.textContent = e.topic || e.room_id;
-      const nm = document.createElement("span");
-      nm.className = "tick-nm";
-      nm.textContent = e.from + (e.to ? " → " + e.to : "");
-      s.append(room, document.createTextNode(" "), nm,
-        document.createTextNode(": " + e.text));
-      const sep = document.createElement("span");
-      sep.className = "tick-sep";
-      sep.textContent = "✦";
-      trackEl.append(s, sep);
-    }
-  };
-  if (!events.length) {
-    const s = document.createElement("span");
-    s.className = "tick dim";
-    s.textContent = "quiet in the commons…";
-    trackEl.append(s, s.cloneNode(true)); // two copies keep the loop seamless
-    return;
-  }
-  add(events);
-  add(events); // duplicate once so the -50% marquee loop is seamless
-}
-async function loadTicker() {
+async function loadChatter() {
   try {
-    const r = await fetch("/api/ticker");
+    const r = await fetch("/api/ticker?limit=10");
     const j = await r.json();
-    renderTicker(j.events || []);
+    renderRecent(j.events || []);
   } catch {
     /* keep the previous content on failure */
   }
 }
-loadTicker();
-setInterval(loadTicker, 15000);
+loadChatter();
+setInterval(loadChatter, 15000);
 
 // --- presence feed: who came and went, across all rooms ---
 // Polls /api/presence every 15s. Unfiltered by room on purpose: this is the
@@ -503,33 +488,265 @@ function renderRoster() {
   }
 }
 
-function roundRect(x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
+// ---------- canvas helpers ----------
+function rr(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+function roundRect(x, y, w, h, r) { rr(ctx, x, y, w, h, r); }
+
+// deterministic pseudo-random in [0,1) for stable procedural detail
+function prand(n) {
+  const x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+  return x - Math.floor(x);
+}
+function hexA(hex, a) {
+  try {
+    let h = String(hex).replace("#", "");
+    if (h.length === 3) h = h.split("").map((ch) => ch + ch).join("");
+    const n = parseInt(h, 16);
+    if (Number.isNaN(n)) return `rgba(255,255,255,${a})`;
+    return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+  } catch {
+    return `rgba(255,255,255,${a})`;
+  }
 }
 
-function plant(x, y) {
-  ctx.fillStyle = "#2f7d4f";
-  ctx.beginPath(); ctx.ellipse(x, y, 26, 42, 0, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = "#3a2e2e";
-  ctx.fillRect(x - 14, y + 28, 28, 16);
+// ---------- static room ----------
+// Rendered once to an offscreen canvas (2x) so each frame costs one
+// drawImage. Only lamp flicker and dust motes are drawn live.
+const roomStatic = document.createElement("canvas");
+roomStatic.width = WORLD.w * 2;
+roomStatic.height = WORLD.h * 2;
+const LAMPS = [150, 850];
+const FLOOR_Y = 430;
+
+function pictureFrame(c, x, y, w, h, seed) {
+  c.fillStyle = "#4a3826";
+  c.fillRect(x - 8, y - 8, w + 16, h + 16);
+  c.fillStyle = "rgba(255,225,180,.18)";
+  c.fillRect(x - 8, y - 8, w + 16, 3);
+  c.fillStyle = "#241d2e";
+  c.fillRect(x, y, w, h);
+  const cols = ["#7a5a8a", "#4a7a8a", "#8a6a4a", "#5a8a6a"];
+  for (let i = 0; i < 3; i++) {
+    const ax = x + prand(seed + i * 3) * w;
+    const ay = y + prand(seed + i * 3 + 1) * h;
+    const ar = 14 + prand(seed + i * 3 + 2) * 26;
+    const col = cols[Math.floor(prand(seed + i * 1.3) * cols.length)];
+    const ag = c.createRadialGradient(ax, ay, 0, ax, ay, ar);
+    ag.addColorStop(0, col + "b0");
+    ag.addColorStop(1, col + "00");
+    c.fillStyle = ag;
+    c.beginPath(); c.arc(ax, ay, ar, 0, 6.2832); c.fill();
+  }
 }
 
-function lamp(x, y, t) {
-  const glow = 0.5 + 0.1 * Math.sin(t / 700 + x);
-  const g = ctx.createRadialGradient(x, y, 4, x, y, 60);
-  g.addColorStop(0, `rgba(251,191,36,${0.35 * glow})`);
-  g.addColorStop(1, "rgba(251,191,36,0)");
-  ctx.fillStyle = g;
-  ctx.beginPath(); ctx.arc(x, y, 60, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = "#fbbf24";
-  ctx.beginPath(); ctx.arc(x, y, 7, 0, Math.PI * 2); ctx.fill();
+function plantC(c, x, y) {
+  // leaves behind the pot
+  for (let k = 0; k < 7; k++) {
+    const a = (-90 + (k - 3) * 22) * Math.PI / 180;
+    const len = 36 + prand(k * 3.3 + x) * 24;
+    c.save();
+    c.translate(x, y - 12);
+    c.rotate(a);
+    c.fillStyle = k % 2 ? "#2f7d4f" : "#3aa05c";
+    c.beginPath(); c.ellipse(0, -len / 2, 9, len / 2, 0, 0, 6.2832); c.fill();
+    // leaf vein highlight
+    c.strokeStyle = "rgba(255,255,255,.14)";
+    c.lineWidth = 1.5;
+    c.beginPath(); c.moveTo(0, -6); c.lineTo(0, -len + 8); c.stroke();
+    c.restore();
+  }
+  // terracotta pot
+  c.fillStyle = "#8a4a30";
+  c.beginPath();
+  c.moveTo(x - 20, y - 6); c.lineTo(x + 20, y - 6);
+  c.lineTo(x + 14, y + 22); c.lineTo(x - 14, y + 22);
+  c.closePath(); c.fill();
+  c.fillStyle = "rgba(255,220,180,.16)";
+  c.beginPath();
+  c.moveTo(x - 20, y - 6); c.lineTo(x - 14, y - 6);
+  c.lineTo(x - 11, y + 22); c.lineTo(x - 14, y + 22);
+  c.closePath(); c.fill();
+  c.fillStyle = "#a35c3c";
+  c.fillRect(x - 23, y - 13, 46, 8);
 }
+
+function lampFixture(c, x) {
+  c.strokeStyle = "#0b0b10";
+  c.lineWidth = 3;
+  c.beginPath(); c.moveTo(x, 0); c.lineTo(x, 66); c.stroke();
+  // shade
+  c.fillStyle = "#6b4a34";
+  c.beginPath();
+  c.moveTo(x - 36, 66); c.lineTo(x + 36, 66);
+  c.lineTo(x + 24, 106); c.lineTo(x - 24, 106);
+  c.closePath(); c.fill();
+  c.fillStyle = "rgba(255,220,170,.22)";
+  c.beginPath();
+  c.moveTo(x - 36, 66); c.lineTo(x + 36, 66);
+  c.lineTo(x + 30, 80); c.lineTo(x - 30, 80);
+  c.closePath(); c.fill();
+  // bulb
+  c.fillStyle = "#ffe3b0";
+  c.beginPath(); c.arc(x, 110, 7, 0, 6.2832); c.fill();
+  // baked halo + floor pool (flicker is drawn live on top)
+  const hg = c.createRadialGradient(x, 110, 4, x, 110, 120);
+  hg.addColorStop(0, "rgba(255,196,110,.20)");
+  hg.addColorStop(1, "rgba(255,196,110,0)");
+  c.fillStyle = hg;
+  c.beginPath(); c.arc(x, 110, 120, 0, 6.2832); c.fill();
+  c.fillStyle = "rgba(255,190,110,.08)";
+  c.beginPath(); c.ellipse(x, 580, 130, 26, 0, 0, 6.2832); c.fill();
+}
+
+function buildRoomStatic() {
+  const c = roomStatic.getContext("2d");
+  c.scale(2, 2);
+  const W = WORLD.w, H = WORLD.h;
+
+  // warm wall
+  let g = c.createLinearGradient(0, 0, 0, FLOOR_Y);
+  g.addColorStop(0, "#2e2840");
+  g.addColorStop(0.6, "#282334");
+  g.addColorStop(1, "#221c2c");
+  c.fillStyle = g;
+  c.fillRect(0, 0, W, FLOOR_Y);
+
+  // framed art on the wall
+  pictureFrame(c, 268, 96, 150, 112, 11);
+  pictureFrame(c, 668, 118, 120, 150, 47);
+
+  // wainscot + chair rail
+  c.fillStyle = "#1c1725";
+  c.fillRect(0, 378, W, FLOOR_Y - 378);
+  c.strokeStyle = "rgba(0,0,0,.35)";
+  c.lineWidth = 1;
+  for (let x = 45; x < W; x += 90) {
+    c.beginPath(); c.moveTo(x, 384); c.lineTo(x, FLOOR_Y - 4); c.stroke();
+  }
+  c.fillStyle = "#54402c";
+  c.fillRect(0, 372, W, 10);
+  c.fillStyle = "rgba(255,225,180,.22)";
+  c.fillRect(0, 372, W, 2);
+
+  // wooden plank floor with per-plank tone variation
+  const plankH = (H - FLOOR_Y) / 6;
+  for (let i = 0; i < 6; i++) {
+    const y0 = FLOOR_Y + i * plankH;
+    const l = 21 + prand(i * 1.7) * 7;
+    c.fillStyle = `hsl(${26 + prand(i * 3.1) * 6},${30 + prand(i * 5.3) * 8}%,${l}%)`;
+    c.fillRect(0, y0, W, plankH);
+    c.fillStyle = "rgba(0,0,0,.45)";
+    c.fillRect(0, y0, W, 2);
+    c.fillStyle = "rgba(255,220,170,.07)";
+    c.fillRect(0, y0 + 2, W, 1.5);
+    c.fillStyle = "rgba(0,0,0,.32)";
+    for (let k = 0; k < 2; k++) {
+      const sx = (prand(i * 13.7 + k * 71.3) * W) | 0;
+      c.fillRect(sx, y0 + 2, 1.5, plankH - 2);
+    }
+  }
+  // floor sheen
+  g = c.createLinearGradient(0, FLOOR_Y, 0, H);
+  g.addColorStop(0, "rgba(255,220,160,.07)");
+  g.addColorStop(0.5, "rgba(255,220,160,0)");
+  g.addColorStop(1, "rgba(0,0,0,.14)");
+  c.fillStyle = g;
+  c.fillRect(0, FLOOR_Y, W, H - FLOOR_Y);
+
+  // rug with patterned double border
+  const rx = 500, ry = 528, rrX = 295, rrY = 82;
+  c.fillStyle = "#472b33";
+  c.beginPath(); c.ellipse(rx, ry, rrX, rrY, 0, 0, 6.2832); c.fill();
+  c.lineWidth = 7; c.strokeStyle = "#2a1a20";
+  c.beginPath(); c.ellipse(rx, ry, rrX, rrY, 0, 0, 6.2832); c.stroke();
+  c.lineWidth = 4.5; c.strokeStyle = "#c08a4e";
+  c.beginPath(); c.ellipse(rx, ry, rrX - 26, rrY - 22, 0, 0, 6.2832); c.stroke();
+  c.lineWidth = 1.5; c.strokeStyle = "rgba(192,138,78,.4)";
+  c.beginPath(); c.ellipse(rx, ry, rrX - 40, rrY - 32, 0, 0, 6.2832); c.stroke();
+  c.fillStyle = "rgba(216,164,100,.85)";
+  for (let i = 0; i < 36; i++) {
+    const a = (i / 36) * 6.2832;
+    c.beginPath();
+    c.arc(rx + Math.cos(a) * (rrX - 26), ry + Math.sin(a) * (rrY - 22), 2.4, 0, 6.2832);
+    c.fill();
+  }
+  c.save();
+  c.translate(rx, ry); c.rotate(Math.PI / 4);
+  c.lineWidth = 2; c.strokeStyle = "rgba(216,164,100,.5)";
+  c.strokeRect(-26, -26, 52, 52);
+  c.restore();
+
+  // coffee table in wood tones
+  const tx = 500, ty = 470;
+  c.fillStyle = "#3a2614";
+  c.fillRect(tx - 66, ty + 22, 12, 30);
+  c.fillRect(tx + 54, ty + 22, 12, 30);
+  c.fillStyle = "#5f3f24";
+  rr(c, tx - 80, ty - 6, 160, 30, 9); c.fill();
+  c.fillStyle = "#7a5330";
+  rr(c, tx - 80, ty - 14, 160, 18, 9); c.fill();
+  c.fillStyle = "rgba(255,225,180,.20)";
+  rr(c, tx - 72, ty - 12, 144, 6, 3); c.fill();
+  // books
+  c.fillStyle = "#7a4a5e";
+  rr(c, tx - 34, ty - 26, 46, 11, 2); c.fill();
+  c.fillStyle = "#47617e";
+  rr(c, tx - 28, ty - 37, 38, 11, 2); c.fill();
+  c.fillStyle = "rgba(255,255,255,.25)";
+  c.fillRect(tx - 28, ty - 37, 3, 11);
+  // mug
+  c.fillStyle = "#8a6a4a";
+  c.beginPath(); c.arc(tx + 48, ty - 24, 5.5, 0, 6.2832); c.fill();
+  c.fillStyle = "#c9d4e2";
+  c.beginPath(); c.arc(tx + 48, ty - 24, 8, 0.3, 5.9); c.fill();
+  c.fillStyle = "#8a6a4a";
+  c.beginPath(); c.arc(tx + 48, ty - 24, 5, 0, 6.2832); c.fill();
+  c.lineWidth = 2.5; c.strokeStyle = "#c9d4e2";
+  c.beginPath(); c.arc(tx + 57, ty - 24, 5, -1.2, 1.2); c.stroke();
+
+  plantC(c, 90, 556);
+  plantC(c, 912, 556);
+  for (const lx of LAMPS) lampFixture(c, lx);
+}
+buildRoomStatic();
+
+// warm glow sprite reused for live lamp flicker (tinted by globalAlpha)
+const glowSprite = (() => {
+  const s = document.createElement("canvas");
+  s.width = s.height = 256;
+  const c = s.getContext("2d");
+  const g = c.createRadialGradient(128, 128, 0, 128, 128, 128);
+  g.addColorStop(0, "rgba(255,214,150,.9)");
+  g.addColorStop(0.4, "rgba(255,190,120,.35)");
+  g.addColorStop(1, "rgba(255,180,110,0)");
+  c.fillStyle = g;
+  c.fillRect(0, 0, 256, 256);
+  return s;
+})();
+
+// dust motes drifting in the lamplight (precomputed, animated live)
+const MOTES = [];
+for (let i = 0; i < 44; i++) {
+  const cx = (i % 2 === 0) ? LAMPS[0] : LAMPS[1];
+  MOTES.push({
+    bx: cx + (prand(i * 3 + 1) - 0.5) * 340,
+    by: 110 + prand(i * 3 + 2) * 400,
+    r: 0.8 + prand(i * 3 + 3) * 1.7,
+    ph: prand(i * 7 + 0.5) * 6.2832,
+    sp: 0.00010 + prand(i * 11 + 0.3) * 0.00022,
+    amp: 12 + prand(i * 13 + 0.7) * 26,
+  });
+}
+
+const sortScratch = [];
 
 function draw(t) {
   // Reset for DPR, clear the visible area, then move into world space.
@@ -540,53 +757,140 @@ function draw(t) {
   ctx.scale(cam.zoom, cam.zoom);
   ctx.translate(-cam.x, -cam.y);
 
-  const g = ctx.createLinearGradient(0, 0, 0, 620);
-  g.addColorStop(0, "#1c2333");
-  g.addColorStop(1, "#141a28");
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, 1000, 620);
+  // static room: one cached drawImage
+  ctx.drawImage(roomStatic, 0, 0, WORLD.w, WORLD.h);
 
   // subtle room bounds so the world edge reads at any zoom
-  ctx.strokeStyle = "rgba(255,255,255,.06)";
+  ctx.strokeStyle = "rgba(255,255,255,.05)";
   ctx.lineWidth = 2 / cam.zoom;
-  ctx.strokeRect(0, 0, 1000, 620);
+  ctx.strokeRect(0, 0, WORLD.w, WORLD.h);
 
-  // rug
-  ctx.fillStyle = "#232c44";
-  ctx.beginPath(); ctx.ellipse(500, 340, 330, 185, 0, 0, Math.PI * 2); ctx.fill();
-  ctx.strokeStyle = "#2e3a58"; ctx.lineWidth = 6; ctx.stroke();
+  // lamp flicker: warm halo + floor pool, very subtle
+  for (const lx of LAMPS) {
+    const fl = 0.9 + 0.06 * Math.sin(t / 640 + lx * 0.13) + 0.04 * Math.sin(t / 173 + lx);
+    ctx.globalAlpha = 0.5 * fl;
+    ctx.drawImage(glowSprite, lx - 95, 110 - 95, 190, 190);
+    ctx.globalAlpha = 0.30 * fl;
+    ctx.drawImage(glowSprite, lx - 130, 580 - 27, 260, 54);
+  }
+  ctx.globalAlpha = 1;
 
-  // coffee table
-  ctx.fillStyle = "#2b3550";
-  roundRect(430, 300, 140, 66, 18); ctx.fill();
-  ctx.fillStyle = "#38436a";
-  roundRect(470, 316, 60, 34, 10); ctx.fill();
+  // dust motes
+  ctx.fillStyle = "#ffe9c4";
+  for (const m of MOTES) {
+    const mx = m.bx + Math.sin(t * m.sp * 6.2832 + m.ph) * m.amp;
+    const my = m.by + Math.cos(t * m.sp * 4.1 + m.ph * 1.7) * m.amp * 0.55;
+    ctx.globalAlpha = 0.04 + 0.07 * (0.5 + 0.5 * Math.sin(t * 0.0011 + m.ph * 2.3));
+    ctx.beginPath();
+    ctx.arc(mx, my, m.r, 0, 6.2832);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
 
-  plant(90, 540);
-  plant(915, 540);
-  lamp(120, 90, t);
-  lamp(880, 90, t + 2000);
+  // avatars sorted by y so lower ones overlap correctly (scratch array: no alloc)
+  sortScratch.length = 0;
+  for (const a of agents) sortScratch.push(a);
+  sortScratch.sort((p, q) => p.y - q.y);
+  const seenBubbles = new Set();
+  for (const a of sortScratch) {
+    drawAgent(a, t);
+    if (a.bubble) seenBubbles.add(a.id || a.name);
+  }
+  for (const k of bubbleState.keys()) {
+    if (!seenBubbles.has(k)) bubbleState.delete(k);
+  }
 
-  // draw avatars sorted by y so lower ones overlap correctly
-  for (const a of [...agents].sort((p, q) => p.y - q.y)) drawAgent(a, t);
+  // soft vignette in screen space
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (vignetteGrad) {
+    ctx.fillStyle = vignetteGrad;
+    ctx.fillRect(0, 0, viewW, viewH);
+  }
+}
+
+// per-color soft glow sprite, cached
+const glowCache = new Map();
+function agentGlow(color) {
+  let s = glowCache.get(color);
+  if (!s) {
+    s = document.createElement("canvas");
+    s.width = s.height = 128;
+    const c = s.getContext("2d");
+    const g = c.createRadialGradient(64, 64, 6, 64, 64, 64);
+    g.addColorStop(0, hexA(color, 0.55));
+    g.addColorStop(0.55, hexA(color, 0.20));
+    g.addColorStop(1, hexA(color, 0));
+    c.fillStyle = g;
+    c.fillRect(0, 0, 128, 128);
+    glowCache.set(color, s);
+  }
+  return s;
+}
+
+// name pill metrics cached per (verified, name)
+const labelCache = new Map();
+const PILL_FONT = "600 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+
+function drawNamePill(a, x, cy) {
+  // screen-space pill: crisp and readable at any zoom
+  const sx = (x - cam.x) * cam.zoom + viewW / 2;
+  const sy = (cy + 36 - cam.y) * cam.zoom + viewH / 2;
+  if (sx < -80 || sx > viewW + 80 || sy < -30 || sy > viewH + 30) return;
+  const verified = a.verified === "verified";
+  const key = (verified ? "1" : "0") + ":" + a.name;
+  let L = labelCache.get(key);
+  if (!L) {
+    ctx.font = PILL_FONT;
+    const nameW = ctx.measureText(a.name).width;
+    const checkW = verified ? ctx.measureText("✓ ").width : 0;
+    L = { w: nameW + checkW, checkW };
+    labelCache.set(key, L);
+  }
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.font = PILL_FONT;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  const pw = L.w + 20, ph = 22;
+  const px = sx - pw / 2, py = sy - ph / 2;
+  ctx.fillStyle = "rgba(9,12,21,.80)";
+  rr(ctx, px, py, pw, ph, 11); ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,.14)";
+  ctx.lineWidth = 1;
+  rr(ctx, px + 0.5, py + 0.5, pw - 1, ph - 1, 10.5); ctx.stroke();
+  let tx = px + 10;
+  if (verified) {
+    ctx.fillStyle = "#34d399";
+    ctx.fillText("✓ ", tx, sy + 0.5);
+    tx += L.checkW;
+  }
+  ctx.fillStyle = "#f2f5fb";
+  ctx.fillText(a.name, tx, sy + 0.5);
+  ctx.restore();
 }
 
 function drawAgent(a, t) {
   const { x, y } = a;
-  ctx.fillStyle = "rgba(0,0,0,.35)";
-  ctx.beginPath(); ctx.ellipse(x, y + 27, 26, 9, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "rgba(0,0,0,.38)";
+  ctx.beginPath(); ctx.ellipse(x, y + 27, 26, 9, 0, 0, 6.2832); ctx.fill();
 
   // gentle bob
   const bob = Math.sin(t / 500 + x) * 2;
   const cy = y + bob;
 
+  // soft outer glow in the agent's color
+  const gs = agentGlow(a.color || "#a78bfa");
+  ctx.globalAlpha = 0.8;
+  ctx.drawImage(gs, x - 44, cy - 44, 88, 88);
+  ctx.globalAlpha = 1;
+
   // portrait: real avatar image when available, emoji fallback otherwise
   const img = getAvatarImage(a.image);
-  ctx.fillStyle = a.color;
-  ctx.beginPath(); ctx.arc(x, cy, 24, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = a.color || "#a78bfa";
+  ctx.beginPath(); ctx.arc(x, cy, 24, 0, 6.2832); ctx.fill();
   if (img) {
     ctx.save();
-    ctx.beginPath(); ctx.arc(x, cy, 21, 0, Math.PI * 2); ctx.clip();
+    ctx.beginPath(); ctx.arc(x, cy, 21, 0, 6.2832); ctx.clip();
     // cover-fit the portrait into the circle
     const s = Math.max(42 / img.naturalWidth, 42 / img.naturalHeight);
     const dw = img.naturalWidth * s, dh = img.naturalHeight * s;
@@ -596,28 +900,31 @@ function drawAgent(a, t) {
     ctx.font = "24px serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(a.emoji, x, cy + 1);
+    ctx.fillText(a.emoji || "🙂", x, cy + 1);
   }
-  ctx.lineWidth = 3;
-  ctx.strokeStyle = a.talking ? "#34d399" : "rgba(255,255,255,.25)";
-  ctx.beginPath(); ctx.arc(x, cy, 24, 0, Math.PI * 2); ctx.stroke();
+  // thin light ring, green while talking
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = a.talking ? "#34d399" : "rgba(240,244,255,.85)";
+  ctx.beginPath(); ctx.arc(x, cy, 24, 0, 6.2832); ctx.stroke();
 
   if (a.talking) {
+    // soft expanding pulse
+    const pr = ((t / 1100) + x * 0.013) % 1;
+    ctx.globalAlpha = (1 - pr) * 0.5;
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#34d399";
+    ctx.beginPath(); ctx.arc(x, cy, 27 + pr * 16, 0, 6.2832); ctx.stroke();
+    ctx.globalAlpha = 1;
     const n = 1 + ((t / 400) | 0) % 3;
     ctx.font = "13px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
     ctx.fillStyle = "#34d399";
     ctx.fillText("●".repeat(n), x, cy - 38);
   }
 
-  ctx.font = "12px sans-serif";
-  const label = (a.verified === "verified" ? "✓ " : "") + a.name;
-  const w = ctx.measureText(label).width;
-  ctx.fillStyle = "rgba(0,0,0,.55)";
-  roundRect(x - w / 2 - 6, cy + 33, w + 12, 18, 9); ctx.fill();
-  ctx.fillStyle = "#e8ecf4";
-  ctx.fillText(label, x, cy + 42);
-
-  if (a.bubble) drawBubble(a, cy);
+  drawNamePill(a, x, cy);
+  if (a.bubble) drawBubble(a, cy, t);
 }
 
 // Avatar image cache: loads each unique URL once, returns the Image only
@@ -634,10 +941,27 @@ function getAvatarImage(url) {
   return e.complete && e.naturalWidth > 0 ? e : null;
 }
 
-function drawBubble(a, cy) {
-  ctx.font = "13px sans-serif";
+// bubble appear animation state: agentKey -> { text, t0 }
+const bubbleState = new Map();
+
+function drawBubble(a, cy, t) {
+  const key = a.id || a.name;
+  const txt = String(a.bubble);
+  let st = bubbleState.get(key);
+  if (!st || st.text !== txt) {
+    st = { text: txt, t0: t };
+    bubbleState.set(key, st);
+  }
+  const age = t - st.t0;
+  const k = Math.min(1, age / 220);
+  const e = 1 - Math.pow(1 - k, 3); // easeOutCubic
+  const yOff = (1 - e) * 14;
+
+  ctx.save();
+  ctx.globalAlpha = 0.15 + 0.85 * e;
+  ctx.font = "13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
   const maxW = 200;
-  const words = String(a.bubble).split(/\s+/);
+  const words = txt.split(/\s+/);
   const lines = [];
   let line = "";
   for (const w of words) {
@@ -646,23 +970,35 @@ function drawBubble(a, cy) {
     else line = trial;
   }
   if (line) lines.push(line);
-  const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 20;
-  const h = lines.length * 18 + 16;
+  const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 28;
+  const h = lines.length * 19 + 20;
   const bx = Math.min(990 - w, Math.max(10, a.x - w / 2));
-  const by = cy - 58 - h;
-  ctx.fillStyle = "rgba(10,14,24,.94)";
-  roundRect(bx, by, w, h, 12); ctx.fill();
-  ctx.strokeStyle = "rgba(255,255,255,.18)";
-  ctx.lineWidth = 1; ctx.stroke();
+  const by = cy - 60 - h + yOff;
+
+  // soft drop shadow on the body
+  ctx.shadowColor = "rgba(0,0,0,.5)";
+  ctx.shadowBlur = 16;
+  ctx.shadowOffsetY = 5;
+  ctx.fillStyle = "rgba(13,17,29,.96)";
+  rr(ctx, bx, by, w, h, 13); ctx.fill();
+  ctx.shadowColor = "transparent";
+  ctx.shadowBlur = 0;
+  ctx.shadowOffsetY = 0;
+  // smooth curved tail
   ctx.beginPath();
-  ctx.moveTo(a.x - 7, by + h); ctx.lineTo(a.x + 7, by + h); ctx.lineTo(a.x, by + h + 9);
+  ctx.moveTo(a.x - 9, by + h - 3);
+  ctx.quadraticCurveTo(a.x, by + h + 11, a.x + 9, by + h - 3);
   ctx.closePath(); ctx.fill();
+
+  ctx.strokeStyle = "rgba(255,255,255,.16)";
+  ctx.lineWidth = 1;
+  rr(ctx, bx + 0.5, by + 0.5, w - 1, h - 1, 12.5); ctx.stroke();
+
   ctx.fillStyle = "#f2f5fb";
   ctx.textAlign = "left";
   ctx.textBaseline = "top";
-  lines.forEach((l, i) => ctx.fillText(l, bx + 10, by + 8 + i * 18));
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
+  lines.forEach((l, i) => ctx.fillText(l, bx + 14, by + 10 + i * 19));
+  ctx.restore();
 }
 
 // start the render loop (defined above in the camera section)
