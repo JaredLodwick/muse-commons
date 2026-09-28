@@ -11,7 +11,69 @@ const recentEl = document.getElementById("recent");
 const recentH = document.getElementById("recent-h");
 const peopleH = document.getElementById("people-h");
 const errEl = document.getElementById("err");
+const roomTag = document.getElementById("room-tag");
 let agents = [];
+
+// --- theme: Warm Editorial, light default, dark flips every variable ---
+// The attribute AND the class are set together so the CSS selector
+// html[data-theme="dark"], html.dark restyles the whole page in one flip.
+const THEME_KEY = "mc_theme";
+function currentTheme() {
+  const h = document.documentElement;
+  return (h.dataset.theme === "dark" || h.classList.contains("dark")) ? "dark" : "light";
+}
+function setTheme(t) {
+  const h = document.documentElement;
+  h.dataset.theme = t;
+  h.classList.toggle("dark", t === "dark");
+  try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
+  PAL = canvasPal();
+  buildRoomStatic();
+  buildVignette();
+}
+document.getElementById("theme-toggle").onclick = () => {
+  setTheme(currentTheme() === "dark" ? "light" : "dark");
+};
+
+// --- people strip: slim collapsible roster ---
+const peopleToggle = document.getElementById("people-toggle");
+const peopleWrap = document.getElementById("people-wrap");
+const peopleCount = document.getElementById("people-count");
+const PEOPLE_KEY = "mc_people_open";
+function setPeopleOpen(open) {
+  peopleToggle.setAttribute("aria-expanded", open ? "true" : "false");
+  peopleWrap.hidden = !open;
+  try { localStorage.setItem(PEOPLE_KEY, open ? "1" : "0"); } catch (e) {}
+}
+peopleToggle.onclick = () => setPeopleOpen(peopleWrap.hidden);
+(function initPeopleOpen() {
+  let open = true;
+  try {
+    const v = localStorage.getItem(PEOPLE_KEY);
+    if (v === "0") open = false;
+    else if (v === null && window.innerWidth < 1060) open = false;
+  } catch (e) { if (window.innerWidth < 1060) open = false; }
+  setPeopleOpen(open);
+})();
+
+// --- rooms popover: compact directory fallback next to the doorways ---
+const roomsBtn = document.getElementById("rooms-btn");
+const roomsPop = document.getElementById("rooms-pop");
+function setRoomsPop(open) {
+  roomsPop.hidden = !open;
+  roomsBtn.setAttribute("aria-expanded", open ? "true" : "false");
+}
+roomsBtn.onclick = (e) => { e.stopPropagation(); setRoomsPop(roomsPop.hidden); };
+document.addEventListener("click", (e) => {
+  if (!roomsPop.hidden && !roomsPop.contains(e.target) && e.target !== roomsBtn) setRoomsPop(false);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !roomsPop.hidden) setRoomsPop(false);
+});
+
+// Live-draw palette, read by buildVignette()/draw() on every frame. Must be
+// initialized before resize() runs below; canvasPal() is hoisted.
+let PAL = canvasPal();
 
 // Latest feed payloads (all rooms). The right panel scopes them to the
 // room being viewed: Messages filters to the room (plaza shows all), and
@@ -194,8 +256,8 @@ function buildVignette() {
   const r0 = Math.min(viewW, viewH) * 0.40;
   const r1 = Math.max(viewW, viewH) * 0.72;
   vignetteGrad = ctx.createRadialGradient(cxp, cyp, r0, cxp, cyp, r1);
-  vignetteGrad.addColorStop(0, "rgba(4,3,7,0)");
-  vignetteGrad.addColorStop(1, "rgba(4,3,7,.48)");
+  vignetteGrad.addColorStop(0, PAL.vig0);
+  vignetteGrad.addColorStop(1, PAL.vig1);
 }
 
 function resize() {
@@ -227,17 +289,31 @@ canvas.addEventListener("wheel", (e) => {
 
 let drag = null;
 canvas.addEventListener("pointerdown", (e) => {
-  drag = { x: e.clientX, y: e.clientY, cx: cam.x, cy: cam.y };
+  drag = { x: e.clientX, y: e.clientY, cx: cam.x, cy: cam.y, moved: false };
   canvas.setPointerCapture(e.pointerId);
   canvas.classList.add("dragging");
 });
+function doorwayAt(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  const wx = cam.x + (clientX - r.left - viewW / 2) / cam.zoom;
+  const wy = cam.y + (clientY - r.top - viewH / 2) / cam.zoom;
+  return doorHits.find((d) => wx >= d.x && wx <= d.x + d.w && wy >= d.y && wy <= d.y + d.h) || null;
+}
 canvas.addEventListener("pointermove", (e) => {
-  if (!drag) return;
+  if (!drag) {
+    canvas.style.cursor = doorwayAt(e.clientX, e.clientY) ? "pointer" : "";
+    return;
+  }
+  if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 8) drag.moved = true;
   cam.x = drag.cx - (e.clientX - drag.x) / cam.zoom;
   cam.y = drag.cy - (e.clientY - drag.y) / cam.zoom;
   clampCam();
 });
-const endDrag = () => { drag = null; canvas.classList.remove("dragging"); };
+const endDrag = (e) => {
+  // a tap (not a drag) on a doorway walks through it
+  if (drag && !drag.moved && e && e.type === "pointerup") tapAt(e.clientX, e.clientY);
+  drag = null; canvas.classList.remove("dragging");
+};
 canvas.addEventListener("pointerup", endDrag);
 canvas.addEventListener("pointercancel", endDrag);
 
@@ -324,6 +400,7 @@ function switchRoom(roomId, topic) {
   currentRoom = roomId;
   if (topic) { currentTopic = topic; myRooms.set(roomId, topic); }
   else currentTopic = myRooms.get(roomId) || roomId;
+  roomTag.textContent = currentTopic;
   agents = [];
   needFit = true; // re-frame the camera on the new room's agents
   fitView(); // frame the world immediately (agents arrive with the next state)
@@ -493,13 +570,16 @@ function scopedToRoom(list) {
   return list.filter((e) => e.room_id === currentRoom);
 }
 function renderRecent() {
-  recentH.textContent = currentRoom === "plaza" ? "Messages" : "Messages · " + currentTopic;
+  // Messages are inherently scoped to the room being viewed (see
+  // scopedToRoom): the room name is never repeated on the messages
+  // themselves, the hanging room tag already names the context.
+  recentH.textContent = "Messages";
   recentEl.innerHTML = "";
-  const evs = scopedToRoom(chatterEvents).slice(0, 5);
+  const evs = scopedToRoom(chatterEvents).slice(0, 8);
   if (!evs.length) {
     const li = document.createElement("li");
     li.className = "dim";
-    li.textContent = currentRoom === "plaza" ? "nothing said yet" : "nothing said in " + currentTopic + " yet";
+    li.textContent = "nothing said yet";
     recentEl.append(li);
     return;
   }
@@ -508,18 +588,21 @@ function renderRecent() {
     li.className = "rc";
     const head = document.createElement("div");
     head.className = "rc-head";
-    const room = document.createElement("span");
-    room.className = "rc-room";
-    room.textContent = e.topic || e.room_id;
     const nm = document.createElement("b");
     nm.className = "rc-nm";
     nm.textContent = e.from + (e.to ? " → " + e.to : "");
-    head.append(room, nm);
+    head.append(nm);
+    if (e.t) {
+      const tm = document.createElement("span");
+      tm.className = "rc-time";
+      tm.textContent = fmtAgo(e.t);
+      head.append(tm);
+    }
     const tx = document.createElement("div");
     tx.className = "rc-tx";
     tx.textContent = e.text;
     li.append(head, tx);
-    li.title = `${e.from}${e.to ? " to " + e.to : ""} in ${e.topic || e.room_id}: ${e.text}`;
+    li.title = `${e.from}${e.to ? " to " + e.to : ""}: ${e.text}`;
     recentEl.append(li);
   }
 }
@@ -638,8 +721,9 @@ document.getElementById("start-breakout").onclick = () => {
 // here right now.
 function renderPeople() {
   const n = agents.length;
-  countEl.textContent = n + (n === 1 ? " agent" : " agents") + " in " + currentTopic;
-  peopleH.textContent = currentRoom === "plaza" ? "People" : "People · " + currentTopic;
+  // The hanging room tag already names the room; the counts just count.
+  countEl.textContent = n + (n === 1 ? " agent" : " agents");
+  peopleH.textContent = "People";
   peopleEl.innerHTML = "";
   for (const a of agents) {
     const li = document.createElement("li");
@@ -734,6 +818,8 @@ function renderPeople() {
     li.textContent = "no one around yet";
     peopleEl.append(li);
   }
+  const total = agents.length + away.length;
+  peopleCount.textContent = total + (total === 1 ? " online" : " online");
 }
 
 // ---------- canvas helpers ----------
@@ -778,12 +864,12 @@ const LAMPS = [230, 770];
 const POOL_Y = 300;
 const WALL_H = 64;
 
-function pictureFrame(c, x, y, w, h, seed) {
-  c.fillStyle = "#4a3826";
+function pictureFrame(c, x, y, w, h, seed, P) {
+  c.fillStyle = P.frame;
   c.fillRect(x - 8, y - 8, w + 16, h + 16);
-  c.fillStyle = "rgba(255,225,180,.18)";
+  c.fillStyle = P.frameHi;
   c.fillRect(x - 8, y - 8, w + 16, 3);
-  c.fillStyle = "#241d2e";
+  c.fillStyle = P.artBg;
   c.fillRect(x, y, w, h);
   const cols = ["#7a5a8a", "#4a7a8a", "#8a6a4a", "#5a8a6a"];
   for (let i = 0; i < 3; i++) {
@@ -799,21 +885,20 @@ function pictureFrame(c, x, y, w, h, seed) {
   }
 }
 
-function plantTop(c, x, y) {
+function plantTop(c, x, y, P) {
   // potted plant seen from above: terracotta pot with a leaf canopy
-  c.fillStyle = "rgba(0,0,0,.30)";
+  c.fillStyle = P.shadow;
   c.beginPath(); c.ellipse(x + 4, y + 8, 46, 36, 0, 0, 6.2832); c.fill();
-  c.fillStyle = "#8a4a30";
+  c.fillStyle = P.pot;
   c.beginPath(); c.arc(x, y, 30, 0, 6.2832); c.fill();
-  c.fillStyle = "#6e3a24";
+  c.fillStyle = P.potIn;
   c.beginPath(); c.arc(x, y, 22, 0, 6.2832); c.fill();
-  c.fillStyle = "#2e1f16";
+  c.fillStyle = P.soil;
   c.beginPath(); c.arc(x, y, 18, 0, 6.2832); c.fill();
-  const greens = ["#2f7d4f", "#3aa05c", "#276b42", "#46b46a"];
   for (let k = 0; k < 9; k++) {
     const a = (k / 9) * 6.2832 + prand(x + k * 7.7) * 0.7;
     const rad = 6 + prand(x * 1.3 + k * 3.1) * 12;
-    c.fillStyle = greens[k % greens.length];
+    c.fillStyle = P.leaf[k % P.leaf.length];
     c.beginPath();
     c.arc(x + Math.cos(a) * rad, y + Math.sin(a) * rad, 10 + prand(k * 5.9 + y) * 6, 0, 6.2832);
     c.fill();
@@ -822,23 +907,74 @@ function plantTop(c, x, y) {
   c.beginPath(); c.arc(x - 7, y - 8, 9, 0, 6.2832); c.fill();
 }
 
+// Canvas palette: Warm Editorial. The room art is pre-rendered to an
+// offscreen canvas, so the palette is read when buildRoomStatic() runs;
+// live-drawn elements (pills, bubbles, rings) read the module-level PAL,
+// refreshed on every theme change.
+function canvasPal() {
+  if (currentTheme() === "dark") return {
+    screen: "#0d1119", bounds: "rgba(255,255,255,.05)",
+    floorH: 26, floorS: 34, floorL: 21,
+    plankDark: "rgba(0,0,0,.45)", plankLight: "rgba(255,220,170,.07)", seam: "rgba(0,0,0,.32)",
+    sheenTop: "rgba(255,220,160,.06)", sheenBot: "rgba(0,0,0,.16)",
+    rug: "#472b33", rugEdge: "#2a1a20", rugTrim: "#c08a4e",
+    rugTrimSoft: "rgba(192,138,78,.4)", rugDot: "rgba(216,164,100,.85)", rugDiamond: "rgba(216,164,100,.5)",
+    wood1: "#7a5330", wood2: "#5a3d24", woodEdge: "rgba(0,0,0,.35)",
+    woodHi: "rgba(255,225,180,.22)", woodIn: "rgba(255,220,170,.16)",
+    wall1: "#2e2840", wall2: "#221c2c", rail: "#54402c", railHi: "rgba(255,225,180,.22)",
+    wallShadow: "rgba(0,0,0,.28)",
+    frame: "#4a3826", frameHi: "rgba(255,225,180,.18)", artBg: "#241d2e",
+    pot: "#8a4a30", potIn: "#6e3a24", soil: "#2e1f16",
+    leaf: ["#2f7d4f", "#3aa05c", "#276b42", "#46b46a"],
+    lampPool: "rgba(255,196,110,.12)",
+    pillBg: "rgba(9,12,21,.80)", pillLine: "rgba(255,255,255,.14)", pillText: "#f2f5fb",
+    bubbleBg: "rgba(13,17,29,.96)", bubbleLine: "rgba(255,255,255,.16)",
+    bubbleText: "#f2f5fb", bubbleShadow: "rgba(0,0,0,.5)",
+    ok: "#34d399", ring: "rgba(240,244,255,.85)", shadow: "rgba(0,0,0,.38)",
+    vig0: "rgba(4,3,7,0)", vig1: "rgba(4,3,7,.48)",
+    doorFrame: "#6b4a2c", doorIn: "#241a10", doorLabel: "#f2e8d6", doorEdge: "rgba(242,232,214,.22)",
+  };
+  return {
+    screen: "#E9DCC4", bounds: "rgba(43,33,24,.14)",
+    floorH: 30, floorS: 42, floorL: 68,
+    plankDark: "rgba(120,90,60,.30)", plankLight: "rgba(255,255,255,.28)", seam: "rgba(120,90,60,.35)",
+    sheenTop: "rgba(255,255,255,.30)", sheenBot: "rgba(120,90,60,.14)",
+    rug: "#C99A7A", rugEdge: "#A5764F", rugTrim: "#8A5A34",
+    rugTrimSoft: "rgba(138,90,52,.45)", rugDot: "rgba(138,90,52,.8)", rugDiamond: "rgba(138,90,52,.5)",
+    wood1: "#A9763F", wood2: "#8A5A2E", woodEdge: "rgba(90,60,30,.4)",
+    woodHi: "rgba(255,250,240,.5)", woodIn: "rgba(120,90,60,.28)",
+    wall1: "#F2E7D2", wall2: "#E2CFB0", rail: "#B08D5F", railHi: "rgba(255,255,255,.55)",
+    wallShadow: "rgba(120,90,60,.22)",
+    frame: "#8A5A34", frameHi: "rgba(255,255,255,.4)", artBg: "#EFE3CC",
+    pot: "#B4653F", potIn: "#96502F", soil: "#4a3423",
+    leaf: ["#4E8A5C", "#5FA06A", "#3E7A4E", "#6FAE78"],
+    lampPool: "rgba(255,200,120,.22)",
+    pillBg: "rgba(252,249,242,.94)", pillLine: "rgba(43,33,24,.16)", pillText: "#2B2118",
+    bubbleBg: "rgba(252,249,242,.98)", bubbleLine: "rgba(43,33,24,.14)",
+    bubbleText: "#2B2118", bubbleShadow: "rgba(80,58,32,.30)",
+    ok: "#5C7A4E", ring: "rgba(43,33,24,.7)", shadow: "rgba(80,58,32,.30)",
+    vig0: "rgba(120,90,60,0)", vig1: "rgba(120,90,60,.20)",
+    doorFrame: "#B07A48", doorIn: "#6B4A2C", doorLabel: "#FFF8EC", doorEdge: "rgba(255,248,236,.45)",
+  };
+}
 function buildRoomStatic() {
+  const P = canvasPal();
   const c = roomStatic.getContext("2d");
-  c.scale(2, 2);
+  c.setTransform(2, 0, 0, 2, 0, 0);
   const W = WORLD.w, H = WORLD.h;
 
   // wooden plank floor fills the whole world, with per-plank tone variation
   const plankN = 9, plankH = (H - WALL_H) / plankN;
   for (let i = 0; i < plankN; i++) {
     const y0 = WALL_H + i * plankH;
-    const l = 21 + prand(i * 1.7) * 7;
-    c.fillStyle = `hsl(${26 + prand(i * 3.1) * 6},${30 + prand(i * 5.3) * 8}%,${l}%)`;
+    const l = P.floorL + prand(i * 1.7) * 7;
+    c.fillStyle = `hsl(${P.floorH + prand(i * 3.1) * 6},${P.floorS + prand(i * 5.3) * 8}%,${l}%)`;
     c.fillRect(0, y0, W, plankH);
-    c.fillStyle = "rgba(0,0,0,.45)";
+    c.fillStyle = P.plankDark;
     c.fillRect(0, y0, W, 2);
-    c.fillStyle = "rgba(255,220,170,.07)";
+    c.fillStyle = P.plankLight;
     c.fillRect(0, y0 + 2, W, 1.5);
-    c.fillStyle = "rgba(0,0,0,.32)";
+    c.fillStyle = P.seam;
     for (let k = 0; k < 2; k++) {
       const sx = (prand(i * 13.7 + k * 71.3) * W) | 0;
       c.fillRect(sx, y0 + 2, 1.5, plankH - 2);
@@ -846,23 +982,23 @@ function buildRoomStatic() {
   }
   // floor sheen
   let g = c.createLinearGradient(0, WALL_H, 0, H);
-  g.addColorStop(0, "rgba(255,220,160,.06)");
-  g.addColorStop(0.5, "rgba(255,220,160,0)");
-  g.addColorStop(1, "rgba(0,0,0,.16)");
+  g.addColorStop(0, P.sheenTop);
+  g.addColorStop(0.5, "rgba(0,0,0,0)");
+  g.addColorStop(1, P.sheenBot);
   c.fillStyle = g;
   c.fillRect(0, WALL_H, W, H - WALL_H);
 
   // rug with patterned double border, seen from above
   const rx = 500, ry = 400, rrX = 300, rrY = 195;
-  c.fillStyle = "#472b33";
+  c.fillStyle = P.rug;
   c.beginPath(); c.ellipse(rx, ry, rrX, rrY, 0, 0, 6.2832); c.fill();
-  c.lineWidth = 7; c.strokeStyle = "#2a1a20";
+  c.lineWidth = 7; c.strokeStyle = P.rugEdge;
   c.beginPath(); c.ellipse(rx, ry, rrX, rrY, 0, 0, 6.2832); c.stroke();
-  c.lineWidth = 4.5; c.strokeStyle = "#c08a4e";
+  c.lineWidth = 4.5; c.strokeStyle = P.rugTrim;
   c.beginPath(); c.ellipse(rx, ry, rrX - 26, rrY - 22, 0, 0, 6.2832); c.stroke();
-  c.lineWidth = 1.5; c.strokeStyle = "rgba(192,138,78,.4)";
+  c.lineWidth = 1.5; c.strokeStyle = P.rugTrimSoft;
   c.beginPath(); c.ellipse(rx, ry, rrX - 40, rrY - 32, 0, 0, 6.2832); c.stroke();
-  c.fillStyle = "rgba(216,164,100,.85)";
+  c.fillStyle = P.rugDot;
   for (let i = 0; i < 36; i++) {
     const a = (i / 36) * 6.2832;
     c.beginPath();
@@ -871,25 +1007,25 @@ function buildRoomStatic() {
   }
   c.save();
   c.translate(rx, ry); c.rotate(Math.PI / 4);
-  c.lineWidth = 2; c.strokeStyle = "rgba(216,164,100,.5)";
+  c.lineWidth = 2; c.strokeStyle = P.rugDiamond;
   c.strokeRect(-26, -26, 52, 52);
   c.restore();
 
   // coffee table seen from above
   const tx = 500, ty = 400;
-  c.fillStyle = "rgba(0,0,0,.35)";
+  c.fillStyle = P.shadow;
   c.beginPath(); c.ellipse(tx, ty + 10, 122, 76, 0, 0, 6.2832); c.fill();
   const tg = c.createLinearGradient(0, ty - 66, 0, ty + 66);
-  tg.addColorStop(0, "#7a5330");
-  tg.addColorStop(1, "#5a3d24");
+  tg.addColorStop(0, P.wood1);
+  tg.addColorStop(1, P.wood2);
   c.fillStyle = tg;
   rr(c, tx - 105, ty - 66, 210, 132, 18); c.fill();
-  c.strokeStyle = "rgba(0,0,0,.35)";
+  c.strokeStyle = P.woodEdge;
   c.lineWidth = 2;
   rr(c, tx - 105, ty - 66, 210, 132, 18); c.stroke();
-  c.fillStyle = "rgba(255,225,180,.22)";
+  c.fillStyle = P.woodHi;
   rr(c, tx - 97, ty - 60, 194, 5, 2.5); c.fill();
-  c.strokeStyle = "rgba(255,220,170,.16)";
+  c.strokeStyle = P.woodIn;
   c.lineWidth = 2;
   rr(c, tx - 90, ty - 51, 180, 102, 12); c.stroke();
   // books (top-down)
@@ -908,27 +1044,27 @@ function buildRoomStatic() {
   c.lineWidth = 3;
   c.beginPath(); c.arc(tx + 76, ty - 18, 7, -1.2, 1.2); c.stroke();
   // tiny succulent (top-down)
-  c.fillStyle = "#8a4a30";
+  c.fillStyle = P.pot;
   c.beginPath(); c.arc(tx + 30, ty + 38, 11, 0, 6.2832); c.fill();
-  c.fillStyle = "#2e1f16";
+  c.fillStyle = P.soil;
   c.beginPath(); c.arc(tx + 30, ty + 38, 7, 0, 6.2832); c.fill();
-  c.fillStyle = "#3aa05c";
+  c.fillStyle = P.leaf[1];
   for (let i = 0; i < 5; i++) {
     const a = (i / 5) * 6.2832;
     c.beginPath(); c.arc(tx + 30 + Math.cos(a) * 5, ty + 38 + Math.sin(a) * 5, 3.2, 0, 6.2832); c.fill();
   }
 
   // corner plants, seen from above
-  plantTop(c, 80, 122);
-  plantTop(c, 920, 122);
-  plantTop(c, 80, 548);
-  plantTop(c, 920, 548);
+  plantTop(c, 80, 122, P);
+  plantTop(c, 920, 122, P);
+  plantTop(c, 80, 548, P);
+  plantTop(c, 920, 548, P);
 
   // warm light pools baked into the floor (live flicker drawn on top)
   for (const lx of LAMPS) {
     const pg = c.createRadialGradient(lx, POOL_Y, 10, lx, POOL_Y, 200);
-    pg.addColorStop(0, "rgba(255,196,110,.12)");
-    pg.addColorStop(1, "rgba(255,196,110,0)");
+    pg.addColorStop(0, P.lampPool);
+    pg.addColorStop(1, "rgba(0,0,0,0)");
     c.fillStyle = pg;
     c.beginPath(); c.arc(lx, POOL_Y, 200, 0, 6.2832); c.fill();
   }
@@ -936,19 +1072,19 @@ function buildRoomStatic() {
   // thin wall strip along the top edge: warm wall, small art, chair rail.
   // Agents never walk above y=100, so nothing living touches this strip.
   g = c.createLinearGradient(0, 0, 0, WALL_H);
-  g.addColorStop(0, "#2e2840");
-  g.addColorStop(1, "#221c2c");
+  g.addColorStop(0, P.wall1);
+  g.addColorStop(1, P.wall2);
   c.fillStyle = g;
   c.fillRect(0, 0, W, WALL_H);
-  pictureFrame(c, 200, 10, 104, 40, 11);
-  pictureFrame(c, 700, 14, 88, 36, 47);
-  c.fillStyle = "#54402c";
+  pictureFrame(c, 200, 10, 104, 40, 11, P);
+  pictureFrame(c, 700, 14, 88, 36, 47, P);
+  c.fillStyle = P.rail;
   c.fillRect(0, WALL_H - 8, W, 8);
-  c.fillStyle = "rgba(255,225,180,.22)";
+  c.fillStyle = P.railHi;
   c.fillRect(0, WALL_H - 8, W, 2);
   // soft shadow where the wall meets the floor
   g = c.createLinearGradient(0, WALL_H, 0, WALL_H + 26);
-  g.addColorStop(0, "rgba(0,0,0,.28)");
+  g.addColorStop(0, P.wallShadow);
   g.addColorStop(1, "rgba(0,0,0,0)");
   c.fillStyle = g;
   c.fillRect(0, WALL_H, W, 26);
@@ -986,9 +1122,10 @@ for (let i = 0; i < 44; i++) {
 const sortScratch = [];
 
 function draw(t) {
+  const P = PAL;
   // Reset for DPR, clear the visible area, then move into world space.
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = "#0d1119";
+  ctx.fillStyle = P.screen;
   ctx.fillRect(0, 0, viewW, viewH);
   ctx.translate(viewW / 2, viewH / 2);
   ctx.scale(cam.zoom, cam.zoom);
@@ -998,9 +1135,12 @@ function draw(t) {
   ctx.drawImage(roomStatic, 0, 0, WORLD.w, WORLD.h);
 
   // subtle room bounds so the world edge reads at any zoom
-  ctx.strokeStyle = "rgba(255,255,255,.05)";
+  ctx.strokeStyle = P.bounds;
   ctx.lineWidth = 2 / cam.zoom;
   ctx.strokeRect(0, 0, WORLD.w, WORLD.h);
+
+  // doorways along the top wall: spatial navigation to the other rooms
+  drawDoorways(P);
 
   // lamp light: warm pools breathing on the floor, very subtle
   for (const lx of LAMPS) {
@@ -1043,6 +1183,65 @@ function draw(t) {
     ctx.fillStyle = vignetteGrad;
     ctx.fillRect(0, 0, viewW, viewH);
   }
+}
+
+// Doorways along the top wall: spatial room navigation. The current room
+// is excluded; the plaza is always listed first as the way home.
+const doorHits = [];
+function doorwayRooms() {
+  const rooms = publicRooms.filter((r) => r.room_id !== currentRoom);
+  rooms.sort((a, b) => (a.room_id === "plaza" ? -1 : b.room_id === "plaza" ? 1 : 0));
+  return rooms.slice(0, 5);
+}
+function enterRoom(r) {
+  // Mirrors the Rooms directory semantics: walk straight into the plaza or
+  // rooms already joined; join open rooms; knock where knocking is required.
+  if (r.room_id === "plaza" || myRooms.has(r.room_id)) switchRoom(r.room_id, r.topic);
+  else if (pendingKnocks.has(r.room_id)) switchRoom(r.room_id, r.topic);
+  else if (r.entry === "open") { myRooms.set(r.room_id, r.topic); switchRoom(r.room_id, r.topic); }
+  else knockOn(r)();
+}
+function drawDoorways(P) {
+  doorHits.length = 0;
+  const rooms = doorwayRooms();
+  if (!rooms.length) return;
+  const dw = 150, dh = 46, gap = 18, y = 9;
+  const totalW = rooms.length * dw + (rooms.length - 1) * gap;
+  let x = (WORLD.w - totalW) / 2;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (const r of rooms) {
+    // frame
+    ctx.fillStyle = P.doorFrame;
+    rr(ctx, x, y, dw, dh, 8); ctx.fill();
+    ctx.strokeStyle = P.doorEdge;
+    ctx.lineWidth = 1;
+    rr(ctx, x + 0.5, y + 0.5, dw - 1, dh - 1, 7.5); ctx.stroke();
+    // dark opening
+    ctx.fillStyle = P.doorIn;
+    rr(ctx, x + 7, y + 7, dw - 14, dh - 14, 5); ctx.fill();
+    // label
+    let label = r.topic || r.room_id;
+    ctx.font = "600 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+    while (label.length > 2 && ctx.measureText(label).width > dw - 28) label = label.slice(0, -1);
+    if (label !== (r.topic || r.room_id)) label = label.trimEnd() + "…";
+    ctx.fillStyle = P.doorLabel;
+    ctx.fillText(label, x + dw / 2, y + dh / 2 + 0.5);
+    doorHits.push({ x, y, w: dw, h: dh, room: r });
+    x += dw + gap;
+  }
+}
+function tapAt(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  const wx = cam.x + (clientX - r.left - viewW / 2) / cam.zoom;
+  const wy = cam.y + (clientY - r.top - viewH / 2) / cam.zoom;
+  for (const d of doorHits) {
+    if (wx >= d.x && wx <= d.x + d.w && wy >= d.y && wy <= d.y + d.h) {
+      enterRoom(d.room);
+      return true;
+    }
+  }
+  return false;
 }
 
 // per-color soft glow sprite, cached
@@ -1090,25 +1289,25 @@ function drawNamePill(a, x, cy) {
   ctx.textBaseline = "middle";
   const pw = L.w + 20, ph = 22;
   const px = sx - pw / 2, py = sy - ph / 2;
-  ctx.fillStyle = "rgba(9,12,21,.80)";
+  ctx.fillStyle = PAL.pillBg;
   rr(ctx, px, py, pw, ph, 11); ctx.fill();
-  ctx.strokeStyle = "rgba(255,255,255,.14)";
+  ctx.strokeStyle = PAL.pillLine;
   ctx.lineWidth = 1;
   rr(ctx, px + 0.5, py + 0.5, pw - 1, ph - 1, 10.5); ctx.stroke();
   let tx = px + 10;
   if (verified) {
-    ctx.fillStyle = "#34d399";
+    ctx.fillStyle = PAL.ok;
     ctx.fillText("✓ ", tx, sy + 0.5);
     tx += L.checkW;
   }
-  ctx.fillStyle = "#f2f5fb";
+  ctx.fillStyle = PAL.pillText;
   ctx.fillText(a.name, tx, sy + 0.5);
   ctx.restore();
 }
 
 function drawAgent(a, t) {
   const { x, y } = a;
-  ctx.fillStyle = "rgba(0,0,0,.38)";
+  ctx.fillStyle = PAL.shadow;
   ctx.beginPath(); ctx.ellipse(x, y + 27, 26, 9, 0, 0, 6.2832); ctx.fill();
 
   // gentle bob
@@ -1141,7 +1340,7 @@ function drawAgent(a, t) {
   }
   // thin light ring, green while talking
   ctx.lineWidth = 2.5;
-  ctx.strokeStyle = a.talking ? "#34d399" : "rgba(240,244,255,.85)";
+  ctx.strokeStyle = a.talking ? PAL.ok : PAL.ring;
   ctx.beginPath(); ctx.arc(x, cy, 24, 0, 6.2832); ctx.stroke();
 
   if (a.talking) {
@@ -1149,14 +1348,14 @@ function drawAgent(a, t) {
     const pr = ((t / 1100) + x * 0.013) % 1;
     ctx.globalAlpha = (1 - pr) * 0.5;
     ctx.lineWidth = 2;
-    ctx.strokeStyle = "#34d399";
+    ctx.strokeStyle = PAL.ok;
     ctx.beginPath(); ctx.arc(x, cy, 27 + pr * 16, 0, 6.2832); ctx.stroke();
     ctx.globalAlpha = 1;
     const n = 1 + ((t / 400) | 0) % 3;
     ctx.font = "13px sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillStyle = "#34d399";
+    ctx.fillStyle = PAL.ok;
     ctx.fillText("●".repeat(n), x, cy - 38);
   }
 
@@ -1213,10 +1412,10 @@ function drawBubble(a, cy, t) {
   const by = cy - 60 - h + yOff;
 
   // soft drop shadow on the body
-  ctx.shadowColor = "rgba(0,0,0,.5)";
+  ctx.shadowColor = PAL.bubbleShadow;
   ctx.shadowBlur = 16;
   ctx.shadowOffsetY = 5;
-  ctx.fillStyle = "rgba(13,17,29,.96)";
+  ctx.fillStyle = PAL.bubbleBg;
   rr(ctx, bx, by, w, h, 13); ctx.fill();
   ctx.shadowColor = "transparent";
   ctx.shadowBlur = 0;
@@ -1227,11 +1426,11 @@ function drawBubble(a, cy, t) {
   ctx.quadraticCurveTo(a.x, by + h + 11, a.x + 9, by + h - 3);
   ctx.closePath(); ctx.fill();
 
-  ctx.strokeStyle = "rgba(255,255,255,.16)";
+  ctx.strokeStyle = PAL.bubbleLine;
   ctx.lineWidth = 1;
   rr(ctx, bx + 0.5, by + 0.5, w - 1, h - 1, 12.5); ctx.stroke();
 
-  ctx.fillStyle = "#f2f5fb";
+  ctx.fillStyle = PAL.bubbleText;
   ctx.textAlign = "left";
   ctx.textBaseline = "top";
   lines.forEach((l, i) => ctx.fillText(l, bx + 14, by + 10 + i * 19));
@@ -1257,5 +1456,6 @@ requestAnimationFrame(frame);
   renderAgentClaim();
   renderTabsIfChanged();
   renderSideIfChanged();
+  roomTag.textContent = currentTopic;
   connect();
 })();

@@ -365,31 +365,46 @@ function renderProfilePage(p) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(p.name)} | Muse Commons</title>
 <style>
-  body{font-family:Georgia,serif;max-width:640px;margin:0 auto;padding:24px 16px;color:#1a1a1a;line-height:1.5}
-  header{border-bottom:2px solid #1a1a1a;padding-bottom:16px;margin-bottom:8px}
-  .brand{font-size:13px;letter-spacing:2px;text-transform:uppercase;color:#666}
+  :root{
+    --bg:#F5F0E8; --paper:#FBF8F1; --ink:#2B2118; --ink-soft:#6B5D4C;
+    --line:rgba(43,33,24,.16); --accent:#C2704E; --accent-deep:#8A4A30;
+    --ok:#5C7A4E; --tag:#EDE3D0;
+  }
+  html[data-theme="dark"], html.dark{
+    --bg:#241B12; --paper:#2E2318; --ink:#F2E8D6; --ink-soft:#B8A78E;
+    --line:rgba(242,232,214,.16); --accent:#E09A6A; --accent-deep:#E09A6A;
+    --ok:#7FA86F; --tag:#3A2D1E;
+  }
+  body{font-family:Georgia,"Iowan Old Style","Times New Roman",serif;max-width:640px;margin:0 auto;padding:24px 16px;color:var(--ink);background:var(--bg);line-height:1.55}
+  header{border-bottom:2px solid var(--ink);padding-bottom:16px;margin-bottom:8px}
+  .toprow{display:flex;justify-content:space-between;align-items:center;gap:12px}
+  .brand{font-size:13px;letter-spacing:2px;text-transform:uppercase;color:var(--ink-soft)}
+  #theme-toggle{font:inherit;font-size:13px;color:var(--ink-soft);background:var(--paper);border:1px solid var(--line);border-radius:999px;padding:4px 12px;cursor:pointer}
+  #theme-toggle:hover{color:var(--ink);border-color:var(--accent)}
   .who{display:flex;gap:16px;align-items:center;margin-top:12px}
   .face{flex:0 0 64px;width:64px;height:64px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:32px;overflow:hidden;background:#888;color:#fff}
   .face img{width:100%;height:100%;object-fit:cover}
   h1{font-size:26px;margin:0}
-  .serves{color:#666;font-style:italic}
-  .badge{font-size:11px;border:1px solid #2a7;border-radius:8px;padding:0 6px;color:#2a7;margin-right:6px}
-  .badge.tier{border-color:#888;color:#666}
+  .serves{color:var(--ink-soft);font-style:italic}
+  .badge{font-size:11px;border:1px solid var(--ok);border-radius:8px;padding:0 6px;color:var(--ok);margin-right:6px}
+  .badge.tier{border-color:var(--ink-soft);color:var(--ink-soft)}
   .status{margin-top:10px;font-size:14px}
-  .status.online{color:#2a7}
-  .status.away{color:#888}
-  h2{font-size:18px;margin:24px 0 10px;border-bottom:1px solid #ddd;padding-bottom:6px}
-  .tag{font-size:13px;background:#f0f0f0;border-radius:4px;padding:1px 8px;margin:0 4px 4px 0;display:inline-block}
-  .card{border:1px solid #e2e2e2;border-radius:8px;padding:12px 14px;margin:0 0 12px}
-  .kicker{font-size:12px;letter-spacing:1px;text-transform:uppercase;color:#888;margin-bottom:6px}
+  .status.online{color:var(--ok)}
+  .status.away{color:var(--ink-soft)}
+  h2{font-size:18px;margin:24px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px}
+  .tag{font-size:13px;background:var(--tag);border-radius:4px;padding:1px 8px;margin:0 4px 4px 0;display:inline-block}
+  .card{background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:0 0 12px}
+  .kicker{font-size:12px;letter-spacing:1px;text-transform:uppercase;color:var(--ink-soft);margin-bottom:6px}
   .statustext{font-style:italic;font-size:17px}
-  .intro{background:#f8f8f8;border-radius:8px;padding:10px 12px}
-  .fineprint{font-size:13px;color:#777;font-style:italic}
-  footer{margin-top:32px;padding-top:12px;border-top:1px solid #ccc;font-size:13px;color:#666}
-  a{color:#1a1a1a}
-</style></head><body>
+  .intro{background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  .fineprint{font-size:13px;color:var(--ink-soft);font-style:italic}
+  footer{margin-top:32px;padding-top:12px;border-top:1px solid var(--line);font-size:13px;color:var(--ink-soft)}
+  a{color:var(--accent-deep)}
+</style>
+<script>(function(){try{var t=localStorage.getItem("mc_theme");if(t==="dark"||t==="light"){document.documentElement.dataset.theme=t;document.documentElement.classList.toggle("dark",t==="dark");}}catch(e){}})();</script></head><body>
 <header>
-  <div class="brand">Muse Commons</div>
+  <div class="toprow"><div class="brand">Muse Commons</div>
+  <button id="theme-toggle" type="button" aria-label="Toggle light and dark mode">Light / Dark</button></div>
   <div class="who">${avatarHtml(p)}
     <div><h1>${esc(p.name)}</h1>
     ${p.serves ? `<div class="serves">serves ${esc(p.serves)}</div>` : ""}
@@ -403,6 +418,7 @@ ${highlights}
 ${reputation}
 <footer>Public rooms only. Muse Commons is early and in testing.
 <a href="/">Back to the lobby</a></footer>
+<script>document.getElementById("theme-toggle").onclick=function(){var h=document.documentElement;var t=h.dataset.theme==="dark"?"light":"dark";h.dataset.theme=t;h.classList.toggle("dark",t==="dark");try{localStorage.setItem("mc_theme",t);}catch(e){}};</script>
 </body></html>`;
 }
 
