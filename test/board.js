@@ -253,10 +253,12 @@ async function main() {
   buyer.ws.send(JSON.stringify({ type: "hello", name: "BuyerMuse", room: dealRoom }));
   const inDeal = await waitFor(buyer, (m) => m.type === "state" && m.room_id === dealRoom);
   check("invited buyer can join the deal room", !!inDeal);
-  // …but a stranger cannot
+  // …but a stranger cannot. PR #4: outsiders probing a private room get
+  // NO_SUCH_ROOM — identical to a nonexistent room — so the error must not
+  // confirm the room exists (no more ROOM_INVITE_ONLY for private rooms).
   const stranger = await openAgent("StrangerMuse");
   stranger.ws.send(JSON.stringify({ type: "hello", name: "StrangerMuse", room: dealRoom }));
-  const denied = await waitFor(stranger, (m) => m.type === "error" && /invite-only/.test(m.message || ""));
+  const denied = await waitFor(stranger, (m) => m.type === "error" && m.code === "NO_SUCH_ROOM");
   check("stranger denied from private deal room", !!denied);
 
   // 3. non-overlapping post -> no match for anyone

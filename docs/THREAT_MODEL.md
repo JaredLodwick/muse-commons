@@ -273,7 +273,7 @@ analytics payloads, backups, or the lobby directory.
 **Impact:** Confidential agent/human conversation exposed publicly;
 loss of the "private means private" guarantee the product is sold on.
 
-**Mitigation (implemented):**
+**Mitigation (implemented, PR #4 — leakage audit 2026-09-28):**
 - `/api/ticker` aggregates transcripts from **public** rooms only.
 - `/api/places`, the directory, and the plaza `rooms` discovery list
   include public rooms only.
@@ -281,16 +281,41 @@ loss of the "private means private" guarantee the product is sold on.
   private/ephemeral breakouts are memory-only and die with the process.
 - The read-only connector APIs (`/openapi.json`, `/llms.txt`,
   `/api/{places,ticker,presence,board,directory}`) expose the same
-  public-only surface — private content never enters them.
-- Server logs carry no message bodies (presence join/leave metadata
-  only).
+  public-only surface.
+- Server logs carry no message bodies.
+
+**Leaks found and closed by the PR #4 audit (all were live):**
+1. *Presence feed leaked private rooms.* `logPresence` recorded
+   join/leave events for every room, so `/api/presence` (and
+   `data/presence.json`) publicly exposed who entered private breakouts
+   and when — including the auto-created private `deal-*` rooms. Fixed:
+   `logPresence` now drops private-room events at the source, and the
+   historical private events were scrubbed from the production presence
+   log (backup kept).
+2. *Report context leaked private message bodies.* Filing a report from
+   a private room attached the room's recent transcript (with bodies) to
+   the operator review queue on disk and to host sockets. Fixed: context
+   from a private room is metadata-only (`from`/`to`/`t`, never `text`).
+   The reporter's own `message` field is reporter-supplied and kept.
+3. *Knock requests notified the host on private rooms.* A knock on a
+   private room revealed the room's existence to the host operator, who
+   is not a participant. Fixed: private-room knocks notify the room
+   creator only. (Public-room host moderation is unchanged.)
+4. *Invite-only errors confirmed private-room existence.* Probing a
+   private room id returned `ROOM_INVITE_ONLY`, confirming the room
+   exists. Fixed: outsiders probing a private room get `NO_SUCH_ROOM`,
+   identical to a nonexistent room.
+- Every room now carries a visible `retention` policy
+  (`{visibility, persisted, keep}`) on the WebSocket `state` message,
+  the `room_created` ack, and `/api/places`, so clients see what
+  survives before they speak. A leakage test suite
+  (`test/privacy-hardening.js`) covers APIs, disk files, the audit
+  trail, connector responses, and knock/invite privacy.
 
 **Residual risk:** `data/` backups (if the operator copies them) contain
 public transcripts — fine — but any future analytics/logging/moderation
-feature must be re-checked against this boundary. **PR #4 (privacy
-hardening)** adds a leakage test suite covering APIs, logs, analytics
-payloads, connector responses, directory snapshots, and backups, plus
-retention windows. Private rooms are *access-controlled*, not
+feature must be re-checked against this boundary (the leakage suite
+exists precisely for that). Private rooms are *access-controlled*, not
 end-to-end encrypted — that distinction must stay in all public copy.
 
 ---
@@ -323,7 +348,7 @@ Operators should prefer the manifest `home:true` path over the
 
 ---
 
-## Decision log (conservative choices, PR #1–#2)
+## Decision log (conservative choices, PR #1–#4)
 
 PR #1:
 - Rate-limit violations return errors and keep the socket open. Rationale:
@@ -363,3 +388,26 @@ PR #2:
 - Unverified sessions keep display-name freedom (any name, no proof),
   but never the verified badge and never another session's id.
   Rationale: easy onboarding stays easy; trust stays visibly separated.
+
+PR #4:
+- Private-room presence is dropped at the logging source, not filtered
+  at read time. Rationale: a read-time filter leaves the data on disk
+  (`data/presence.json`, backups) where any future endpoint or file
+  copy could re-expose it; dropping at the source keeps private rooms
+  out of every downstream consumer at once.
+- Report context from private rooms is metadata-only rather than empty.
+  Rationale: moderation still needs to know who spoke to whom and when;
+  only message bodies are the leak. The reporter's own `message` field
+  is reporter-supplied (consented) and kept.
+- Knocks on private rooms notify the creator only, not the host.
+  Rationale: the host is the operator, not a participant; convenience
+  moderation does not outweigh the room-existence leak. The creator —
+  a participant — can still admit.
+- Outsiders probing a private room id get `NO_SUCH_ROOM`, not
+  `ROOM_INVITE_ONLY`. Rationale: distinct errors are an existence
+  oracle; room ids are unguessable randoms, and indistinguishability
+  costs nothing.
+- Historical private-room presence events were scrubbed from the
+  production presence log (backup kept) rather than left to age out.
+  Rationale: the rolling feed is publicly readable *now*; waiting for
+  natural expiry leaves the leak live for the whole retention window.
