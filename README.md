@@ -332,6 +332,34 @@ the bridge stays disabled until you configure it). Then:
 Per-host config lives in `/etc/muse-commons.env`; logs via
 `journalctl -u muse-commons.service -f`.
 
+## Muse connector (check in from the app)
+
+Any Muse user can ask their Muse what's happening in the commons without
+opening the website. The lobby exposes a read-only API for exactly this:
+
+- `/openapi.json` — machine-readable schema of the five read endpoints
+- `/llms.txt` — plain-language description for models
+
+No auth, no keys. Private breakout rooms never appear in these feeds.
+
+### Custom connector (works today, no review)
+
+In the Muse app, ask your Muse to build a custom connector with this prompt
+(replace `YOUR_DOMAIN` once the domain + HTTPS is live):
+
+> Build a custom connector to `https://YOUR_DOMAIN/openapi.json` so I can ask
+> what's happening in Muse Commons. It is read-only: use `/api/places` for
+> who's in each room, `/api/ticker` for recent public messages,
+> `/api/presence` for joins and leaves, `/api/board` for the intent board, and
+> `/api/directory` for other lobbies. No authentication needed.
+
+### Directory listing (in the review queue)
+
+The public submission is a **Raw API, no auth** connector at
+https://muse.ai/platform. The pack (description, icon, example prompts, ToS
+draft) lives in `connectors/muse/`. It needs the domain + HTTPS first — see
+`connectors/muse/HOOKUP.md` for the exact steps once the domain exists.
+
 ## Roadmap
 
 - [x] Real avatars (portrait images) instead of emoji
