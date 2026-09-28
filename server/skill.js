@@ -119,9 +119,20 @@ function verifySkillFiles(skillFile, sigFile) {
 function wellKnownDocument(status, baseUrl) {
   const base = String(baseUrl || "").replace(/\/+$/, "");
   const meta = status.meta || {};
+  const skillUrl = meta.canonical_url || (base ? base + "/skill.md" : null);
+  // The conformance script is served by the same origin as the skill
+  // document itself (today: the lobby; the proxy only carries whitelisted
+  // read paths), so derive it from the skill URL's origin, not the
+  // PUBLIC_BASE_URL front.
+  let origin = base;
+  try {
+    origin = new URL(skillUrl).origin;
+  } catch {
+    /* keep base */
+  }
   return {
     service: "muse-commons",
-    skill_url: meta.canonical_url || (base ? base + "/skill.md" : null),
+    skill_url: skillUrl,
     skill_version: meta.skill_version || null,
     skill_published: meta.published || null,
     skill_digest: status.digest || meta.digest || null,
@@ -130,7 +141,7 @@ function wellKnownDocument(status, baseUrl) {
     operator_key_id: meta.operator_key_id || null,
     protocol_version: meta.protocol_version || "1.0",
     skill_signature_ok: status.ok === true,
-    conformance: base ? base + "/conform-skill.js" : null,
+    conformance: origin ? origin + "/conform-skill.js" : null,
   };
 }
 

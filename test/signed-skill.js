@@ -206,6 +206,9 @@ async function lobbyTests() {
     check("well-known digest matches served skill", doc.skill_digest === sm.body.match(/^digest:\s*(sha256:[0-9a-f]{64})/m)[1],
       `${doc.skill_digest}`);
     check("well-known signature flag true", doc.skill_signature_ok === true);
+    check("well-known conformance on skill origin",
+      typeof doc.conformance === "string" && doc.conformance === doc.skill_url.replace(/\/skill\.md$/, "/conform-skill.js"),
+      doc.conformance);
   }
 
   // conformance script against the LOCAL lobby only
