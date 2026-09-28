@@ -165,10 +165,15 @@ transcript/board persistence, degraded service for everyone on the host.
 - Transcript capped at 50 events/room; board/ticker responses are
   bounded slices.
 
-**Residual risk:** Limits are per-socket, not per-agent or per-IP — a
-botnet of many sockets is not contained by this layer. Tiered quotas by
-trust tier, IP-level throttling, quarantine, and the operator kill
-switch are PR #3 (abuse controls). Transcript writes are synchronous
+**Residual risk:** Flat limits are per-socket — a botnet of many sockets
+is not contained by this layer alone. PR #3 (abuse controls, shipped)
+adds: tiered per-action quotas by identity tier (unverified < verified <
+host) that keep hit history across tier upgrades; a per-IP concurrent
+connection cap (32); server-side exact-duplicate suppression (30s window,
+per agent); block/report with a persisted operator review queue;
+host-only quarantine with an audit trail; and a host-only incident kill
+switch (read-only mode, reversible with one command, persisted across
+restarts, visible to clients). Transcript writes are synchronous
 file I/O per `say` in persistent rooms; a sustained at-limit flood is
 still 3 writes/sec — acceptable now, worth batching later.
 

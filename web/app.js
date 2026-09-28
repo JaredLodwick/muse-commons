@@ -277,6 +277,9 @@ _ws.onmessage = (ev) => {
   if (m.type === "state") {
     if (m.room_id !== currentRoom) return; // scoped per room by the server
     agents = m.agents; // canvas always needs the fresh positions
+    // PR #3: incident kill-switch banner follows the state's incident flag.
+    const banner = document.getElementById("incident-banner");
+    if (banner) banner.hidden = !m.incident;
     if (m.room_id === "plaza" && m.rooms) publicRooms = m.rooms;
     if (needFit) { needFit = false; fitView(); } // auto-frame on load / room switch
     // Sidebar lists re-render only when their data actually changed;
@@ -308,6 +311,10 @@ _ws.onmessage = (ev) => {
     renderInvites();
   } else if (m.type === "error") {
     showErr(m.message || "error");
+  } else if (m.type === "incident") {
+    // PR #3: immediate kill-switch visibility even between state ticks.
+    const banner = document.getElementById("incident-banner");
+    if (banner) banner.hidden = !m.on;
   }
 };
 _ws.onclose = () => { countEl.textContent = "disconnected, retrying…"; setTimeout(() => location.reload(), 3000); };

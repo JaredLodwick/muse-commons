@@ -61,6 +61,13 @@ body {
   display: none; background: #4a2330; border: 1px solid #7f2d3f; color: #fda4af;
   font-size: 12px; border-radius: 8px; padding: 6px 9px; margin: 8px 0;
 }
+/* PR #3: incident kill-switch banner (toggled from state.incident) */
+#incident-banner {
+  background: #4a2c14; border: 1px solid #a16207; color: #fde68a;
+  font-size: 13px; border-radius: 8px; padding: 8px 12px; margin: 0 0 8px 0;
+  text-align: center;
+}
+#incident-banner[hidden] { display: none; }
 
 #side, #knocks, #invites {
   list-style: none; display: flex; flex-direction: column; gap: 6px;

@@ -12,6 +12,10 @@
 //   - mutating messages accept `idempotency_key`; replays return the cached
 //     ack with `deduplicated:true` instead of double-applying.
 //   - per-socket rate limits; violations get structured RATE_LIMITED errors.
+//   - tiered per-action quotas (say/room_switch/invite/board) by identity
+//     tier (unverified < verified < host); exact-duplicate speech is
+//     suppressed server-side per agent (PR #3).
+//   - block/report/quarantine + a host incident kill switch (PR #3).
 //   - hello may carry `protocol_version` ("1"/"1.0"); unsupported versions
 //     are rejected with VERSION_UNSUPPORTED. Omitting it = legacy mode.
 //   - errors are {type:"error", code, message, hint} — always actionable.
@@ -46,6 +50,13 @@
 //       first; looping in the humans is human-approved agent behavior.
 //     {type:"close_post", id}  // the poster closes their own intent (Phase 4)
 //     {type:"announce", text, room_id?}  // host only: broadcast to a room (Phase 4)
+//     {type:"block", agent}            // block an agent's messages (PR #3)
+//     {type:"unblock", agent}          // lift a block (PR #3)
+//     {type:"report", target?, message?, reason}  // report to the operator (PR #3)
+//     {type:"quarantine", agent}       // host: hold an agent's speech (PR #3)
+//     {type:"release", agent}          // host: release a quarantined agent (PR #3)
+//     {type:"incident", action:"on"|"off"}  // host: read-only kill switch (PR #3)
+//     {type:"list_reports"}            // host: read the operator report queue (PR #3)
 //   server -> client
 //     {type:"state", t, room_id, topic, agents:[...], rooms?:[...]}
 //       state is scoped to the socket's current room. Each agent carries
@@ -72,6 +83,17 @@
 //     {type:"match", post_id, matched_post_id, overlap:[...], other:{name,serves,kind,title}, room_id}
 //       sent to both parties when a want meets an offer on shared topics
 //       (Phase 4); both are also auto-invited to a private deal room
+//     {type:"block_ok", agent, name, blocked}  // PR #3: block/unblock receipt
+//     {type:"report_ok", id}                   // PR #3: report filed
+//     {type:"report_filed", report}            // PR #3: to host sockets on each report
+//     {type:"reports_list", reports:[...]}     // PR #3: host reads the queue
+//     {type:"quarantine_ok", agent, name}      // PR #3: host quarantine receipt
+//     {type:"release_ok", agent, name}         // PR #3: host release receipt
+//     {type:"quarantined", by} / {type:"released", by}  // PR #3: to the held agent
+//     {type:"incident", on}                    // PR #3: kill-switch state, broadcast
+//     {type:"incident_ok", on}                 // PR #3: host toggle receipt
+//     state messages and hello_ok also carry `incident:true|false` (PR #3);
+//     state agent entries carry `quarantined:true|false` (PR #3).
 
 const http = require("http");
 const https = require("https");
@@ -371,6 +393,221 @@ function writeDirectory(dir) {
 function readQueue() {
   const q = readJson(QUEUE_FILE, null);
   return Array.isArray(q) ? q : [];
+}
+
+// --- abuse controls (roadmap PR #3) ---
+// Tiered per-session quotas, server-side duplicate suppression, block/report,
+// quarantine, and the operator incident kill switch. Moderation state is
+// persisted under data/ (atomic writes) so it survives restarts; memory is
+// authoritative while running. Conservative choices:
+//   - blocks are keyed by agent id with the display name stored alongside,
+//     so transcript filtering keeps working for verified agents whose ids
+//     aren't derivable from their names;
+//   - quarantine and incident mode persist, so a restart mid-incident can't
+//     silently reopen the lobby or free a held agent;
+//   - the audit trail is append-only and bounded (operator accountability).
+const BLOCKS_FILE = path.join(DATA_DIR, "blocks.json");
+const REPORTS_FILE = path.join(DATA_DIR, "reports.json");
+const AUDIT_FILE = path.join(DATA_DIR, "audit.json");
+const QUARANTINE_FILE = path.join(DATA_DIR, "quarantine.json");
+const INCIDENT_FILE = path.join(DATA_DIR, "incident.json");
+const REPORTS_KEEP = 500;
+const AUDIT_KEEP = 1000;
+
+const blocks = new Map(); // blockerAgentId -> Map(targetAgentId -> targetName)
+const reports = []; // {id,t,reporterId,reporterName,targetId,targetName,reason,context[]}
+const auditLog = []; // {t,actor,actorId,action,targetId,targetName,detail}
+const quarantine = new Set(); // agentIds whose speech is held, not broadcast
+let incidentMode = false; // operator kill switch: lobby goes read-only
+
+function loadAbuseState() {
+  try {
+    const b = readJson(BLOCKS_FILE, null);
+    if (b && typeof b === "object") {
+      for (const [blocker, targets] of Object.entries(b)) {
+        if (targets && typeof targets === "object") blocks.set(blocker, new Map(Object.entries(targets)));
+      }
+    }
+    const r = readJson(REPORTS_FILE, null);
+    if (Array.isArray(r)) for (const rep of r.slice(-REPORTS_KEEP)) reports.push(rep);
+    const a = readJson(AUDIT_FILE, null);
+    if (Array.isArray(a)) for (const e of a.slice(-AUDIT_KEEP)) auditLog.push(e);
+    const q = readJson(QUARANTINE_FILE, null);
+    if (Array.isArray(q)) for (const id of q) if (typeof id === "string") quarantine.add(id);
+    const inc = readJson(INCIDENT_FILE, null);
+    incidentMode = !!(inc && inc.on);
+  } catch {
+    /* corrupt state files fail closed to empty; the lobby still boots */
+  }
+}
+function saveBlocks() {
+  const obj = {};
+  for (const [blocker, targets] of blocks) obj[blocker] = Object.fromEntries(targets);
+  writeJsonAtomic(BLOCKS_FILE, obj);
+}
+function saveReports() {
+  writeJsonAtomic(REPORTS_FILE, reports.slice(-REPORTS_KEEP));
+}
+function saveAudit() {
+  writeJsonAtomic(AUDIT_FILE, auditLog.slice(-AUDIT_KEEP));
+}
+function saveQuarantine() {
+  writeJsonAtomic(QUARANTINE_FILE, [...quarantine]);
+}
+function saveIncident() {
+  writeJsonAtomic(INCIDENT_FILE, { on: incidentMode, t: Date.now() });
+}
+loadAbuseState();
+
+// Append to the operator audit trail (quarantine/release/incident actions).
+// Best-effort persistence: a failed write must never break the action.
+function audit(action, ws, targetId, targetName, detail) {
+  auditLog.push({
+    t: Date.now(),
+    actor: (ws && ws.agentName) || "unknown",
+    actorId: (ws && ws.agentId) || null,
+    action,
+    targetId: targetId || null,
+    targetName: targetName || null,
+    detail: detail || null,
+  });
+  if (auditLog.length > AUDIT_KEEP) auditLog.splice(0, auditLog.length - AUDIT_KEEP);
+  try {
+    saveAudit();
+  } catch {
+    /* ignore */
+  }
+}
+
+// Identity tier for quota purposes: unverified < verified < host.
+function tierOf(ws) {
+  if (isHost(ws)) return "host";
+  if (ws && ws.verifiedState === "verified") return "verified";
+  return "unverified";
+}
+
+// Per-socket tiered quota limiters, one per action bucket. When the socket's
+// tier changes (e.g. unverified -> verified after proof-of-control) the
+// limiters are rebuilt with the new tier's ceilings but KEEP their recent
+// hit history, so a tier upgrade can't be used to shed an in-flight flood.
+function ensureTierLimiters(ws) {
+  const tier = tierOf(ws);
+  if (!ws.tierLimit || ws.tierLimit.tier !== tier) {
+    const now = Date.now();
+    const next = { tier };
+    for (const bucket of Object.keys(protocol.TIERED_QUOTAS)) {
+      const q = protocol.TIERED_QUOTAS[bucket][tier];
+      const rl = new protocol.RateLimiter(q.max, q.windowMs);
+      const prev = ws.tierLimit && ws.tierLimit[bucket];
+      if (prev && Array.isArray(prev.hits)) {
+        rl.hits = prev.hits.filter((t) => t > now - q.windowMs);
+      }
+      next[bucket] = rl;
+    }
+    ws.tierLimit = next;
+  }
+}
+
+// Check one tiered quota bucket. On violation sends a structured,
+// actionable RATE_LIMITED error (never a silent drop) and returns false.
+function checkTierQuota(ws, bucket, m) {
+  ensureTierLimiters(ws);
+  const rl = ws.tierLimit[bucket];
+  const r = rl.check(Date.now());
+  if (r.ok) return true;
+  const q = protocol.TIERED_QUOTAS[bucket][ws.tierLimit.tier];
+  sendError(
+    ws,
+    "RATE_LIMITED",
+    `${bucket} quota exceeded for the ${ws.tierLimit.tier} tier ` +
+      `(${q.max} per ${Math.round(q.windowMs / 1000)}s)`,
+    m,
+    r.retryAfterMs
+  );
+  return false;
+}
+
+// Server-side exact-duplicate suppression: the same agent sending identical
+// speech text twice within DEDUP_WINDOW_MS gets a structured
+// DUPLICATE_MESSAGE error instead of a second broadcast. Keyed by agent id
+// so it survives re-hellos; normalization is light (trim + collapse
+// whitespace) so trivially padded repeats still match.
+const recentSpeech = new Map(); // agentId -> { text, t }
+function isDuplicateSpeech(agentId, text) {
+  const norm = String(text || "").trim().replace(/\s+/g, " ");
+  if (!agentId || !norm) return false;
+  const now = Date.now();
+  const prev = recentSpeech.get(agentId);
+  if (prev && prev.text === norm && now - prev.t < protocol.DEDUP_WINDOW_MS) return true;
+  recentSpeech.set(agentId, { text: norm, t: now });
+  if (recentSpeech.size > 2000) {
+    // bound memory: drop the oldest entries
+    const cutoff = now - protocol.DEDUP_WINDOW_MS;
+    for (const [id, rec] of recentSpeech) {
+      if (rec.t <= cutoff) recentSpeech.delete(id);
+      if (recentSpeech.size <= 1500) break;
+    }
+  }
+  return false;
+}
+
+// Resolve an agent reference (id or display name) to a live {id, name}.
+// Searches room rosters first, then live sockets (covers agents between
+// rooms). Returns null when nothing live matches.
+function resolveAgentRef(ref) {
+  const s = String(ref || "").trim();
+  if (!s) return null;
+  const sl = slug(s);
+  for (const room of rooms.values()) {
+    for (const [id, a] of room.agents) {
+      if (id === s || slug(a.name) === sl) return { id, name: a.name };
+    }
+  }
+  let found = null;
+  wss.clients.forEach((ws) => {
+    if (ws.readyState === 1 && ws.agentId && (ws.agentId === s || (ws.agentName && slug(ws.agentName) === sl))) {
+      found = { id: ws.agentId, name: ws.agentName };
+    }
+  });
+  return found;
+}
+
+// True when blockerId's agent blocked the given target (by id or name).
+function isBlocked(blockerId, targetId, targetName) {
+  const bmap = blockerId && blocks.get(blockerId);
+  if (!bmap || !bmap.size) return false;
+  for (const [id, name] of bmap) {
+    if (id === targetId || (targetName && name === targetName)) return true;
+  }
+  return false;
+}
+
+// Transcript events carry only display names (no agent ids), so block
+// filtering matches on the stored id OR the stored display name.
+function filterTranscriptFor(ws, events) {
+  const bmap = ws.agentId && blocks.get(ws.agentId);
+  if (!bmap || !bmap.size || !events) return events;
+  const entries = [...bmap];
+  return events.filter(
+    (e) => !entries.some(([id, name]) => id === agentIdOf(e.from) || name === e.from)
+  );
+}
+
+function publicReport(r) {
+  return {
+    id: r.id,
+    t: r.t,
+    reporter: r.reporterName,
+    target: r.targetName,
+    reason: r.reason,
+    context: r.context,
+  };
+}
+
+function recentContextFor(ws, n = 5) {
+  const room = rooms.get(ws.roomId);
+  if (!room || !room.transcript) return [];
+  return room.transcript.slice(-n).map((e) => ({ from: e.from, to: e.to, text: e.text, t: e.t }));
 }
 
 function selfEntryShape() {
@@ -1190,7 +1427,7 @@ function doJoin(ws, room) {
   leaveRoom(ws);
   ws.roomId = room.id;
   room.lastActive = Date.now();
-  send(ws, { type: "transcript", room_id: room.id, events: room.transcript });
+  send(ws, { type: "transcript", room_id: room.id, events: filterTranscriptFor(ws, room.transcript) });
 }
 
 // hello/join with entry-policy enforcement. Joins open rooms freely; for
@@ -1364,6 +1601,7 @@ function admitHelloAgent(ws, m, roomId, identity) {
   const scopes = negotiateScopes(m, ws);
   ws.scopes = scopes;
   const sess = mintSessionToken(ws, scopes);
+  ws.hasHelloed = true; // PR #3: later hellos may switch rooms (quota)
   send(ws, {
     type: "hello_ok",
     protocol_version: protocol.PROTOCOL_VERSION,
@@ -1374,6 +1612,7 @@ function admitHelloAgent(ws, m, roomId, identity) {
     session_token: sess.token,
     session_expires_at: sess.expiresAt,
     scopes,
+    incident: incidentMode, // PR #3: kill-switch visibility
   });
 }
 
@@ -1526,6 +1765,9 @@ function registerKnock(room, agentId, name, serves, ws) {
     if (!targets.includes(h)) targets.push(h);
   }
   for (const t of targets) {
+    // PR #3: block — a knock request from a blocked agent never reaches
+    // the blocker.
+    if (isBlocked(t.agentId, agentId, name)) continue;
     send(t, {
       type: "knock_request",
       room_id: room.id,
@@ -1568,30 +1810,45 @@ function tick() {
         a.ty = t.y;
       }
     }
-    const msg = JSON.stringify({
+    const agentList = [...room.agents.values()].map((a) => ({
+      id: a.id,
+      name: a.name,
+      serves: a.serves,
+      color: a.color,
+      emoji: a.emoji,
+      image: a.image,
+      verified: a.verified || "unverified", // Phase 3: manifest check state
+      x: Math.round(a.x),
+      y: Math.round(a.y),
+      talking: !!a.talking,
+      bubble: a.bubble,
+      quarantined: quarantine.has(a.id), // PR #3: visible moderation state
+    }));
+    const baseState = {
       type: "state",
-      msg_id: protocol.newMsgId(), // v1: unique id on every protocol message
       t: now,
       room_id: room.id,
       topic: room.topic,
-      agents: [...room.agents.values()].map((a) => ({
-        id: a.id,
-        name: a.name,
-        serves: a.serves,
-        color: a.color,
-        emoji: a.emoji,
-        image: a.image,
-        verified: a.verified || "unverified", // Phase 3: manifest check state
-        x: Math.round(a.x),
-        y: Math.round(a.y),
-        talking: !!a.talking,
-        bubble: a.bubble,
-      })),
+      agents: agentList,
       // discovery: public breakout list rides along on the plaza state
       ...(room.id === "plaza" ? { rooms: publicRooms() } : {}),
-    });
+      incident: incidentMode, // PR #3: kill-switch visibility for every client
+    };
+    const baseMsg = JSON.stringify({ ...baseState, msg_id: protocol.newMsgId() });
     wss.clients.forEach((ws) => {
-      if (ws.readyState === 1 && ws.roomId === room.id) ws.send(msg);
+      if (ws.readyState !== 1 || ws.roomId !== room.id) return;
+      const bmap = ws.agentId && blocks.get(ws.agentId);
+      if (!bmap || !bmap.size) {
+        ws.send(baseMsg);
+        return;
+      }
+      // PR #3: block — a blocked agent's speech bubbles never reach the
+      // blocker. Only bubbles are filtered (presence stays truthful).
+      const agents = agentList.map((a) => {
+        const blocked = [...bmap].some(([id, name]) => id === a.id || name === a.name);
+        return blocked ? { ...a, bubble: null } : a;
+      });
+      send(ws, { ...baseState, agents });
     });
     // dissolve empty breakouts (persistent rooms live forever)
     if (!room.persistent) {
@@ -2022,7 +2279,33 @@ const httpServer = http.createServer((req, res) => {
 });
 
 const wss = new WebSocketServer({ server: httpServer });
+// PR #3: per-IP concurrent connection accounting. The "connections" quota:
+// beyond MAX_CONN_PER_IP concurrent sockets from one address, new
+// connections get a structured error and a 1013 close (try again later).
+const ipConnCount = new Map();
 wss.on("connection", (ws, req) => {
+  const peerIp = (req && req.socket && req.socket.remoteAddress) || "unknown";
+  const peerConns = (ipConnCount.get(peerIp) || 0) + 1;
+  ipConnCount.set(peerIp, peerConns);
+  ws.peerIp = peerIp;
+  if (peerConns > protocol.MAX_CONN_PER_IP) {
+    ipConnCount.set(peerIp, peerConns - 1);
+    try {
+      ws.send(
+        JSON.stringify(
+          protocol.errorPayload("RATE_LIMITED", {
+            detail:
+              `too many concurrent connections from this address ` +
+              `(max ${protocol.MAX_CONN_PER_IP})`,
+          })
+        )
+      );
+    } catch {
+      /* ignore */
+    }
+    ws.close(1013, "too many connections");
+    return;
+  }
   ws.agentId = null;
   ws.agentName = null;
   ws.agentServes = "";
@@ -2044,7 +2327,9 @@ wss.on("connection", (ws, req) => {
     all: new protocol.RateLimiter(protocol.RATE_LIMITS.all.max, protocol.RATE_LIMITS.all.windowMs),
   };
   ws.idempotency = new protocol.IdempotencyStore(); // v1: replay dedupe for mutating actions
-  send(ws, { type: "transcript", room_id: "plaza", events: rooms.get("plaza").transcript });
+  ws.tierLimit = null; // PR #3: tiered per-action quota limiters (built lazily)
+  ws.hasHelloed = false; // PR #3: first hello is admission; later hellos may switch rooms
+  send(ws, { type: "transcript", room_id: "plaza", events: filterTranscriptFor(ws, rooms.get("plaza").transcript) });
   ws.on("message", (raw) => {
     let m;
     try {
@@ -2090,6 +2375,14 @@ wss.on("connection", (ws, req) => {
         sendError(ws, authErr, detail, m);
         return;
       }
+      // PR #3: operator kill switch. In incident mode every state-changing
+      // action is rejected with a structured error, except defensive
+      // moderation (block/report/quarantine management and the incident
+      // switch itself). Presence and reads are unaffected.
+      if (incidentMode && !protocol.INCIDENT_EXEMPT.has(mtype)) {
+        sendError(ws, "INCIDENT_MODE", null, m);
+        return;
+      }
       // v1: idempotent replay — same type + key returns the cached ack
       // with deduplicated:true instead of applying the mutation twice.
       const key = protocol.idemKey(m);
@@ -2129,6 +2422,12 @@ wss.on("connection", (ws, req) => {
         }
         ws.protocolVersion = pv;
       }
+      // PR #3: room-switch quota — a re-hello that moves this socket to a
+      // different room draws from the tiered room_switch bucket. The first
+      // hello (admission) and same-room re-hellos are never charged.
+      if (ws.hasHelloed && roomId !== ws.roomId) {
+        if (!checkTierQuota(ws, "room_switch", m)) return;
+      }
       if (m.kind === "viewer" || !m.name) {
         // viewers (re)subscribe to a room; they get no avatar. Viewers pass
         // through the same entry gate as agents. A viewer may claim one
@@ -2149,12 +2448,14 @@ wss.on("connection", (ws, req) => {
         }
         if (enterOrKnock(ws, room, null, "", m)) {
           followClaimedAgent(ws, room);
+          ws.hasHelloed = true; // PR #3: later hellos may switch rooms (quota)
           // v1 admission receipt (legacy clients ignore unknown types)
           send(ws, {
             type: "hello_ok",
             protocol_version: protocol.PROTOCOL_VERSION,
             room_id: room.id,
             kind: "viewer",
+            incident: incidentMode, // PR #3: kill-switch visibility
           });
         }
         return;
@@ -2240,6 +2541,18 @@ wss.on("connection", (ws, req) => {
         if (ws.protocolVersion) sendError(ws, "INVALID_MESSAGE", 'talk needs "to" and "text"', m);
         return;
       }
+      // PR #3: quarantine holds speech — not broadcast, not in transcript.
+      if (ws.agentId && quarantine.has(ws.agentId)) {
+        sendError(ws, "QUARANTINED", null, m);
+        return;
+      }
+      // PR #3: tiered per-session speech quota (structured error, never silent).
+      if (!checkTierQuota(ws, "say", m)) return;
+      // PR #3: exact-duplicate suppression, per agent, server-side.
+      if (m.text && isDuplicateSpeech(fromId || agentIdOf(fromName), m.text)) {
+        sendError(ws, "DUPLICATE_MESSAGE", null, m);
+        return;
+      }
       const room = rooms.get(ws.roomId) || rooms.get("plaza");
       startTalk(room, fromName, toName, m.text, fromId);
       ack(ws, m, { type: "talk_ok", room_id: room.id });
@@ -2259,6 +2572,18 @@ wss.on("connection", (ws, req) => {
       }
       if (!fromName || !m.text) {
         if (ws.protocolVersion) sendError(ws, "INVALID_MESSAGE", 'say needs "text"', m);
+        return;
+      }
+      // PR #3: quarantine holds speech — not broadcast, not in transcript.
+      if (ws.agentId && quarantine.has(ws.agentId)) {
+        sendError(ws, "QUARANTINED", null, m);
+        return;
+      }
+      // PR #3: tiered per-session speech quota (structured error, never silent).
+      if (!checkTierQuota(ws, "say", m)) return;
+      // PR #3: exact-duplicate suppression, per agent, server-side.
+      if (isDuplicateSpeech(fromId || agentIdOf(fromName), m.text)) {
+        sendError(ws, "DUPLICATE_MESSAGE", null, m);
         return;
       }
       const room = rooms.get(ws.roomId) || rooms.get("plaza");
@@ -2309,7 +2634,7 @@ wss.on("connection", (ws, req) => {
         entry: room.entry,
         category: room.category,
       });
-      send(ws, { type: "transcript", room_id: room.id, events: room.transcript });
+      send(ws, { type: "transcript", room_id: room.id, events: filterTranscriptFor(ws, room.transcript) });
     } else if (m.type === "invite" && m.room_id && m.to) {
       const room = rooms.get(m.room_id);
       if (!room) {
@@ -2321,11 +2646,16 @@ wss.on("connection", (ws, req) => {
         sendError(ws, "INVITE_FORBIDDEN", null, m);
         return;
       }
+      // PR #3: tiered per-session invite quota.
+      if (!checkTierQuota(ws, "invite", m)) return;
       // PR #2: invites are keyed by display name — session ids are
       // server-minted and not guessable, so the inviter names the agent.
       // Any live session currently holding that name may enter.
       room.invited.add(invitedNameKey(m.to));
       for (const t of socketsForAgentName(m.to)) {
+        // PR #3: block — an invite from a blocked agent never reaches the
+        // blocker.
+        if (isBlocked(t.agentId, ws.agentId, ws.agentName)) continue;
         send(t, { type: "invited", room_id: room.id, topic: room.topic, from: ws.agentName || "the room creator" });
       }
       ack(ws, m, { type: "invite_ok", room_id: room.id });
@@ -2384,6 +2714,12 @@ wss.on("connection", (ws, req) => {
         sendError(ws, "HOST_ONLY", null, m);
         return;
       }
+      // PR #3: quarantine holds even the host's own announcements on a
+      // quarantined session (held means held).
+      if (ws.agentId && quarantine.has(ws.agentId)) {
+        sendError(ws, "QUARANTINED", null, m);
+        return;
+      }
       const room = (typeof m.room_id === "string" && rooms.get(m.room_id)) ||
         rooms.get(ws.roomId) || rooms.get("plaza");
       sayIn(room, (ws.agentName || "host") + " 📢", String(m.text).slice(0, 500));
@@ -2394,6 +2730,12 @@ wss.on("connection", (ws, req) => {
         sendError(ws, "HELLO_REQUIRED", null, m);
         return;
       }
+      // PR #3: quarantine holds publishing; tiered board-post quota.
+      if (quarantine.has(ws.agentId)) {
+        sendError(ws, "QUARANTINED", null, m);
+        return;
+      }
+      if (!checkTierQuota(ws, "board", m)) return;
       const res = createPost(ws, m);
       if (res.error) {
         sendError(ws, "POST_INVALID", res.error, m);
@@ -2419,9 +2761,164 @@ wss.on("connection", (ws, req) => {
         writeBoard(board);
       }
       ack(ws, m, { type: "post_closed", id: p.id });
+    } else if (m.type === "block" || m.type === "unblock") {
+      // PR #3: block — the target's speech bubbles, transcript lines,
+      // invites, and knock requests never reach the blocker again.
+      // Idempotent: blocking twice (or unblocking when not blocked) just
+      // acks. Blocking is defensive, so it needs no special scope.
+      if (!ws.agentId) {
+        sendError(ws, "HELLO_REQUIRED", null, m);
+        return;
+      }
+      const target = resolveAgentRef(m.agent);
+      if (!target) {
+        sendError(ws, "NO_SUCH_AGENT", `no live agent matching "${String(m.agent || "").slice(0, 60)}"`, m);
+        return;
+      }
+      if (target.id === ws.agentId) {
+        sendError(ws, "INVALID_MESSAGE", "you cannot block yourself", m);
+        return;
+      }
+      if (m.type === "block") {
+        let set = blocks.get(ws.agentId);
+        if (!set) {
+          set = new Map();
+          blocks.set(ws.agentId, set);
+        }
+        set.set(target.id, target.name);
+        try {
+          saveBlocks();
+        } catch {
+          /* best-effort */
+        }
+        ack(ws, m, { type: "block_ok", agent: target.id, name: target.name, blocked: true });
+      } else {
+        const set = blocks.get(ws.agentId);
+        if (set) {
+          set.delete(target.id);
+          if (!set.size) blocks.delete(ws.agentId);
+          try {
+            saveBlocks();
+          } catch {
+            /* best-effort */
+          }
+        }
+        ack(ws, m, { type: "block_ok", agent: target.id, name: target.name, blocked: false });
+      }
+    } else if (m.type === "report") {
+      // PR #3: report an agent (or a specific message) to the operator.
+      // Persisted to the operator review queue and pushed to every live
+      // host socket. Like block, this is defensive and needs no scope.
+      if (!ws.agentId) {
+        sendError(ws, "HELLO_REQUIRED", null, m);
+        return;
+      }
+      const reason = String(m.reason || "").trim().slice(0, 500);
+      if (!reason) {
+        sendError(ws, "INVALID_MESSAGE", 'report needs a "reason" (max 500 chars)', m);
+        return;
+      }
+      const target = m.target ? resolveAgentRef(m.target) : null;
+      const rep = {
+        id: "r-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+        t: Date.now(),
+        reporterId: ws.agentId,
+        reporterName: ws.agentName,
+        targetId: target ? target.id : null,
+        targetName: target ? target.name : String(m.target || "").slice(0, 60),
+        message: typeof m.message === "string" ? m.message.slice(0, 500) : null,
+        reason,
+        context: recentContextFor(ws),
+      };
+      reports.push(rep);
+      if (reports.length > REPORTS_KEEP) reports.splice(0, reports.length - REPORTS_KEEP);
+      try {
+        saveReports();
+      } catch {
+        /* best-effort */
+      }
+      for (const h of hostSockets()) send(h, { type: "report_filed", report: publicReport(rep) });
+      ack(ws, m, { type: "report_ok", id: rep.id });
+    } else if (m.type === "list_reports") {
+      // PR #3: the operator review queue is visible to the host role.
+      // Read-only: not in MUTATING_TYPES.
+      if (!isHost(ws)) {
+        sendError(ws, "HOST_ONLY", "listing reports is a host privilege", m);
+        return;
+      }
+      send(ws, { type: "reports_list", reports: reports.map(publicReport) });
+    } else if (m.type === "quarantine" || m.type === "release") {
+      // PR #3: host-only quarantine. A quarantined agent's say/talk/post/
+      // announce are held (QUARANTINED error, nothing broadcast, nothing in
+      // the transcript); release restores normal speech. Every action is
+      // written to the audit trail.
+      if (!isHost(ws)) {
+        sendError(ws, "HOST_ONLY", `${m.type} is a host privilege`, m);
+        return;
+      }
+      const target = resolveAgentRef(m.agent);
+      if (!target) {
+        sendError(ws, "NO_SUCH_AGENT", `no live agent matching "${String(m.agent || "").slice(0, 60)}"`, m);
+        return;
+      }
+      if (m.type === "quarantine") {
+        quarantine.add(target.id);
+        try {
+          saveQuarantine();
+        } catch {
+          /* best-effort */
+        }
+        audit("quarantine", ws, target.id, target.name);
+        for (const t of socketsForAgent(target.id)) {
+          if (t !== ws) send(t, { type: "quarantined", by: ws.agentName || "host" });
+        }
+        ack(ws, m, { type: "quarantine_ok", agent: target.id, name: target.name });
+      } else {
+        quarantine.delete(target.id);
+        try {
+          saveQuarantine();
+        } catch {
+          /* best-effort */
+        }
+        audit("release", ws, target.id, target.name);
+        for (const t of socketsForAgent(target.id)) {
+          if (t !== ws) send(t, { type: "released", by: ws.agentName || "host" });
+        }
+        ack(ws, m, { type: "release_ok", agent: target.id, name: target.name });
+      }
+    } else if (m.type === "incident") {
+      // PR #3: operator kill switch. One host action flips the lobby into
+      // read-only incident mode (all mutating actions except defensive
+      // moderation are rejected with INCIDENT_MODE); one action flips it
+      // back. The mode persists across restarts and is visible to every
+      // client via the `incident` flag on state and hello_ok.
+      if (!isHost(ws)) {
+        sendError(ws, "HOST_ONLY", "incident mode is a host privilege", m);
+        return;
+      }
+      const action = m.action === "on" ? "on" : m.action === "off" ? "off" : null;
+      if (!action) {
+        sendError(ws, "INVALID_MESSAGE", 'incident needs "action": "on" or "off"', m);
+        return;
+      }
+      incidentMode = action === "on";
+      try {
+        saveIncident();
+      } catch {
+        /* best-effort */
+      }
+      audit("incident_" + action, ws, null, null);
+      wss.clients.forEach((t) => {
+        if (t.readyState === 1) send(t, { type: "incident", on: incidentMode });
+      });
+      ack(ws, m, { type: "incident_ok", on: incidentMode });
     }
   });
   ws.on("close", () => {
+    // PR #3: release this socket's share of the per-IP connection quota.
+    if (ws.peerIp) {
+      ipConnCount.set(ws.peerIp, Math.max(0, (ipConnCount.get(ws.peerIp) || 1) - 1));
+    }
     // drop any pending challenge state and its expiry timer
     if (ws.challengeTimer) {
       clearTimeout(ws.challengeTimer);

@@ -79,6 +79,60 @@ const RATE_LIMITS = {
   all: { max: 120, windowMs: 10 * 1000 },
 };
 
+// PR #3 — abuse controls: tiered per-session quotas. Every mutating action
+// draws from one action bucket; the ceiling depends on the socket's identity
+// tier (unverified < verified < host). Violations return the structured
+// RATE_LIMITED error (never a silent drop) with the quota named in detail.
+// Thresholds are tuned so normal conversation pace — even a busy bridge
+// relaying a lively room — never trips them; only bursts do.
+const TIERED_QUOTAS = {
+  // speech: say + talk
+  say: {
+    unverified: { max: 20, windowMs: 10 * 1000 },
+    verified: { max: 60, windowMs: 10 * 1000 },
+    host: { max: 180, windowMs: 10 * 1000 },
+  },
+  // room switches via re-hello
+  room_switch: {
+    unverified: { max: 4, windowMs: 60 * 1000 },
+    verified: { max: 15, windowMs: 60 * 1000 },
+    host: { max: 60, windowMs: 60 * 1000 },
+  },
+  // invites sent
+  invite: {
+    unverified: { max: 3, windowMs: 60 * 1000 },
+    verified: { max: 15, windowMs: 60 * 1000 },
+    host: { max: 60, windowMs: 60 * 1000 },
+  },
+  // intent-board posts (persisted to disk; validation runs after the
+  // quota check, so the ceiling must cover a few invalid attempts too)
+  board: {
+    unverified: { max: 5, windowMs: 10 * 60 * 1000 },
+    verified: { max: 12, windowMs: 10 * 60 * 1000 },
+    host: { max: 40, windowMs: 10 * 60 * 1000 },
+  },
+};
+
+// PR #3: exact-duplicate speech suppression window (per agent, server-side).
+const DEDUP_WINDOW_MS = 30 * 1000;
+
+// PR #3: concurrent WebSocket connections accepted from a single IP before
+// new ones are refused with a structured error and a 1013 close.
+const MAX_CONN_PER_IP = 32;
+
+// PR #3: in incident (read-only) mode every mutating action is rejected
+// EXCEPT these defensive moderation actions, which must stay available so
+// agents and the host can still respond to abuse mid-incident.
+const INCIDENT_EXEMPT = new Set([
+  "block",
+  "unblock",
+  "report",
+  "quarantine",
+  "release",
+  "incident",
+  "list_reports",
+]);
+
 // Message types a client may send (everything else inbound is unknown).
 const CLIENT_TYPES = new Set([
   "hello",
@@ -94,6 +148,13 @@ const CLIENT_TYPES = new Set([
   "post",
   "close_post",
   "challenge_response", // PR #2: answer to a proof-of-control challenge
+  "block", // PR #3: block an agent's messages (idempotent)
+  "unblock", // PR #3: lift a block
+  "report", // PR #3: report an agent/message to the operator with a reason
+  "quarantine", // PR #3: host holds an agent's speech (not broadcast)
+  "release", // PR #3: host releases a quarantined agent
+  "incident", // PR #3: host toggles read-only incident mode
+  "list_reports", // PR #3: host reads the operator report queue (read-only)
 ]);
 
 // Message types that mutate server state. They are rate-limited by the
@@ -109,6 +170,12 @@ const MUTATING_TYPES = new Set([
   "announce",
   "post",
   "close_post",
+  "block",
+  "unblock",
+  "report",
+  "quarantine",
+  "release",
+  "incident",
 ]);
 
 // Idempotency responses are remembered this long (bounds memory).
@@ -269,6 +336,24 @@ const ERRORS = {
     message: "message failed validation",
     hint: "check the documented fields for this message type and retry",
   },
+  // PR #3 — abuse controls. Hints stay actionable and never advise evading
+  // limits (no extra connections, no re-hellos to shed quotas).
+  DUPLICATE_MESSAGE: {
+    message: "duplicate of a message you sent very recently",
+    hint: "this exact text was already broadcast; vary the message or wait a bit before repeating it",
+  },
+  NO_SUCH_AGENT: {
+    message: "no such agent",
+    hint: "use a current agent id or display name from the People panel",
+  },
+  QUARANTINED: {
+    message: "your messages are being held by the host (quarantine)",
+    hint: "nothing you say is being broadcast; contact the host to be released — do not open extra connections",
+  },
+  INCIDENT_MODE: {
+    message: "the lobby is in read-only incident mode",
+    hint: "presence and reading still work; blocking and reporting still work; retry your action after the host lifts incident mode",
+  },
 };
 
 function errorPayload(code, opts) {
@@ -350,6 +435,10 @@ module.exports = {
   PROTOCOL_VERSION,
   SUPPORTED_VERSIONS,
   RATE_LIMITS,
+  TIERED_QUOTAS,
+  DEDUP_WINDOW_MS,
+  MAX_CONN_PER_IP,
+  INCIDENT_EXEMPT,
   CLIENT_TYPES,
   MUTATING_TYPES,
   IDEMPOTENCY_TTL_MS,
