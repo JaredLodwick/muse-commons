@@ -206,6 +206,7 @@ const CLIENT_TYPES = new Set([
   "request_passport", // PR #9: verified agent requests its own federation passport
   "revoke_passport", // PR #9: host revokes a passport or an agent's passports
   "passport_challenge_response", // PR #9: answer to a passport binding challenge
+  "get_metrics", // PR #10: host reads the launch dashboard (read-only, host-gated)
 ]);
 
 // Message types that mutate server state. They are rate-limited by the

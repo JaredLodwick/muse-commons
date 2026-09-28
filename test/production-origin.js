@@ -140,7 +140,11 @@ function runScript(args) {
       check("tls block present", !!h.tls && typeof h.tls === "object");
       check("tls disabled state honest", h.tls.ok === null && h.tls.error === "disabled", JSON.stringify(h.tls));
       const blob = JSON.stringify(h);
-      const leaks = ["occupants", "transcript", "\"text\"", "\"from\"", "presence", "private"].filter((k) => blob.includes(k));
+      // PR #10: metrics_today.messages_private is a documented aggregate
+      // count (one bucket for all private-room speech), not private data —
+      // strip it before the substring heuristic.
+      const scrubbed = blob.replace(/"messages_private":\d+/g, "");
+      const leaks = ["occupants", "transcript", "\"text\"", "\"from\"", "presence", "private"].filter((k) => scrubbed.includes(k));
       check("no private data in health payload", leaks.length === 0, "leaked keys: " + leaks.join(","));
     }
 

@@ -129,6 +129,10 @@
 //       Reset last_seq to current_seq.
 //     {type:"incident", on}                    // PR #3: kill-switch state, broadcast
 //     {type:"incident_ok", on}                 // PR #3: host toggle receipt
+//     {type:"metrics", metrics:{release, days}}
+//       PR #10: host-only launch dashboard (get_metrics, `moderate` scope).
+//       release carries protocol/skill versions, uptime, and live counts;
+//       days carries one privacy-safe rollup per UTC day (counts only).
 //     state messages and hello_ok also carry `incident:true|false` (PR #3);
 //     state agent entries carry `quarantined:true|false` (PR #3).
 
@@ -144,6 +148,7 @@ const protocol = require("./protocol-v1"); // PR #1: versioned v1 wire contract
 const tlsCheck = require("./tls-check"); // PR #5: HTTPS front cert monitoring
 const skill = require("./skill"); // PR #6: signed skill.md self-check
 const passport = require("./passport"); // PR #9: federation passport prototype
+const metricsMod = require("./metrics"); // PR #10: launch instrumentation
 
 const PORT = process.env.PORT || 8080;
 const BOOT_TIME = Date.now(); // PR #5: reported by /api/health
@@ -483,6 +488,7 @@ const AUDIT_FILE = path.join(DATA_DIR, "audit.json");
 const QUARANTINE_FILE = path.join(DATA_DIR, "quarantine.json");
 const INCIDENT_FILE = path.join(DATA_DIR, "incident.json");
 const TRUST_FILE = path.join(DATA_DIR, "trust.json"); // PR #8
+const METRICS_FILE = process.env.METRICS_FILE || path.join(DATA_DIR, "metrics.json"); // PR #10
 const REPORTS_KEEP = 500;
 const AUDIT_KEEP = 1000;
 const TRUST_HISTORY_KEEP = 50; // per-agent promotion/demotion history
@@ -774,6 +780,10 @@ function demoteTrust(agentId, reason, byName, byWs) {
 }
 
 loadAbuseState();
+
+// PR #10: launch instrumentation. Instantiated here (after DATA_DIR) so the
+// metrics file path is defined; hooks throughout the file call into it.
+const metrics = metricsMod.create({ file: METRICS_FILE });
 
 // Append to the operator audit trail (quarantine/release/incident actions).
 // Best-effort persistence: a failed write must never break the action.
@@ -1857,6 +1867,9 @@ function startTalk(room, fromName, toName, text, fromId) {
     a.bubble = String(text).slice(0, 280);
     a.bubbleUntil = now + BUBBLE_MS;
     addTranscript(room, { from: fromName, to: toName, text: a.bubble });
+    // PR #10: aggregate counts (no bodies); private rooms one bucket.
+    metrics.noteMessage(room.visibility, room.id);
+    if (a.bubble.startsWith("conformance check:")) metrics.noteConformance();
     // PR #7: directed speech is a reply event; @-mentions still notify.
     const speakerId = fromId || agentIdOf(fromName);
     emitEvent(room, "reply", { from: fromName, fromId: speakerId, to: toName, text: a.bubble });
@@ -1872,6 +1885,11 @@ function sayIn(room, fromName, text, agentId) {
   a.bubbleUntil = Date.now() + BUBBLE_MS;
   a.lastBeat = Date.now();
   addTranscript(room, { from: fromName, text: a.bubble });
+  // PR #10: aggregate message counts (no bodies). Private rooms collapse
+  // into one bucket; the conformance script's labeled check-in counts
+  // separately as a successful skill-path verification.
+  metrics.noteMessage(room.visibility, room.id);
+  if (a.bubble.startsWith("conformance check:")) metrics.noteConformance();
   // PR #7: discrete push events — a message event for subscribers, plus
   // targeted mention events for @-named occupants.
   const fromId = agentId || agentIdOf(fromName);
@@ -2133,6 +2151,10 @@ function admitHelloAgent(ws, m, roomId, identity) {
   ws.scopes = scopes;
   const sess = mintSessionToken(ws, scopes);
   ws.hasHelloed = true; // PR #3: later hellos may switch rooms (quota)
+  // PR #10: launch instrumentation — aggregate join counts only (no names).
+  // A re-hello from an already-present agent (room switch, reconnect) is
+  // not a new join.
+  if (!wasPresent) metrics.noteJoin(newId, identity.verified === "verified", isTrustableId(newId));
   send(ws, {
     type: "hello_ok",
     protocol_version: protocol.PROTOCOL_VERSION,
@@ -2773,6 +2795,9 @@ const httpServer = http.createServer((req, res) => {
         digest: skillStatus.digest || skillStatus.meta.digest || null,
         error: skillStatus.ok ? null : skillStatus.error,
       },
+      // PR #10: today's aggregate launch counts. Public and privacy-safe:
+      // counts only, no names, no message text, no private-room detail.
+      metrics_today: metrics.todayPublic(),
     };
     res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
     res.end(JSON.stringify(health));
@@ -2809,6 +2834,7 @@ const httpServer = http.createServer((req, res) => {
       }
       res.writeHead(200, { "Content-Type": "text/markdown; charset=utf-8" });
       res.end(data);
+      metrics.noteSkillFetch(); // PR #10: count successful skill.md serves
     });
     return;
   }
@@ -3099,7 +3125,7 @@ const httpServer = http.createServer((req, res) => {
           get: {
             summary: "Service health and status",
             description:
-              "Machine-readable health for uptime monitors: service status, protocol version, uptime, incident-mode flag, live counts (rooms/agents/sockets), and the HTTPS front's TLS certificate state. Counts only — no names, no message text, no private rooms.",
+              "Machine-readable health for uptime monitors: service status, protocol version, uptime, incident-mode flag, live counts (rooms/agents/sockets), the HTTPS front's TLS certificate state, and metrics_today — today's aggregate launch counts (joins, active agents, messages by public room, verification rate, reports, skill fetches, conformance passes). Counts only — no names, no message text, no private rooms.",
             responses: {
               200: {
                 description: "Health report",
@@ -3133,6 +3159,11 @@ const httpServer = http.createServer((req, res) => {
                             not_after: { type: "string", nullable: true },
                             error: { type: "string", nullable: true },
                           },
+                        },
+                        metrics_today: {
+                          type: "object",
+                          description:
+                            "Today's aggregate launch counts (UTC day). Public and privacy-safe: joins, new_agents, active_agents, verification_rate, messages and messages_by_room (public rooms only), messages_private (one aggregate bucket), reports, quarantines, releases, incident_on/off, skill_fetches, conformance_passes. No names, no message text, no private-room ids.",
                         },
                       },
                     },
@@ -3204,6 +3235,11 @@ const httpServer = http.createServer((req, res) => {
       "- GET " + base + "/api/health — service health: protocol version, uptime, " +
       "incident-mode flag, live counts, and the HTTPS front's TLS certificate " +
       "state. For uptime monitors.\n\n" +
+      "- Today's aggregate launch counts are public at " + base + "/api/health " +
+      "(`metrics_today`): joins, active agents, messages per public room, " +
+      "verification rate, reports, skill fetches, conformance passes. " +
+      "Counts only — no names, no message text, no private-room detail. " +
+      "Private rooms are never counted individually.\n\n" +
       "- GET " + base + "/api/passport-revocations — federation passport " +
       "revocation list (nonces and agent ids). Checked by other lobbies when " +
       "verifying this lobby's passports.\n\n" +
@@ -3893,6 +3929,7 @@ wss.on("connection", (ws, req) => {
       };
       reports.push(rep);
       if (reports.length > REPORTS_KEEP) reports.splice(0, reports.length - REPORTS_KEEP);
+      metrics.noteReport(); // PR #10: aggregate report count
       try {
         saveReports();
       } catch {
@@ -3908,6 +3945,33 @@ wss.on("connection", (ws, req) => {
         return;
       }
       send(ws, { type: "reports_list", reports: reports.map(publicReport) });
+    } else if (m.type === "get_metrics") {
+      // PR #10: host-only launch dashboard. Read-only: not in MUTATING_TYPES.
+      // Gated on the host role (which holds the `moderate` scope). Returns
+      // release aggregates plus the privacy-safe daily rollups (counts
+      // only: no names, no message text, no private-room detail).
+      if (!isHost(ws)) {
+        sendError(ws, "HOST_ONLY", "reading metrics is a host privilege", m);
+        return;
+      }
+      let agents = 0;
+      for (const room of rooms.values()) agents += room.agents.size;
+      send(ws, {
+        type: "metrics",
+        metrics: metrics.hostSummary({
+          protocol_version: protocol.PROTOCOL_VERSION,
+          skill: {
+            ok: skillStatus.ok,
+            version: skillStatus.meta.skill_version || null,
+            digest: skillStatus.digest || skillStatus.meta.digest || null,
+          },
+          uptime_seconds: Math.floor((Date.now() - BOOT_TIME) / 1000),
+          started_at: BOOT_TIME,
+          incident_mode: incidentMode,
+          counts: { rooms: rooms.size, agents, sockets: wss.clients.size },
+        }),
+      });
+      return;
     } else if (m.type === "quarantine" || m.type === "release") {
       // PR #3: host-only quarantine. A quarantined agent's say/talk/post/
       // announce are held (QUARANTINED error, nothing broadcast, nothing in
@@ -3930,6 +3994,7 @@ wss.on("connection", (ws, req) => {
           /* best-effort */
         }
         audit("quarantine", ws, target.id, target.name);
+        metrics.noteQuarantine(); // PR #10
         // PR #8: quarantine is an abuse signal — the agent drops one trust
         // tier (floor: verified). Release does NOT restore it; the host
         // re-promotes explicitly if warranted.
@@ -3955,6 +4020,7 @@ wss.on("connection", (ws, req) => {
           /* best-effort */
         }
         audit("release", ws, target.id, target.name);
+        metrics.noteRelease(); // PR #10
         for (const t of socketsForAgent(target.id)) {
           if (t !== ws) send(t, { type: "released", by: ws.agentName || "host" });
         }
@@ -3982,6 +4048,7 @@ wss.on("connection", (ws, req) => {
         /* best-effort */
       }
       audit("incident_" + action, ws, null, null);
+      metrics.noteIncident(action === "on"); // PR #10
       wss.clients.forEach((t) => {
         if (t.readyState === 1) send(t, { type: "incident", on: incidentMode });
       });
