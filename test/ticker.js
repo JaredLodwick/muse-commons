@@ -6,12 +6,17 @@
 // Exit 0 = all pass, 1 = any failure.
 const http = require("http");
 const path = require("path");
+const fs = require("fs");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
 
 const REPO = path.join(__dirname, "..");
 const LOBBY = path.join(REPO, "server", "lobby.js");
 const PORT = 18783;
+// The "fresh server -> empty ticker" check below assumes no persisted history:
+// earlier test files now leave data/transcripts.json behind (transcripts
+// persist across restarts by design), so start from a clean slate.
+try { fs.unlinkSync(path.join(REPO, "data", "transcripts.json")); } catch { /* ignore */ }
 
 const RUN = Math.random().toString(36).slice(2, 8);
 const T = (s) => `${s}-${RUN}`;

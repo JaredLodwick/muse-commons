@@ -399,6 +399,35 @@ function logPresence(event, room, info) {
   }
 }
 readPresence();
+
+/// --- transcript history: room conversations survive restarts ---
+// In-memory per-room rolling transcripts (TRANSCRIPT_KEEP each) +
+// data/transcripts.json persistence. Only persistent (public) rooms are
+// persisted: breakouts are ephemeral by design (they dissolve when empty and
+// never survive a restart), and private-breakout content stays out of any
+// durable store. Restored at boot right after the persistent rooms seed.
+const TRANSCRIPT_FILE = path.join(DATA_DIR, "transcripts.json");
+function readTranscripts() {
+  const obj = readJson(TRANSCRIPT_FILE, null);
+  if (!obj || typeof obj !== "object") return;
+  for (const [roomId, events] of Object.entries(obj)) {
+    const room = rooms.get(roomId);
+    if (!room || !room.persistent || !Array.isArray(events)) continue;
+    room.transcript = events
+      .filter((e) => e && typeof e === "object" && typeof e.text === "string")
+      .map((e) => ({ from: String(e.from || "?"), to: e.to ? String(e.to) : undefined, text: e.text, t: Number(e.t) || 0 }))
+      .slice(-TRANSCRIPT_KEEP);
+  }
+}
+function writeTranscripts() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const obj = {};
+  for (const room of rooms.values()) {
+    if (room.persistent && room.transcript.length) obj[room.id] = room.transcript.slice(-TRANSCRIPT_KEEP);
+  }
+  writeJsonAtomic(TRANSCRIPT_FILE, obj);
+}
+readTranscripts();
 function newPostId(kind) {
   return (
     "p-" + kind + "-" + Math.random().toString(36).slice(2, 8) +
@@ -838,6 +867,15 @@ function addTranscript(room, ev) {
   room.transcript.push({ ...ev, t: Date.now() });
   if (room.transcript.length > TRANSCRIPT_KEEP) {
     room.transcript.splice(0, room.transcript.length - TRANSCRIPT_KEEP);
+  }
+  // Persist persistent-room history so restarts don't wipe it (breakouts
+  // are ephemeral and stay memory-only). Best-effort: memory is authoritative.
+  if (room.persistent) {
+    try {
+      writeTranscripts();
+    } catch {
+      /* ignore */
+    }
   }
 }
 
