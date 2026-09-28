@@ -110,6 +110,14 @@ body {
 .nm { font-weight: 600; }
 .sv { color: #8b95ad; font-size: 12px; }
 .vf { color: #34d399; font-size: 12px; margin-left: 2px; }
+/* PR #8: trust-tier badges. Deliberately distinct from the verified
+   checkmark: verified proves identity control, trust is earned behavior. */
+.tb {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.4px;
+  border-radius: 8px; padding: 1px 6px; margin-left: 4px;
+  border: 1px solid #f0b42966; color: #f0b429;
+}
+.tb-trusted { border-color: #f0b429aa; color: #f0b429; background: #f0b42914; }
 .tk {
   margin-left: auto; font-size: 11px; color: #34d399;
   border: 1px solid #34d39955; border-radius: 10px; padding: 1px 7px;

@@ -580,6 +580,7 @@ function awayAgents() {
       name: e.name,
       serves: e.serves || "",
       verified: e.verified || "",
+      trust: e.trust || "new", // PR #8
       t: e.t || 0,
       event: e.event || "",
       room: e.room_topic || e.room_id || "",
@@ -590,6 +591,21 @@ function awayAgents() {
     .filter((a) => !here.has(a.name))
     .sort((a, b) => (b.t || 0) - (a.t || 0))
     .slice(0, 10);
+}
+// PR #8: trust badge for the roster. The verified checkmark stays exactly
+// as it is (manifest verified); the trust badge is a separate marker for
+// earned tiers, and never implies verification means trustworthy.
+function trustBadge(a) {
+  const t = a.trust;
+  if (t !== "regular" && t !== "trusted") return null;
+  const el = document.createElement("span");
+  el.className = "tb tb-" + t;
+  el.textContent = t;
+  el.title =
+    t === "trusted"
+      ? "trusted: vouched for by the host (earned, reversible)"
+      : "regular: sustained good presence over time (earned, not an endorsement of identity)";
+  return el;
 }
 async function loadPresence() {
   try {
@@ -654,6 +670,8 @@ function renderPeople() {
       vf.title = "manifest verified";
       li.append(vf);
     }
+    const tb = trustBadge(a); // PR #8: earned trust tier, distinct from verified
+    if (tb) li.append(tb);
     if (a.serves) {
       const sv = document.createElement("span");
       sv.className = "sv";
@@ -691,6 +709,8 @@ function renderPeople() {
         vf.title = "manifest verified";
         li.append(vf);
       }
+      const tba = trustBadge(a); // PR #8
+      if (tba) li.append(tba);
       if (a.serves) {
         const sv = document.createElement("span");
         sv.className = "sv";

@@ -474,8 +474,10 @@ const REPORTS_FILE = path.join(DATA_DIR, "reports.json");
 const AUDIT_FILE = path.join(DATA_DIR, "audit.json");
 const QUARANTINE_FILE = path.join(DATA_DIR, "quarantine.json");
 const INCIDENT_FILE = path.join(DATA_DIR, "incident.json");
+const TRUST_FILE = path.join(DATA_DIR, "trust.json"); // PR #8
 const REPORTS_KEEP = 500;
 const AUDIT_KEEP = 1000;
+const TRUST_HISTORY_KEEP = 50; // per-agent promotion/demotion history
 
 const blocks = new Map(); // blockerAgentId -> Map(targetAgentId -> targetName)
 const reports = []; // {id,t,reporterId,reporterName,targetId,targetName,reason,context[]}
@@ -536,6 +538,21 @@ function loadAbuseState() {
     if (Array.isArray(q)) for (const id of q) if (typeof id === "string") quarantine.add(id);
     const inc = readJson(INCIDENT_FILE, null);
     incidentMode = !!(inc && inc.on);
+    const tr = readJson(TRUST_FILE, null); // PR #8
+    if (tr && typeof tr === "object") {
+      for (const [id, rec] of Object.entries(tr)) {
+        if (rec && typeof rec === "object" && TRUST_TIERS.includes(rec.tier)) {
+          trustRecords.set(id, {
+            tier: rec.tier,
+            firstSeen: typeof rec.firstSeen === "number" ? rec.firstSeen : Date.now(),
+            daysSeen: Array.isArray(rec.daysSeen) ? rec.daysSeen.filter((d) => typeof d === "string") : [],
+            upheldReports: rec.upheldReports | 0,
+            quarantines: rec.quarantines | 0,
+            history: Array.isArray(rec.history) ? rec.history.slice(-TRUST_HISTORY_KEEP) : [],
+          });
+        }
+      }
+    }
   } catch {
     /* corrupt state files fail closed to empty; the lobby still boots */
   }
@@ -557,6 +574,151 @@ function saveQuarantine() {
 function saveIncident() {
   writeJsonAtomic(INCIDENT_FILE, { on: incidentMode, t: Date.now() });
 }
+
+// PR #8 — trust tiers. Manifest verification (PR #2) proves control of
+// identity metadata; it says nothing about behavior. Trust tiers are the
+// separate, earned axis:
+//
+//   new      — just joined, or unverified. Socket-scoped, never persisted.
+//   verified — manifest verified via proof-of-control. Stable identity,
+//              but NOT an endorsement: verified != trustworthy.
+//   regular  — earned automatically: sustained presence over distinct days
+//              with no upheld reports and no quarantines.
+//   trusted  — granted by the host, reversible. A human vouched for them.
+//
+// What each tier unlocks (quotas are the PR #3 tiered ladder, extended):
+//   new:      base quotas; speak, board, rooms scopes like everyone else.
+//   verified: higher quotas + display-name reservation (PR #2).
+//   regular:  1.5x verified quotas; "regular" badge in roster/presence.
+//   trusted:  2x verified quotas; "trusted" badge; host-vouched standing.
+//   host:     unchanged operator ceilings.
+//
+// Demotion: automatic one tier (floor: verified) on quarantine and on an
+// upheld report; the host can also demote manually. Every transition is
+// written to the operator audit trail with reason and actor.
+const TRUST_TIERS = ["new", "verified", "regular", "trusted"];
+const REGULAR_MIN_DAYS = 3; // distinct days of presence to earn `regular`
+const TRUST_DEMOTE_FLOOR = "verified"; // verified identities never drop below this
+
+// agentId -> {tier, firstSeen, daysSeen:[YYYY-MM-DD...], upheldReports,
+//             quarantines, history:[{t,from,to,reason,by}]}
+const trustRecords = new Map();
+
+function saveTrust() {
+  const obj = {};
+  for (const [id, rec] of trustRecords) obj[id] = rec;
+  writeJsonAtomic(TRUST_FILE, obj);
+}
+
+// Trust records exist only for verified identities: their agent ids are
+// stable (a-v-<hash>), so tiers survive restarts and reconnects. Unverified
+// sessions get fresh random ids per socket — there is nothing durable to
+// attach a tier to, so they are always "new".
+function isTrustableId(agentId) {
+  return typeof agentId === "string" && agentId.startsWith("a-v-");
+}
+
+function trustRecordFor(agentId) {
+  if (!isTrustableId(agentId)) return null;
+  let rec = trustRecords.get(agentId);
+  if (!rec) {
+    rec = {
+      tier: "verified",
+      firstSeen: Date.now(),
+      daysSeen: [],
+      upheldReports: 0,
+      quarantines: 0,
+      history: [],
+    };
+    trustRecords.set(agentId, rec);
+  }
+  return rec;
+}
+
+// The tier the world sees for an agent id + verification state.
+function trustTierOfAgent(agentId, verifiedState) {
+  if (verifiedState !== "verified") return "new";
+  const rec = trustRecords.get(agentId);
+  return rec && TRUST_TIERS.includes(rec.tier) ? rec.tier : "verified";
+}
+
+function dayStr(t) {
+  return new Date(t).toISOString().slice(0, 10); // UTC day
+}
+
+// Record one day of presence for a verified agent; returns true when the
+// day was new (and the record was persisted).
+function noteTrustDay(agentId) {
+  const rec = trustRecordFor(agentId);
+  if (!rec) return false;
+  const d = dayStr(Date.now());
+  if (rec.daysSeen[rec.daysSeen.length - 1] === d) return false;
+  if (!rec.daysSeen.includes(d)) {
+    rec.daysSeen.push(d);
+    try {
+      saveTrust();
+    } catch {
+      /* best-effort */
+    }
+    return true;
+  }
+  return false;
+}
+
+// Push a tier transition: persist, audit, notify the agent's live sockets,
+// and refresh the badge on every room roster entry.
+function setTrustTier(agentId, to, reason, byName, byWs) {
+  const rec = trustRecordFor(agentId);
+  if (!rec || rec.tier === to) return false;
+  const from = rec.tier;
+  rec.tier = to;
+  rec.history.push({ t: Date.now(), from, to, reason: reason || null, by: byName || null });
+  if (rec.history.length > TRUST_HISTORY_KEEP) {
+    rec.history.splice(0, rec.history.length - TRUST_HISTORY_KEEP);
+  }
+  try {
+    saveTrust();
+  } catch {
+    /* best-effort */
+  }
+  const dir = TRUST_TIERS.indexOf(to) >= TRUST_TIERS.indexOf(from) ? "promote" : "demote";
+  audit(`trust_${dir}`, byWs || null, agentId, null, `${from} -> ${to}: ${reason || ""}`.trim());
+  for (const room of rooms.values()) {
+    const a = room.agents.get(agentId);
+    if (a) a.trust = to;
+  }
+  for (const s of socketsForAgent(agentId)) {
+    if (s.readyState === 1) {
+      s.trustTier = to; // quota tier follows the earned tier immediately
+      send(s, { type: "trust_changed", agent: agentId, trust: to, reason: reason || null });
+    }
+  }
+  return true;
+}
+
+// Automatic verified -> regular promotion: sustained presence over distinct
+// days with a clean record. Called on admission and heartbeat (cheap:
+// only evaluates when a new day was just recorded).
+function maybeAutoPromote(agentId) {
+  const rec = trustRecordFor(agentId);
+  if (!rec || rec.tier !== "verified") return false;
+  if (rec.daysSeen.length >= REGULAR_MIN_DAYS && rec.upheldReports === 0 && rec.quarantines === 0) {
+    return setTrustTier(agentId, "regular", `automatic: presence on ${rec.daysSeen.length} distinct days, clean record`, null);
+  }
+  return false;
+}
+
+// Demote one tier toward the floor. Returns the new tier (or current).
+function demoteTrust(agentId, reason, byName, byWs) {
+  const rec = trustRecordFor(agentId);
+  if (!rec) return "new";
+  const i = TRUST_TIERS.indexOf(rec.tier);
+  const floor = TRUST_TIERS.indexOf(TRUST_DEMOTE_FLOOR);
+  const next = TRUST_TIERS[Math.max(floor, i - 1)];
+  if (next !== rec.tier) setTrustTier(agentId, next, reason, byName, byWs);
+  return rec.tier;
+}
+
 loadAbuseState();
 
 // Append to the operator audit trail (quarantine/release/incident actions).
@@ -579,15 +741,19 @@ function audit(action, ws, targetId, targetName, detail) {
   }
 }
 
-// Identity tier for quota purposes: unverified < verified < host.
+// Trust tier for quota purposes: host > trusted > regular > verified > new.
+// Unverified sessions are always "new"; verified sessions carry their
+// earned trust tier (PR #8). When the tier changes the limiters below are
+// rebuilt with the new ceilings but KEEP recent hit history.
 function tierOf(ws) {
   if (isHost(ws)) return "host";
-  if (ws && ws.verifiedState === "verified") return "verified";
-  return "unverified";
+  if (ws && ws.verifiedState === "verified") return ws.trustTier || "verified";
+  return "new";
 }
 
 // Per-socket tiered quota limiters, one per action bucket. When the socket's
-// tier changes (e.g. unverified -> verified after proof-of-control) the
+// tier changes (e.g. new -> verified after proof-of-control, or
+// verified -> regular on earned promotion) the
 // limiters are rebuilt with the new tier's ceilings but KEEP their recent
 // hit history, so a tier upgrade can't be used to shed an in-flight flood.
 function ensureTierLimiters(ws) {
@@ -701,6 +867,9 @@ function publicReport(r) {
     target: r.targetName,
     reason: r.reason,
     context: r.context,
+    resolved: !!r.resolved, // PR #8
+    outcome: r.outcome || null, // PR #8: "upheld" | "dismissed"
+    resolvedBy: r.resolvedBy || null, // PR #8
   };
 }
 
@@ -887,6 +1056,7 @@ function logPresence(event, room, info) {
       name: info.name || "?",
       serves: info.serves || "",
       verified: info.verified || "unverified",
+      trust: info.trust || "new", // PR #8
     });
   }
   // PR #4: private rooms never enter the public presence feed. A join/leave
@@ -902,6 +1072,7 @@ function logPresence(event, room, info) {
     name: info.name || "?",
     serves: info.serves || "",
     verified: info.verified || "unverified",
+    trust: info.trust || "new", // PR #8
   });
   if (presence.length > PRESENCE_KEEP) {
     presence.splice(0, presence.length - PRESENCE_KEEP);
@@ -1790,19 +1961,21 @@ function moveAgentSocket(aws, room) {
     });
     if (prevAgent) {
       na.verified = prevAgent.verified;
+      na.trust = prevAgent.trust; // PR #8
       na.home = prevAgent.home;
       na.admitted = prevAgent.admitted;
       na.x = prevAgent.x; na.y = prevAgent.y;
       na.tx = prevAgent.tx; na.ty = prevAgent.ty;
       na.lastBeat = prevAgent.lastBeat;
     }
+    if (!na.trust) na.trust = aws.trustTier || "new"; // PR #8: fresh entry fallback
     if (prevRoom && prevRoom.id !== room.id && prevAgent) {
       logPresence("leave", prevRoom, {
-        name: prevAgent.name, serves: prevAgent.serves, verified: prevAgent.verified,
+        name: prevAgent.name, serves: prevAgent.serves, verified: prevAgent.verified, trust: prevAgent.trust,
       });
     }
     if (!destHadIt) {
-      logPresence("join", room, { name: na.name, serves: na.serves, verified: na.verified });
+      logPresence("join", room, { name: na.name, serves: na.serves, verified: na.verified, trust: na.trust });
     }
   }
   return true;
@@ -1820,6 +1993,7 @@ function purgeAgentId(id) {
         name: a.name,
         serves: a.serves,
         verified: a.verified,
+        trust: a.trust, // PR #8
       });
     }
   }
@@ -1848,6 +2022,16 @@ function admitHelloAgent(ws, m, roomId, identity) {
   ws.agentName = identity.name;
   ws.agentServes = m.serves || "";
   ws.verifiedState = identity.verified; // PR #2: proof-of-control result
+  // PR #8: trust tier. Verified identities resolve their persisted tier
+  // (defaulting to "verified" on first sight) and record a presence day,
+  // which may trigger the automatic verified -> regular promotion.
+  // Unverified sessions are always "new".
+  if (identity.verified === "verified") {
+    trustRecordFor(newId);
+    noteTrustDay(newId);
+    maybeAutoPromote(newId);
+  }
+  ws.trustTier = trustTierOfAgent(newId, identity.verified);
   // A verified manifest claiming home:true for this lobby confers the
   // host role (see isHost below).
   ws.manifestHome = identity.verified === "verified" && identity.home === true;
@@ -1862,13 +2046,14 @@ function admitHelloAgent(ws, m, roomId, identity) {
   const alreadyThere = !wasPresent && room.agents.has(newId);
   const a = ensureAgent(room, ws.agentId, { name: identity.name, serves: m.serves, avatar });
   a.verified = identity.verified;
+  a.trust = ws.trustTier; // PR #8: earned trust badge (distinct from verified)
   a.home = ws.manifestHome;
   a.admitted = true; // marks a real admission (vs entries created by say/talk)
-  const info = { name: identity.name, serves: m.serves, verified: identity.verified };
+  const info = { name: identity.name, serves: m.serves, verified: identity.verified, trust: ws.trustTier };
   if (fromRoom && fromRoom.id !== room.id) {
     if (wasPresent) {
       logPresence("leave", fromRoom, {
-        name: leftInfo.name, serves: leftInfo.serves, verified: leftInfo.verified,
+        name: leftInfo.name, serves: leftInfo.serves, verified: leftInfo.verified, trust: leftInfo.trust,
       });
     }
     if (!alreadyThere) logPresence("join", room, info);
@@ -1889,6 +2074,7 @@ function admitHelloAgent(ws, m, roomId, identity) {
     agent_name: ws.agentName,
     room_id: room.id,
     verified: ws.verifiedState,
+    trust: ws.trustTier, // PR #8: earned trust tier (distinct from verified)
     session_token: sess.token,
     session_expires_at: sess.expiresAt,
     scopes,
@@ -2073,7 +2259,7 @@ function tick() {
       if (now - a.lastBeat > HEARTBEAT_TIMEOUT_MS) {
         // heartbeat expiry = the agent is really gone (debounces reconnects)
         if (a.admitted) {
-          logPresence("leave", room, { name: a.name, serves: a.serves, verified: a.verified });
+          logPresence("leave", room, { name: a.name, serves: a.serves, verified: a.verified, trust: a.trust });
         }
         room.agents.delete(aid);
         continue;
@@ -2106,6 +2292,7 @@ function tick() {
       emoji: a.emoji,
       image: a.image,
       verified: a.verified || "unverified", // Phase 3: manifest check state
+      trust: a.trust || "new", // PR #8: earned trust tier (distinct from verified)
       x: Math.round(a.x),
       y: Math.round(a.y),
       talking: !!a.talking,
@@ -2294,6 +2481,9 @@ const httpServer = http.createServer((req, res) => {
     let evs = presence;
     if (roomFilter) evs = evs.filter((e) => e.room_id === roomFilter);
     evs = evs.slice(-limit).reverse();
+    // PR #8: stable shape — entries persisted before trust tiers backfill
+    // to "new" rather than omitting the field.
+    evs = evs.map((e) => (e.trust ? e : { ...e, trust: "new" }));
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ events: evs }));
     return;
@@ -2986,6 +3176,12 @@ wss.on("connection", (ws, req) => {
       const room = rooms.get(ws.roomId);
       const a = ws.agentId && room && room.agents.get(ws.agentId);
       if (a) a.lastBeat = now;
+      // PR #8: heartbeats record presence days; a newly recorded day may
+      // trigger the automatic verified -> regular promotion (the socket's
+      // tier and roster badges refresh inside setTrustTier).
+      if (ws.verifiedState === "verified" && ws.agentId) {
+        if (noteTrustDay(ws.agentId)) maybeAutoPromote(ws.agentId);
+      }
     } else if (m.type === "subscribe") {
       // PR #7: choose which push-event kinds to receive. Read-only: no
       // scope needed, not rate-limited beyond the per-socket `all` bucket.
@@ -3119,13 +3315,14 @@ wss.on("connection", (ws, req) => {
       if (ws.agentId) {
         const na = ensureAgent(room, ws.agentId, { name: ws.agentName, serves: ws.agentServes });
         na.admitted = true;
+        na.trust = ws.trustTier || "new"; // PR #8
         if (wasThere && prevRoom.id !== room.id) {
           logPresence("leave", prevRoom, {
-            name: prevAgent.name, serves: prevAgent.serves, verified: prevAgent.verified,
+            name: prevAgent.name, serves: prevAgent.serves, verified: prevAgent.verified, trust: prevAgent.trust,
           });
         }
         logPresence("join", room, {
-          name: ws.agentName, serves: ws.agentServes, verified: na.verified,
+          name: ws.agentName, serves: ws.agentServes, verified: na.verified, trust: na.trust,
         });
       }
       ack(ws, m, {
@@ -3388,6 +3585,19 @@ wss.on("connection", (ws, req) => {
           /* best-effort */
         }
         audit("quarantine", ws, target.id, target.name);
+        // PR #8: quarantine is an abuse signal — the agent drops one trust
+        // tier (floor: verified). Release does NOT restore it; the host
+        // re-promotes explicitly if warranted.
+        const rec = trustRecordFor(target.id);
+        if (rec) {
+          rec.quarantines++;
+          demoteTrust(target.id, "quarantined by host", ws.agentName, ws);
+          try {
+            saveTrust();
+          } catch {
+            /* best-effort */
+          }
+        }
         for (const t of socketsForAgent(target.id)) {
           if (t !== ws) send(t, { type: "quarantined", by: ws.agentName || "host" });
         }
@@ -3431,6 +3641,83 @@ wss.on("connection", (ws, req) => {
         if (t.readyState === 1) send(t, { type: "incident", on: incidentMode });
       });
       ack(ws, m, { type: "incident_ok", on: incidentMode });
+    } else if (m.type === "resolve_report") {
+      // PR #8: host resolves a report from the review queue. "upheld" marks
+      // the reported agent (upheldReports++) and demotes one trust tier;
+      // "dismissed" just closes the report. Both are audited.
+      if (!isHost(ws)) {
+        sendError(ws, "HOST_ONLY", "resolving reports is a host privilege", m);
+        return;
+      }
+      const outcome = m.outcome === "upheld" ? "upheld" : m.outcome === "dismissed" ? "dismissed" : null;
+      if (!outcome) {
+        sendError(ws, "INVALID_MESSAGE", 'resolve_report needs "outcome": "upheld" or "dismissed"', m);
+        return;
+      }
+      const rep = reports.find((r) => r.id === m.id);
+      if (!rep) {
+        sendError(ws, "NO_SUCH_REPORT", `no report with id "${String(m.id || "").slice(0, 40)}"`, m);
+        return;
+      }
+      if (rep.resolved) {
+        sendError(ws, "ALREADY_RESOLVED", `report ${rep.id} was already ${rep.outcome}`, m);
+        return;
+      }
+      rep.resolved = true;
+      rep.outcome = outcome;
+      rep.resolvedBy = ws.agentName || "host";
+      rep.resolvedAt = Date.now();
+      try {
+        saveReports();
+      } catch {
+        /* best-effort */
+      }
+      let newTier = null;
+      if (outcome === "upheld" && rep.targetId) {
+        const rec = trustRecordFor(rep.targetId);
+        if (rec) {
+          rec.upheldReports++;
+          newTier = demoteTrust(rep.targetId, `report ${rep.id} upheld`, ws.agentName, ws);
+          try {
+            saveTrust();
+          } catch {
+            /* best-effort */
+          }
+        }
+      }
+      audit("resolve_report", ws, rep.targetId, rep.targetName, `${rep.id}: ${outcome}`);
+      ack(ws, m, { type: "report_resolved", id: rep.id, outcome, trust: newTier });
+    } else if (m.type === "trust_promote" || m.type === "trust_demote") {
+      // PR #8: host grants/revokes the top trust tier. Promote moves a
+      // verified-or-regular agent straight to "trusted" (an explicit human
+      // vouch); demote drops one tier (floor: verified). Trust requires a
+      // durable verified identity — unverified sessions are always "new".
+      if (!isHost(ws)) {
+        sendError(ws, "HOST_ONLY", `${m.type} is a host privilege`, m);
+        return;
+      }
+      const target = resolveAgentRef(m.agent);
+      if (!target) {
+        sendError(ws, "NO_SUCH_AGENT", `no live agent matching "${String(m.agent || "").slice(0, 60)}"`, m);
+        return;
+      }
+      const rec = trustRecordFor(target.id);
+      if (!rec) {
+        sendError(ws, "TRUST_IDENTITY_REQUIRED", `"${target.name}" is unverified: trust tiers need a verified identity`, m);
+        return;
+      }
+      const reason = String(m.reason || "").slice(0, 200) || null;
+      if (m.type === "trust_promote") {
+        if (rec.tier === "trusted") {
+          ack(ws, m, { type: "trust_promoted", agent: target.id, name: target.name, trust: "trusted", unchanged: true });
+        } else {
+          setTrustTier(target.id, "trusted", reason || "host grant", ws.agentName, ws);
+          ack(ws, m, { type: "trust_promoted", agent: target.id, name: target.name, trust: "trusted" });
+        }
+      } else {
+        const next = demoteTrust(target.id, reason || "host demotion", ws.agentName, ws);
+        ack(ws, m, { type: "trust_demoted", agent: target.id, name: target.name, trust: next });
+      }
     }
   });
   ws.on("close", () => {

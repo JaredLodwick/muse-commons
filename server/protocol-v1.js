@@ -48,6 +48,9 @@ const SCOPE_FOR_TYPE = {
   admit: "rooms",
   reject: "rooms",
   announce: "moderate", // + the host role, checked separately
+  trust_promote: "moderate", // PR #8: + the host role, checked separately
+  trust_demote: "moderate", // PR #8: + the host role, checked separately
+  resolve_report: "moderate", // PR #8: + the host role, checked separately
 };
 
 // Proof-of-control: the client signs the UTF-8 bytes of
@@ -81,37 +84,53 @@ const RATE_LIMITS = {
 
 // PR #3 — abuse controls: tiered per-session quotas. Every mutating action
 // draws from one action bucket; the ceiling depends on the socket's identity
-// tier (unverified < verified < host). Violations return the structured
+// PR #8 — trust-tier quota ladder. `new` is the old `unverified` level
+// (kept as a deprecated alias below for one release); `regular` and
+// `trusted` are earned, in that order, above `verified`.
+// tier (new < verified < regular < trusted < host). Violations return the structured
 // RATE_LIMITED error (never a silent drop) with the quota named in detail.
 // Thresholds are tuned so normal conversation pace — even a busy bridge
 // relaying a lively room — never trips them; only bursts do.
 const TIERED_QUOTAS = {
   // speech: say + talk
   say: {
-    unverified: { max: 20, windowMs: 10 * 1000 },
+    new: { max: 20, windowMs: 10 * 1000 },
     verified: { max: 60, windowMs: 10 * 1000 },
+    regular: { max: 90, windowMs: 10 * 1000 },
+    trusted: { max: 120, windowMs: 10 * 1000 },
     host: { max: 180, windowMs: 10 * 1000 },
   },
   // room switches via re-hello
   room_switch: {
-    unverified: { max: 4, windowMs: 60 * 1000 },
+    new: { max: 4, windowMs: 60 * 1000 },
     verified: { max: 15, windowMs: 60 * 1000 },
+    regular: { max: 20, windowMs: 60 * 1000 },
+    trusted: { max: 30, windowMs: 60 * 1000 },
     host: { max: 60, windowMs: 60 * 1000 },
   },
   // invites sent
   invite: {
-    unverified: { max: 3, windowMs: 60 * 1000 },
+    new: { max: 3, windowMs: 60 * 1000 },
     verified: { max: 15, windowMs: 60 * 1000 },
+    regular: { max: 20, windowMs: 60 * 1000 },
+    trusted: { max: 30, windowMs: 60 * 1000 },
     host: { max: 60, windowMs: 60 * 1000 },
   },
   // intent-board posts (persisted to disk; validation runs after the
   // quota check, so the ceiling must cover a few invalid attempts too)
   board: {
-    unverified: { max: 5, windowMs: 10 * 60 * 1000 },
+    new: { max: 5, windowMs: 10 * 60 * 1000 },
     verified: { max: 12, windowMs: 10 * 60 * 1000 },
+    regular: { max: 18, windowMs: 10 * 60 * 1000 },
+    trusted: { max: 24, windowMs: 10 * 60 * 1000 },
     host: { max: 40, windowMs: 10 * 60 * 1000 },
   },
 };
+// Deprecated alias: the quota tier for unverified agents was renamed to
+// "new" in PR #8. Kept so older references keep resolving.
+for (const bucket of Object.keys(TIERED_QUOTAS)) {
+  TIERED_QUOTAS[bucket].unverified = TIERED_QUOTAS[bucket].new;
+}
 
 // PR #3: exact-duplicate speech suppression window (per agent, server-side).
 const DEDUP_WINDOW_MS = 30 * 1000;
@@ -151,6 +170,9 @@ const INCIDENT_EXEMPT = new Set([
   "release",
   "incident",
   "list_reports",
+  "resolve_report", // PR #8: moderation stays available in incident mode
+  "trust_promote",
+  "trust_demote",
 ]);
 
 // Message types a client may send (everything else inbound is unknown).
@@ -175,6 +197,9 @@ const CLIENT_TYPES = new Set([
   "release", // PR #3: host releases a quarantined agent
   "incident", // PR #3: host toggles read-only incident mode
   "list_reports", // PR #3: host reads the operator report queue (read-only)
+  "resolve_report", // PR #8: host upholds/dismisses a report (upheld demotes)
+  "trust_promote", // PR #8: host grants the trusted tier (reversible)
+  "trust_demote", // PR #8: host demotes one trust tier
   "subscribe", // PR #7: choose which push-event kinds to receive (read-only)
 ]);
 
@@ -197,6 +222,9 @@ const MUTATING_TYPES = new Set([
   "quarantine",
   "release",
   "incident",
+  "resolve_report", // PR #8
+  "trust_promote", // PR #8
+  "trust_demote", // PR #8
 ]);
 
 // Idempotency responses are remembered this long (bounds memory).
