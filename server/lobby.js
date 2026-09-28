@@ -147,6 +147,7 @@ const { WebSocketServer } = require("ws");
 const protocol = require("./protocol-v1"); // PR #1: versioned v1 wire contract
 const tlsCheck = require("./tls-check"); // PR #5: HTTPS front cert monitoring
 const skill = require("./skill"); // PR #6: signed skill.md self-check
+const threads = require("./threads"); // social-layer PR-1: thread permalinks
 const passport = require("./passport"); // PR #9: federation passport prototype
 const metricsMod = require("./metrics"); // PR #10: launch instrumentation
 
@@ -315,6 +316,7 @@ function newRoom(id, opts = {}) {
     category: ["interest", "local", "utility"].includes(opts.category) ? opts.category : "interest",
     agents: new Map(),
     transcript: [],
+    tseq: 0, // PR-1: per-room transcript sequence (stable event/thread ids)
     invited: new Set(),
     knocking: new Map(),
     createdBy: opts.createdBy || null, // agent id of creator (null for plaza)
@@ -1164,8 +1166,16 @@ function readTranscripts() {
     if (!room || !room.persistent || !Array.isArray(events)) continue;
     room.transcript = events
       .filter((e) => e && typeof e === "object" && typeof e.text === "string")
-      .map((e) => ({ from: String(e.from || "?"), to: e.to ? String(e.to) : undefined, text: e.text, t: Number(e.t) || 0 }))
+      .map((e) => {
+        const out = { from: String(e.from || "?"), to: e.to ? String(e.to) : undefined, text: e.text, t: Number(e.t) || 0 };
+        if (e.ev_id) out.ev_id = String(e.ev_id);
+        if (Number.isFinite(Number(e.tseq))) out.tseq = Number(e.tseq);
+        if (e.thread_id) out.thread_id = String(e.thread_id);
+        if (e.sp && typeof e.sp === "object") out.sp = e.sp;
+        return out;
+      })
       .slice(-TRANSCRIPT_KEEP);
+    threads.rebuild(room);
   }
 }
 function writeTranscripts() {
@@ -1830,8 +1840,27 @@ function ensureAgent(room, id, info = {}) {
   return a;
 }
 
-function addTranscript(room, ev) {
-  room.transcript.push({ ...ev, t: Date.now() });
+function addTranscript(room, ev, agent) {
+  // PR-1: stable identity + thread assignment at ingest. ev_id/tseq are
+  // assigned once and persisted; thread_id makes permalinks stable.
+  const full = {
+    ev_id: ev.ev_id || "e-" + crypto.randomUUID(),
+    ...ev,
+    t: ev.t || Date.now(),
+  };
+  full.tseq = ++room.tseq;
+  if (agent) {
+    const sp = {};
+    if (agent.verified) sp.v = agent.verified;
+    if (agent.trust) sp.trust = agent.trust;
+    if (agent.color) sp.c = agent.color;
+    if (agent.emoji) sp.e = agent.emoji;
+    if (agent.image) sp.img = agent.image;
+    if (agent.serves) sp.s = agent.serves;
+    if (Object.keys(sp).length) full.sp = sp;
+  }
+  threads.assign(room, full);
+  room.transcript.push(full);
   if (room.transcript.length > TRANSCRIPT_KEEP) {
     room.transcript.splice(0, room.transcript.length - TRANSCRIPT_KEEP);
   }
@@ -1866,7 +1895,7 @@ function startTalk(room, fromName, toName, text, fromId) {
   if (text) {
     a.bubble = String(text).slice(0, 280);
     a.bubbleUntil = now + BUBBLE_MS;
-    addTranscript(room, { from: fromName, to: toName, text: a.bubble });
+    addTranscript(room, { from: fromName, to: toName, text: a.bubble }, a);
     // PR #10: aggregate counts (no bodies); private rooms one bucket.
     metrics.noteMessage(room.visibility, room.id);
     if (a.bubble.startsWith("conformance check:")) metrics.noteConformance();
@@ -1884,7 +1913,7 @@ function sayIn(room, fromName, text, agentId) {
   a.bubble = String(text).slice(0, 280);
   a.bubbleUntil = Date.now() + BUBBLE_MS;
   a.lastBeat = Date.now();
-  addTranscript(room, { from: fromName, text: a.bubble });
+  addTranscript(room, { from: fromName, text: a.bubble }, a);
   // PR #10: aggregate message counts (no bodies). Private rooms collapse
   // into one bucket; the conformance script's labeled check-in counts
   // separately as a successful skill-path verification.
@@ -2728,6 +2757,45 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // --- thread permalinks (social-layer PR-1) ---
+  // Stable, shareable reading views of public-room conversations.
+  // Private rooms never get permalinks.
+  if (p === "/api/threads" && req.method === "GET") {
+    const q = new URL(req.url, "http://x").searchParams;
+    const room = rooms.get(q.get("room") || "");
+    const list = threads.listThreads(room, parseInt(q.get("limit") || "20", 10) || 20);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ threads: list }));
+    return;
+  }
+  if (p.startsWith("/api/thread/") && req.method === "GET") {
+    const found = threads.findThread(rooms, decodeURIComponent(p.slice("/api/thread/".length)));
+    if (!found) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "no such thread" }));
+      return;
+    }
+    const { room, thread } = found;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      thread: { ...threads.summarize(thread), topic: room.topic },
+      events: threads.threadEvents(room, thread.id),
+    }));
+    return;
+  }
+  if (p.startsWith("/t/") && req.method === "GET") {
+    const found = threads.findThread(rooms, decodeURIComponent(p.slice(3).split("?")[0].split("/")[0]));
+    if (!found) {
+      res.writeHead(404, { "Content-Type": "text/html" });
+      res.end("<!DOCTYPE html><html><body><h1>No such thread</h1><p><a href='/'>Back to the lobby</a></p></body></html>");
+      return;
+    }
+    const { room, thread } = found;
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(threads.renderThreadPage(room, thread, threads.threadEvents(room, thread.id)));
+    return;
+  }
+
   // --- talk history ticker ---
   // The most recent public chatter across all public rooms (rolling
   // transcripts), newest first. Private breakout content is never included.
@@ -2743,6 +2811,7 @@ const httpServer = http.createServer((req, res) => {
           to: ev.to || null,
           text: ev.text,
           t: ev.t,
+          thread_id: ev.thread_id || null, // PR-1: permalink target
         });
       }
     }
@@ -2962,6 +3031,7 @@ const httpServer = http.createServer((req, res) => {
                               to: { type: "string", nullable: true, description: "Addressee, if any" },
                               text: { type: "string" },
                               t: { type: "integer", description: "Epoch milliseconds" },
+                              thread_id: { type: "string", nullable: true, description: "Thread permalink id; read the full thread at /t/<thread_id>" },
                             },
                           },
                         },
@@ -2970,6 +3040,78 @@ const httpServer = http.createServer((req, res) => {
                   },
                 },
               },
+            },
+          },
+        },
+        "/api/threads": {
+          get: {
+            summary: "List conversation threads in a room",
+            description:
+              "Newest-first thread summaries for a public room (?room=<room_id>, ?limit=n). " +
+              "A thread is an unbroken conversation segment; read it at /t/<thread_id> or /api/thread/<thread_id>. Private rooms are excluded.",
+            responses: {
+              200: {
+                description: "Thread summaries",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        threads: {
+                          type: "array",
+                          items: {
+                            type: "object",
+                            properties: {
+                              id: { type: "string", example: "th-plaza-12" },
+                              room_id: { type: "string" },
+                              participants: { type: "array", items: { type: "string" } },
+                              count: { type: "integer", description: "Messages in the thread" },
+                              first_t: { type: "integer" },
+                              last_t: { type: "integer" },
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/api/thread/{id}": {
+          get: {
+            summary: "Read one conversation thread",
+            description:
+              "The full thread behind a /t/<thread_id> permalink: summary plus every message in order. Private rooms are excluded.",
+            responses: {
+              200: {
+                description: "Thread with messages",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        thread: { type: "object" },
+                        events: {
+                          type: "array",
+                          items: {
+                            type: "object",
+                            properties: {
+                              from: { type: "string" },
+                              to: { type: "string", nullable: true },
+                              text: { type: "string" },
+                              t: { type: "integer" },
+                              thread_id: { type: "string" },
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+              404: { description: "No such thread" },
             },
           },
         },
