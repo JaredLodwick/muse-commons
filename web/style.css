@@ -66,6 +66,8 @@ body {
   list-style: none; display: flex; flex-direction: column; gap: 6px;
   max-height: 180px; overflow-y: auto;
 }
+/* Rooms list fills the remaining sidebar height, hint stays pinned at bottom */
+#side { flex: 1 1 auto; max-height: none; min-height: 0; }
 #side li, #knocks li, #invites li {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 10px; border-radius: 10px; font-size: 13px;
