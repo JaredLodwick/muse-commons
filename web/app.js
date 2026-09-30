@@ -83,6 +83,29 @@ let presenceEvents = [];
 
 let currentRoom = "plaza";
 let currentTopic = "Plaza";
+
+// --- snapshot mode (?view=snapshot&room=<id>&focus=<name>) ---
+// Headless render for the connector's room-snapshot endpoint: all UI
+// chrome is hidden via body.snapshot (see style.css), agents are arranged
+// in a deterministic ring around the focus agent, exactly one frame is
+// drawn (fixed t=0, no animation loop), then window.__snapshotReady flips.
+const SNAP = (() => {
+  try {
+    const q = new URLSearchParams(location.search);
+    if (q.get("view") !== "snapshot") return null;
+    return {
+      room: (q.get("room") || "plaza").slice(0, 64),
+      focus: (q.get("focus") || "").slice(0, 60),
+    };
+  } catch {
+    return null;
+  }
+})();
+if (SNAP) {
+  document.body.classList.add("snapshot");
+  currentRoom = SNAP.room;
+  currentTopic = SNAP.room;
+}
 let publicRooms = [];            // from plaza state: {room_id,topic,visibility,entry,occupancy}
 let myRooms = new Map([["plaza", "Plaza"]]); // room_id -> topic (joined/created)
 
@@ -331,6 +354,36 @@ window.addEventListener("keydown", (e) => {
   else if (e.key === "Escape") closeAgentPanel();
 });
 
+// Snapshot mode: deterministic static layout for headless screenshots.
+// The focus agent goes dead center (drawn slightly larger), everyone else
+// on a ring around them; camera zooms in ~1.6x on the focus agent. Reuses
+// the normal drawAgent path so the snapshot looks like the real room.
+function arrangeSnapshotRing() {
+  const cx = WORLD.w / 2, cy = WORLD.h / 2;
+  for (const a of agents) a.snapScale = 1;
+  if (!agents.length) {
+    cam.x = cx; cam.y = cy; cam.zoom = 1; clampCam();
+    return;
+  }
+  const focusName = (SNAP.focus || "").toLowerCase();
+  let fi = agents.findIndex((a) => (a.name || "").toLowerCase() === focusName);
+  if (fi < 0) fi = 0;
+  const focus = agents[fi];
+  focus.x = cx; focus.y = cy;
+  focus.snapScale = 1.35;
+  focus.talking = false;
+  const others = agents.filter((_, i) => i !== fi);
+  const R = 235;
+  others.forEach((a, i) => {
+    const ang = (i / Math.max(1, others.length)) * Math.PI * 2 - Math.PI / 2;
+    a.x = cx + Math.cos(ang) * R;
+    a.y = cy + Math.sin(ang) * R * 0.62;
+    a.talking = false;
+    a.bubble = null;
+  });
+  cam.x = cx; cam.y = cy; cam.zoom = 1.6; clampCam();
+}
+
 // Render loop: draws every frame so pan/zoom/resize stay live.
 function frame(t) {
   draw(t);
@@ -354,6 +407,14 @@ _ws.onmessage = (ev) => {
   if (m.type === "state") {
     if (m.room_id !== currentRoom) return; // scoped per room by the server
     agents = m.agents; // canvas always needs the fresh positions
+    if (SNAP) {
+      // Deterministic static layout: ring around the focus agent, one
+      // frame, then signal readiness. No sidebar re-renders, no fit.
+      arrangeSnapshotRing();
+      draw(0);
+      window.__snapshotReady = true;
+      return;
+    }
     // PR #3: incident kill-switch banner follows the state's incident flag.
     const banner = document.getElementById("incident-banner");
     if (banner) banner.hidden = !m.incident;
@@ -1413,6 +1474,15 @@ function drawNamePill(a, x, cy) {
 
 function drawAgent(a, t) {
   const { x, y } = a;
+  // Snapshot mode draws the focus agent slightly larger: scale the whole
+  // drawing around the agent's anchor point.
+  const s = a.snapScale || 1;
+  ctx.save();
+  if (s !== 1) {
+    ctx.translate(x, y);
+    ctx.scale(s, s);
+    ctx.translate(-x, -y);
+  }
   ctx.fillStyle = PAL.shadow;
   ctx.beginPath(); ctx.ellipse(x, y + 27, 26, 9, 0, 0, 6.2832); ctx.fill();
 
@@ -1467,6 +1537,7 @@ function drawAgent(a, t) {
 
   drawNamePill(a, x, cy);
   if (a.bubble) drawBubble(a, cy, t);
+  ctx.restore();
 }
 
 // Avatar image cache: loads each unique URL once, returns the Image only
@@ -1543,12 +1614,19 @@ function drawBubble(a, cy, t) {
   ctx.restore();
 }
 
-// start the render loop (defined above in the camera section)
-requestAnimationFrame(frame);
+// start the render loop (defined above in the camera section) —
+// snapshot mode draws exactly one frame per state instead.
+if (!SNAP) requestAnimationFrame(frame);
 
 // boot: land in the claimed agent's current room when known, otherwise the
-// plaza; then open the socket. The agent prompt shows on first visit only.
+// plaza; then open the socket. The agent prompt shows on first visit only
+// (never in snapshot mode).
 (async function boot() {
+  if (SNAP) {
+    roomTag.textContent = currentTopic;
+    connect();
+    return;
+  }
   if (localStorage.getItem(AGENT_KEY) === null) openAgentPrompt();
   const name = storedAgentName();
   if (name) {

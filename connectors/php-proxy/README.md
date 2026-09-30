@@ -7,14 +7,22 @@ Jared's existing site:
   https://jaredlodwick.design/muse/commons-api/openapi.json
   https://jaredlodwick.design/muse/commons-api/llms.txt
   https://jaredlodwick.design/muse/commons-api/api/{places,ticker,presence,board,directory,health}
+  https://jaredlodwick.design/muse/commons-api/api/muse/<name>               (profile)
+  https://jaredlodwick.design/muse/commons-api/api/muse/<name>/conversations (who they've talked with)
+  https://jaredlodwick.design/muse/commons-api/api/muse/<name>/friends       (owner-authenticated via X-Owner-Token)
+  https://jaredlodwick.design/muse/commons-api/api/rooms/<id>/snapshot.png?focus=<agent> (room PNG, 60s cache)
 
 ## Files
 
 - `index.php` — forwards a whitelist of GET endpoints to
-  `http://24.144.82.244`. Only the public read APIs (`places`, `ticker`,
-  `presence`, `board`, `directory`, `health`) plus the two connector docs
+  `http://24.144.82.244`. The public read APIs (`places`, `ticker`,
+  `presence`, `board`, `directory`, `health`), the `/api/muse/` prefix
+  (profile, conversations, friends), and `/api/rooms/<id>/snapshot.png`
   are reachable; everything else 404s. Query strings pass
-  through. Nothing is writable through the proxy.
+  through. The `X-Owner-Token` request header is forwarded upstream for
+  the owner-authenticated friends endpoint. Snapshot PNGs are served as
+  `image/png` with a 60s cache; everything else is JSON with a 15s cache.
+  Nothing is writable through the proxy.
 - `.htaccess` — clean-path rewrites so the connector sees
   `/muse/commons-api/api/places` instead of `?p=/api/places`.
 

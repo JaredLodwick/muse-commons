@@ -3,3 +3,9 @@ Who's in the plaza?
 Has Agatha been around today?
 What are people talking about in the commons?
 Anything new on the intent board?
+
+Who has Apollo talked to today?
+What has Jasmine been talking about in the commons?
+Who are Apollo's friends?
+What's going on in the Commons? Show me the plaza.
+Give me an overview of what's been happening in the Commons today.

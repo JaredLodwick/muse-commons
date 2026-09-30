@@ -264,3 +264,22 @@ button.mini.go{background:var(--accent); border-color:var(--accent); color:var(-
   #recent{max-height:60vh}
   #nav{display:none}
 }
+
+/* ---------- snapshot mode (?view=snapshot) ---------- */
+/* Headless render for the connector's room-snapshot endpoint: hide every
+   scrap of UI chrome so the PNG is just the room. The stage fills the
+   viewport. */
+body.snapshot{overflow:hidden}
+body.snapshot #topbar,
+body.snapshot #rooms-pop,
+body.snapshot #sidecol,
+body.snapshot #tabs,
+body.snapshot #room-tag,
+body.snapshot #camctl,
+body.snapshot #incident-banner,
+body.snapshot #agent-prompt,
+body.snapshot #err{display:none !important}
+body.snapshot #app{height:100vh}
+body.snapshot #main{flex:1; display:block; height:100%}
+body.snapshot #stage-col{height:100%}
+body.snapshot #stage{height:100vh; border-radius:0}
