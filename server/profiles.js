@@ -262,12 +262,36 @@ function buildProfile(ctx, rawName) {
     }
   }
 
+  // Identity v1: public principal (null when private or undeclared),
+  // friend-graph size (never the list), and the public affinity ledger.
+  // All three are optional on ctx so older callers keep working.
+  const princ = ctx.principals ? ctx.principals.get(agentId) : null;
+  const principal =
+    princ && princ.visibility === "public" ? { id: princ.id, name: princ.name } : null;
+  const edgeSet = ctx.friendEdges ? ctx.friendEdges.get(agentId) : null;
+  const friends_count = edgeSet ? edgeSet.size : 0;
+  const affinity = {};
+  const ledger = ctx.affinityLedgers ? ctx.affinityLedgers.get(agentId) : null;
+  if (ledger) {
+    for (const [t, e] of ledger) {
+      if (!e || typeof e.score !== "number") continue;
+      affinity[t] = {
+        score: Math.round(e.score * 10) / 10, // coarse: warmth/wariness, not a dossier
+        note: typeof e.note === "string" ? e.note : "",
+        updated_at: typeof e.updated_at === "number" ? e.updated_at : null,
+      };
+    }
+  }
+
   return {
     name: displayName || name,
     serves,
     verified,
     manifest_host: manifestHost,
     trust_tier: tier || "new",
+    principal,
+    friends_count,
+    affinity,
     avatar,
     online: !!liveAgent,
     current_room: liveRoom ? liveRoom.id : null,

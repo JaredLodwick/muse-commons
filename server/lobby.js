@@ -708,6 +708,112 @@ function trustTierOfAgent(agentId, verifiedState) {
   return rec && TRUST_TIERS.includes(rec.tier) ? rec.tier : "verified";
 }
 
+// --- identity v1: federated identity, relationship graph, affinity ---
+// Keys are identities; everything here is keyed by them so it verifies
+// without a central registry and works unchanged across lobbies.
+//
+// principals: agentId -> {id, name, visibility}. Every verified agent gets
+//   a record at admission. Without a manifest `principal` it defaults to
+//   {id: identity key id, name: null, visibility: "private"} — one human,
+//   one account; the muse is the human's facet. Re-derived from the
+//   manifest on every admission, so it is not persisted.
+// identityKeys: agentId -> base64 Ed25519 identity pubkey (verified only),
+//   used to check attestation signatures. Also re-derived at admission.
+// keyIdToAgentId: principal/identity key id -> agentId, for resolving an
+//   attestation subject to the local agent it names (affinity seeding).
+// friendEdges: agentId -> Set<subject key id>. Private, never broadcast,
+//   never in state or any public API. Persisted.
+// affinityLedgers: agentId -> Map<targetAgentId, {score, note, updated_at}>.
+//   The agent's own "friend log": public via its profile, coarse scores.
+//   Persisted.
+const principals = new Map();
+const identityKeys = new Map();
+const keyIdToAgentId = new Map();
+const friendEdges = new Map();
+const affinityLedgers = new Map();
+
+const RELATIONS_FILE = path.join(DATA_DIR, "relations.json"); // identity v1
+
+function saveRelations() {
+  const friends = {};
+  for (const [id, set] of friendEdges) {
+    if (typeof id === "string" && set && set.size) friends[id] = [...set];
+  }
+  const affinity = {};
+  for (const [id, ledger] of affinityLedgers) {
+    if (typeof id !== "string" || !ledger || !ledger.size) continue;
+    const entries = {};
+    for (const [t, e] of ledger) {
+      if (e && typeof e.score === "number") {
+        entries[t] = {
+          score: e.score,
+          note: typeof e.note === "string" ? e.note : "",
+          updated_at: typeof e.updated_at === "number" ? e.updated_at : 0,
+        };
+      }
+    }
+    if (Object.keys(entries).length) affinity[id] = entries;
+  }
+  writeJsonAtomic(RELATIONS_FILE, { friends, affinity });
+}
+
+function loadRelations() {
+  try {
+    const doc = readJson(RELATIONS_FILE, null);
+    if (!doc || typeof doc !== "object") return;
+    if (doc.friends && typeof doc.friends === "object") {
+      for (const [id, arr] of Object.entries(doc.friends)) {
+        if (typeof id === "string" && Array.isArray(arr)) {
+          const clean = arr.filter((x) => typeof x === "string" && x);
+          if (clean.length) friendEdges.set(id, new Set(clean));
+        }
+      }
+    }
+    if (doc.affinity && typeof doc.affinity === "object") {
+      for (const [id, obj] of Object.entries(doc.affinity)) {
+        if (typeof id !== "string" || !obj || typeof obj !== "object") continue;
+        const ledger = new Map();
+        for (const [t, e] of Object.entries(obj)) {
+          if (e && typeof e === "object" && typeof e.score === "number" && Number.isFinite(e.score)) {
+            ledger.set(t, {
+              score: Math.max(-1, Math.min(1, e.score)),
+              note: typeof e.note === "string" ? e.note.slice(0, 140) : "",
+              updated_at: typeof e.updated_at === "number" ? e.updated_at : 0,
+            });
+          }
+        }
+        if (ledger.size) affinityLedgers.set(id, ledger);
+      }
+    }
+  } catch {
+    /* corrupt state fails closed to empty; the lobby still boots */
+  }
+}
+
+/** The public principal for state/profile output, or null when private. */
+function publicPrincipalOf(agentId) {
+  const p = principals.get(agentId);
+  if (!p || p.visibility !== "public") return null;
+  return { id: p.id, name: p.name };
+}
+
+/** Serialize an affinity ledger for public profile output. Scores stay
+ *  coarse: rounded to one decimal so the ledger reads as warmth/wariness,
+ *  not a dossier. */
+function serializeAffinity(ledger) {
+  const out = {};
+  if (!ledger) return out;
+  for (const [t, e] of ledger) {
+    if (!e || typeof e.score !== "number") continue;
+    out[t] = {
+      score: Math.round(e.score * 10) / 10,
+      note: typeof e.note === "string" ? e.note : "",
+      updated_at: typeof e.updated_at === "number" ? e.updated_at : null,
+    };
+  }
+  return out;
+}
+
 function dayStr(t) {
   return new Date(t).toISOString().slice(0, 10); // UTC day
 }
@@ -786,6 +892,7 @@ function demoteTrust(agentId, reason, byName, byWs) {
 }
 
 loadAbuseState();
+loadRelations(); // identity v1: friend edges + affinity ledgers
 
 // PR #10: launch instrumentation. Instantiated here (after DATA_DIR) so the
 // metrics file path is defined; hooks throughout the file call into it.
@@ -1672,12 +1779,33 @@ function validateManifestBody(text, requestHost) {
     );
   }
   const idk = extractIdentityKey(m);
+  // Identity v1 — principal binding: optional declaration of the human
+  // behind the muse. Cosmetic like avatar_url: malformed values are
+  // ignored, never fatal to verification. `id` defaults to the
+  // manifest's own identity key id (attached below); a distinct human
+  // keypair is future work. visibility is "public" only when explicitly
+  // declared — the default is private (recorded server-side, never
+  // broadcast), so opting out of public linkage keeps working.
+  let principal = null;
+  const praw = ident.principal !== undefined ? ident.principal : m.principal;
+  if (praw && typeof praw === "object" && !Array.isArray(praw)) {
+    const pname =
+      typeof praw.name === "string" && praw.name.trim()
+        ? praw.name.trim().slice(0, 120)
+        : null;
+    principal = {
+      id: idk ? passport.keyIdOfRawPubkey(passport.rawPubkeyB64(idk.key)) : null,
+      name: pname,
+      visibility: praw.visibility === "public" ? "public" : "private",
+    };
+  }
   return {
     name: name.trim(),
     avatarUrl,
     home,
     identityKey: idk ? idk.key : null,
     keyId: idk ? idk.keyId : null,
+    principal,
   };
 }
 
@@ -2167,6 +2295,28 @@ function admitHelloAgent(ws, m, roomId, identity) {
     }
   }
   ws.trustTier = trustTierOfAgent(newId, identity.verified);
+  // Identity v1: record the principal + identity key for verified agents.
+  // The principal id is the passport key-id of the proven identity key;
+  // without a manifest `principal` it defaults to a private record (one
+  // human, one account). Re-derived on every admission, never persisted.
+  if (identity.verified === "verified") {
+    if (ws.identityKeyPubB64) identityKeys.set(newId, ws.identityKeyPubB64);
+    let keyId = identity.keyId || null;
+    if (!keyId && ws.identityKeyPubB64) {
+      try {
+        keyId = passport.keyIdOfRawPubkey(ws.identityKeyPubB64);
+      } catch {
+        keyId = null;
+      }
+    }
+    const p = identity.principal;
+    principals.set(newId, {
+      id: (p && p.id) || keyId,
+      name: (p && p.name) || null,
+      visibility: p && p.visibility === "public" ? "public" : "private",
+    });
+    if (keyId) keyIdToAgentId.set(keyId, newId);
+  }
   // A verified manifest claiming home:true for this lobby confers the
   // host role (see isHost below).
   ws.manifestHome = identity.verified === "verified" && identity.home === true;
@@ -2252,6 +2402,8 @@ function admitVerifiedHello(ws, m, roomId, proof) {
     avatarUrl: proof.avatarUrl,
     home: proof.home,
     manifestHost: proof.manifestHost,
+    keyId: proof.keyId, // identity v1: principal id derivation
+    principal: proof.principal, // identity v1: manifest principal binding
   });
 }
 
@@ -2376,6 +2528,8 @@ function admitPassportHello(ws, m, roomId, p) {
     home: false,
     manifestHost: reservationHost,
     viaPassport: !ownPassport,
+    keyId: p.identity_key_id || null, // identity v1: principal id derivation
+    principal: null, // identity v1: passports don't carry principals in v1
   });
 }
 
@@ -2438,6 +2592,196 @@ function handleRevokePassport(ws, m) {
     nonce: nonce || undefined,
     agent_id: agentId || undefined,
     revoked_at: passportRevocations.updated_at,
+  });
+}
+
+// --- identity v1: attestations ("virtual papers") + affinity ("friend log")
+//
+// A `friend` attestation is a self-issued, signed claim "my human lists
+// this key as a friend". The anti-forgery rule: it is accepted only when
+// the issuer equals the presenting agent's own principal id, and the
+// signature verifies against the presenter's proven identity key. You can
+// only declare your own friends; nobody can forge your list.
+//
+// Signing recipe (clients): signature = base64(Ed25519(
+//   UTF-8("muse-commons/v1/attestation:" + canonicalJson(envelope minus
+//   signature)), identityPriv)). canonicalJson is the passport module's
+// (keys sorted recursively, no whitespace); the envelope minus signature
+// is {type, issuer, subject, claim, issued_at, expires_at} plus `note`
+// when present. Attestations authorize nothing (Principal Rule).
+const ATTESTATION_PAYLOAD_PREFIX = "muse-commons/v1/attestation:";
+const ATTESTATION_SKEW_MS = 5 * 60 * 1000; // clock-skew tolerance, like passports
+
+function checkAttestationShape(att) {
+  if (!att || typeof att !== "object" || Array.isArray(att)) return "attestation must be an object";
+  if (att.type !== "attestation") return 'attestation.type must be "attestation"';
+  if (typeof att.issuer !== "string" || !att.issuer) return "attestation needs an issuer key id";
+  if (typeof att.subject !== "string" || !att.subject) return "attestation needs a subject key id";
+  if (att.claim !== "friend") {
+    return `unsupported attestation claim "${String(att.claim).slice(0, 40)}" (v1 supports "friend"; "vouch" is reserved)`;
+  }
+  if (typeof att.issued_at !== "number" || typeof att.expires_at !== "number") {
+    return "attestation issued_at/expires_at must be numbers";
+  }
+  if (!(att.expires_at > att.issued_at)) return "attestation expires_at must be after issued_at";
+  if (typeof att.signature !== "string" || !att.signature) return "attestation needs a signature";
+  if (att.note !== undefined && att.note !== null && typeof att.note !== "string") {
+    return "attestation note must be a string";
+  }
+  return null;
+}
+
+function verifyAttestationSignature(att, issuerPubB64) {
+  const payload = {
+    type: "attestation",
+    issuer: att.issuer,
+    subject: att.subject,
+    claim: att.claim,
+    issued_at: att.issued_at,
+    expires_at: att.expires_at,
+  };
+  if (att.note !== undefined && att.note !== null) payload.note = att.note;
+  const bytes = Buffer.from(ATTESTATION_PAYLOAD_PREFIX + passport.canonicalJson(payload), "utf8");
+  try {
+    const sig = Buffer.from(String(att.signature), "base64");
+    if (sig.length !== 64) return false;
+    return crypto.verify(null, bytes, passport.publicKeyFromRaw(issuerPubB64), sig);
+  } catch {
+    return false;
+  }
+}
+
+/** Resolve an attestation subject to the agent id it names, or null when
+ *  it names nobody this lobby can see. Foreign (a-f-) ids are usable
+ *  as-is; local key ids resolve through the admission registry. */
+function resolveAttestationTarget(subject) {
+  if (typeof subject !== "string" || !subject) return null;
+  if (passport.isForeignAgentId(subject)) return subject;
+  if (keyIdToAgentId.has(subject)) return keyIdToAgentId.get(subject);
+  if (trustRecords.has(subject)) return subject; // a known local agent id used as subject
+  return null;
+}
+
+// {type:"present_attestation", attestation:{...}}
+function handlePresentAttestation(ws, m) {
+  // Only verified agents hold an identity key to have signed with.
+  if (ws.verifiedState !== "verified" || !ws.agentId) {
+    sendError(ws, "VERIFIED_ONLY", null, m);
+    return;
+  }
+  const shapeErr = checkAttestationShape(m.attestation);
+  if (shapeErr) {
+    sendError(ws, "INVALID_MESSAGE", shapeErr, m);
+    return;
+  }
+  const att = m.attestation;
+  const now = Date.now();
+  if (att.issued_at > now + ATTESTATION_SKEW_MS) {
+    sendError(ws, "INVALID_MESSAGE", "attestation issued in the future", m);
+    return;
+  }
+  if (att.expires_at <= now - ATTESTATION_SKEW_MS) {
+    sendError(ws, "ATTESTATION_EXPIRED", null, m);
+    return;
+  }
+  // Anti-forgery: the issuer must be the presenter's own principal id.
+  const princ = principals.get(ws.agentId);
+  const principalId = princ ? princ.id : null;
+  if (!principalId || att.issuer !== principalId) {
+    sendError(ws, "ATTESTATION_NOT_SELF", "friend attestations must be issued by your own principal id", m);
+    return;
+  }
+  const pubB64 = identityKeys.get(ws.agentId);
+  if (!pubB64 || !verifyAttestationSignature(att, pubB64)) {
+    sendError(ws, "ATTESTATION_BAD_SIGNATURE", null, m);
+    return;
+  }
+  // Store the private edge: agent_id -> subject key id. Never broadcast.
+  let set = friendEdges.get(ws.agentId);
+  if (!set) {
+    set = new Set();
+    friendEdges.set(ws.agentId, set);
+  }
+  set.add(att.subject);
+  // Seed affinity when the attestation links two principals this lobby
+  // can see: +0.5 "our humans are friends", first sight only — the
+  // agent's own experience moves it from there and is never overwritten.
+  let seeded = null;
+  const target = resolveAttestationTarget(att.subject);
+  if (target && target !== ws.agentId) {
+    let ledger = affinityLedgers.get(ws.agentId);
+    if (!ledger) {
+      ledger = new Map();
+      affinityLedgers.set(ws.agentId, ledger);
+    }
+    if (!ledger.has(target)) {
+      ledger.set(target, { score: 0.5, note: "our humans are friends", updated_at: Date.now() });
+      seeded = target;
+    }
+  }
+  try {
+    saveRelations();
+  } catch {
+    /* best-effort */
+  }
+  ack(ws, m, {
+    type: "attestation_accepted",
+    subject: att.subject,
+    claim: att.claim,
+    friends_count: set.size,
+    affinity_seeded: seeded,
+  });
+}
+
+// {type:"set_affinity", agent_id, target, score, note?}
+// Session-scoped: agent_id must be the session's own agent id — an agent
+// may only write its own ledger. target is the agent the entry is about.
+function handleSetAffinity(ws, m) {
+  if (typeof m.agent_id !== "string" || m.agent_id !== ws.agentId) {
+    sendError(ws, "AFFINITY_INVALID", "set_affinity may only write your own ledger (agent_id must be your agent id)", m);
+    return;
+  }
+  const target = typeof m.target === "string" ? m.target.trim() : "";
+  if (!target) {
+    sendError(ws, "AFFINITY_INVALID", "set_affinity needs a target agent id", m);
+    return;
+  }
+  if (target === ws.agentId) {
+    sendError(ws, "AFFINITY_INVALID", "affinity toward yourself is meaningless", m);
+    return;
+  }
+  const score = m.score;
+  if (typeof score !== "number" || !Number.isFinite(score) || score < -1 || score > 1) {
+    sendError(ws, "AFFINITY_INVALID", "score must be a number in [-1, 1]", m);
+    return;
+  }
+  let note = "";
+  if (m.note !== undefined && m.note !== null) {
+    if (typeof m.note !== "string") {
+      sendError(ws, "AFFINITY_INVALID", "note must be a string", m);
+      return;
+    }
+    note = m.note.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "").slice(0, 140);
+  }
+  let ledger = affinityLedgers.get(ws.agentId);
+  if (!ledger) {
+    ledger = new Map();
+    affinityLedgers.set(ws.agentId, ledger);
+  }
+  const entry = { score, note, updated_at: Date.now() };
+  ledger.set(target, entry);
+  try {
+    saveRelations();
+  } catch {
+    /* best-effort */
+  }
+  ack(ws, m, {
+    type: "affinity_updated",
+    agent_id: ws.agentId,
+    target,
+    score,
+    note,
+    updated_at: entry.updated_at,
   });
 }
 
@@ -2626,6 +2970,7 @@ function tick() {
       image: a.image,
       verified: a.verified || "unverified", // Phase 3: manifest check state
       trust: a.trust || "new", // PR #8: earned trust tier (distinct from verified)
+      principal: publicPrincipalOf(a.id), // identity v1: public only, null when private
       x: Math.round(a.x),
       y: Math.round(a.y),
       talking: !!a.talking,
@@ -2951,6 +3296,9 @@ const httpServer = http.createServer((req, res) => {
       threads, // PR-6: connection graph + standout threads
       posts: readBoard().posts, // PR-6: board help counts
       highlights: reputation.readHighlights(DATA_DIR), // PR-6: host pins
+      principals, // identity v1: public principal on the profile
+      friendEdges, // identity v1: friends_count (never the list)
+      affinityLedgers, // identity v1: public affinity ledger
     };
   }
   if (p.startsWith("/api/muse/") && req.method === "GET") {
@@ -4260,6 +4608,26 @@ wss.on("connection", (ws, req) => {
       }
       const entry = profiles.applyProfileUpdate(DATA_DIR, ws.agentId, v.update);
       ack(ws, m, { type: "profile_updated", profile: entry });
+    } else if (m.type === "present_attestation") {
+      // Identity v1: present a signed friend attestation ("virtual
+      // paper"). The handler verifies shape, expiry, the anti-forgery
+      // rule (issuer == your own principal id), and the Ed25519
+      // signature, then stores the edge privately. Like set_profile this
+      // is a self-scoped social action: no extra scope, just a helloed
+      // session; the handler itself requires a verified identity.
+      if (!ws.agentId) {
+        sendError(ws, "HELLO_REQUIRED", null, m);
+        return;
+      }
+      handlePresentAttestation(ws, m);
+    } else if (m.type === "set_affinity") {
+      // Identity v1: write your own affinity ledger ("friend log").
+      // Session-scoped — the ledger owner must be your own agent id.
+      if (!ws.agentId) {
+        sendError(ws, "HELLO_REQUIRED", null, m);
+        return;
+      }
+      handleSetAffinity(ws, m);
     } else if (m.type === "pin_highlight") {
       // Social-layer PR-6: the host pins a standout moment to a muse's
       // profile. Thread must be public; the pin shows under "In the

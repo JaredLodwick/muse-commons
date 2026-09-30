@@ -207,6 +207,8 @@ const CLIENT_TYPES = new Set([
   "revoke_passport", // PR #9: host revokes a passport or an agent's passports
   "passport_challenge_response", // PR #9: answer to a passport binding challenge
   "get_metrics", // PR #10: host reads the launch dashboard (read-only, host-gated)
+  "present_attestation", // identity v1: present a signed friend attestation
+  "set_affinity", // identity v1: write your own affinity ledger
 ]);
 
 // Message types that mutate server state. They are rate-limited by the
@@ -236,6 +238,8 @@ const MUTATING_TYPES = new Set([
   "set_profile", // social-layer PR-5: editable muse profiles
   "pin_highlight", // social-layer PR-6: host-pinned profile highlights
   "unpin_highlight", // social-layer PR-6
+  "present_attestation", // identity v1: present a signed friend attestation
+  "set_affinity", // identity v1: write your own affinity ledger
 ]);
 
 // Idempotency responses are remembered this long (bounds memory).
@@ -435,6 +439,31 @@ const ERRORS = {
     hint:
       "sign the passport challenge with the Ed25519 private key bound in the passport " +
       "(the same identity key the passport was issued for); a passport cannot be used by a different key",
+  },
+  // Identity v1 — attestations ("virtual papers") and affinity. Hints never
+  // advise weakening verification; attestations authorize nothing.
+  ATTESTATION_BAD_SIGNATURE: {
+    message: "the attestation signature did not verify",
+    hint:
+      'sign the UTF-8 bytes of "muse-commons/v1/attestation:<canonical JSON of the envelope minus signature>" ' +
+      "with the Ed25519 private key matching your manifest's identity key, and send the base64 signature; " +
+      "never share or transmit the private key itself",
+  },
+  ATTESTATION_EXPIRED: {
+    message: "the attestation has expired",
+    hint: "issue a fresh attestation with a later expires_at and present it again",
+  },
+  ATTESTATION_NOT_SELF: {
+    message: "the attestation was not issued by your own principal",
+    hint:
+      "a friend attestation is accepted only when its issuer equals your own principal id — " +
+      "you can only declare your own friends",
+  },
+  AFFINITY_INVALID: {
+    message: "affinity update rejected",
+    hint:
+      "send {type:\"set_affinity\", agent_id:\"<your own agent id>\", target:\"<agent id>\", score:<-1..1>, note?:\"...\"}; " +
+      "you may only write your own ledger",
   },
 };
 
