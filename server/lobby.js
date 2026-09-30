@@ -880,10 +880,12 @@ function serializeAffinity(ledger) {
 }
 
 // --- connector: room snapshots ---
-// Headless-chromium screenshot of the lobby's snapshot view
-// (/?view=snapshot&room=<id>&focus=<name>). Cached 60s per (room, focus);
-// in-flight generations are deduped so concurrent requests share one
-// chromium run. Rejects with code NO_CHROMIUM when the binary is missing.
+// Server-side SVG room portrait rasterized to PNG with @resvg/resvg-js —
+// no browser needed (headless Chrome cannot run on this droplet's tiny VM).
+// Deterministic ring layout around the focus agent; avatar portraits are
+// fetched server-side with SSRF guards and embedded as data URIs. Cached
+// 60s per (room, focus); in-flight generations are deduped. Rejects with
+// code NO_RENDERER when resvg cannot be loaded.
 const SNAPSHOT_DIR = path.join(DATA_DIR, "snapshots");
 const SNAPSHOT_TTL_MS = 60000;
 const snapshotPending = new Map(); // cacheKey -> Promise<Buffer>
@@ -891,6 +893,187 @@ const snapshotPending = new Map(); // cacheKey -> Promise<Buffer>
 function snapshotCacheKey(roomId, focus) {
   const safe = (s) => String(s).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 48);
   return safe(roomId) + "__" + safe(focus) + ".png";
+}
+
+// SSRF guard for server-side avatar fetches: never fetch loopback,
+// private, or link-local targets.
+function snapshotIpIsPrivate(ip) {
+  if (!ip || typeof ip !== "string") return true;
+  if (ip.includes(":")) {
+    const l = ip.toLowerCase();
+    return l === "::1" || l === "::" || l.startsWith("fe80:") || l.startsWith("fc") || l.startsWith("fd");
+  }
+  const p = ip.split(".").map(Number);
+  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+  return (
+    p[0] === 0 || p[0] === 10 || p[0] === 127 ||
+    (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
+    (p[0] === 192 && p[1] === 168) ||
+    (p[0] === 169 && p[1] === 254)
+  );
+}
+
+const AVATAR_TTL_MS = 10 * 60 * 1000;
+const AVATAR_MAX_BYTES = 2 * 1024 * 1024;
+const avatarDataCache = new Map(); // avatarUrl -> { dataUri|null, expires }
+
+let sharpMod = null; // lazy; webp avatars are converted to PNG for resvg
+function snapshotSharp() {
+  if (sharpMod === null) {
+    try {
+      sharpMod = require("sharp");
+    } catch {
+      sharpMod = false;
+    }
+  }
+  return sharpMod || null;
+}
+
+async function snapshotAvatarDataUri(rawUrl) {
+  const now = Date.now();
+  const hit = avatarDataCache.get(rawUrl);
+  if (hit && hit.expires > now) return hit.dataUri;
+  let dataUri = null;
+  try {
+    const u = new URL(String(rawUrl));
+    if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("bad scheme");
+    const addrs = await dns.lookup(u.hostname, { all: true });
+    if (!addrs.length || addrs.some((a) => snapshotIpIsPrivate(a.address))) throw new Error("private host");
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
+    try {
+      // Manual redirect handling: a redirect target is never fetched here.
+      const r = await fetch(u.toString(), { signal: ctl.signal, redirect: "manual" });
+      const ct = (r.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+      if (!r.ok || (r.status >= 300 && r.status < 400) || !ct.startsWith("image/")) throw new Error("bad response");
+      let buf = Buffer.from(await r.arrayBuffer());
+      if (!buf.length || buf.length > AVATAR_MAX_BYTES) throw new Error("bad size");
+      let outCt = ct;
+      // resvg decodes PNG/JPEG/GIF only — convert webp server-side.
+      if (ct === "image/webp") {
+        const sharp = snapshotSharp();
+        if (!sharp) throw new Error("no webp decoder");
+        buf = await sharp(buf).resize(256, 256, { fit: "cover" }).png().toBuffer();
+        outCt = "image/png";
+      } else if (ct !== "image/png" && ct !== "image/jpeg" && ct !== "image/gif") {
+        throw new Error("undecodable image");
+      }
+      dataUri = "data:" + outCt + ";base64," + buf.toString("base64");
+    } finally {
+      clearTimeout(t);
+    }
+  } catch {
+    dataUri = null;
+  }
+  avatarDataCache.set(rawUrl, { dataUri, expires: now + AVATAR_TTL_MS });
+  if (avatarDataCache.size > 200) avatarDataCache.delete(avatarDataCache.keys().next().value);
+  return dataUri;
+}
+
+function escXml(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// Deterministic portrait: focus agent centered and larger, everyone else
+// on a ring around them — the same composition as the frontend snapshot
+// view, drawn in the Warm Editorial light palette.
+async function buildSnapshotSvg(room, focusName) {
+  const W = 1280, H = 800;
+  const cx = W / 2, cy = H / 2 - 20;
+  const present = [...room.agents.values()].filter((a) => a && a.name);
+  const fl = (focusName || "").toLowerCase();
+  let fi = present.findIndex((a) => String(a.name).toLowerCase() === fl);
+  if (fi < 0) fi = 0;
+  const others = present.filter((_, i) => i !== fi);
+  const focus = present[fi] || null;
+
+  // Fetch avatar portraits in parallel (cached, SSRF-guarded).
+  const portraits = new Map();
+  await Promise.all(present.map(async (a) => {
+    const url = a.image || a.avatarUrl || null;
+    portraits.set(a.id, url ? await snapshotAvatarDataUri(url) : null);
+  }));
+
+  const parts = [];
+  const defs = [];
+  parts.push(`<rect width="${W}" height="${H}" fill="#E9DCC4"/>`);
+  // Floor planks.
+  for (let y = 40; y < H; y += 64) {
+    parts.push(`<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="rgba(120,90,60,.16)" stroke-width="2"/>`);
+  }
+  // Center rug.
+  parts.push(`<ellipse cx="${cx}" cy="${cy}" rx="430" ry="265" fill="#C99A7A"/>`);
+  parts.push(`<ellipse cx="${cx}" cy="${cy}" rx="400" ry="240" fill="none" stroke="#8A5A34" stroke-width="6" opacity=".55"/>`);
+  parts.push(`<ellipse cx="${cx}" cy="${cy}" rx="330" ry="196" fill="none" stroke="rgba(138,90,52,.45)" stroke-width="3" stroke-dasharray="14 10"/>`);
+
+  const drawAgent = (a, x, y, r, isFocus) => {    const clipId = "clip-" + String(a.id).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 32);
+    const d = r * 2;
+    defs.push(`<clipPath id="${clipId}"><circle cx="${x}" cy="${y}" r="${r}"/></clipPath>`);
+    // Soft shadow.
+    parts.push(`<ellipse cx="${x}" cy="${y + r + 10}" rx="${r * 0.9}" ry="14" fill="rgba(43,33,24,.25)"/>`);
+    const uri = portraits.get(a.id);
+    if (uri) {
+      parts.push(`<image href="${uri}" x="${x - r}" y="${y - r}" width="${d}" height="${d}" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clipId})"/>`);
+    } else {
+      const color = /^#[0-9a-fA-F]{6}$/.test(a.color || "") ? a.color : "#8A6B4F";
+      parts.push(`<circle cx="${x}" cy="${y}" r="${r}" fill="${color}" clip-path="url(#${clipId})"/>`);
+      // Initial letter (emoji rendering is font-dependent; the initial
+      // always renders cleanly).
+      const glyph = escXml(String(a.name).trim().slice(0, 1).toUpperCase() || "?");
+      parts.push(`<text x="${x}" y="${y + r * 0.36}" font-family="DejaVu Sans, sans-serif" font-size="${Math.round(r * 0.9)}" text-anchor="middle" fill="#FFF8EC">${glyph}</text>`);
+    }
+    // Verified ring.
+    const ring = a.verified === "verified" || a.verifiedState === "verified" ? "#8A5A34" : "rgba(43,33,24,.30)";
+    parts.push(`<circle cx="${x}" cy="${y}" r="${r}" fill="none" stroke="${ring}" stroke-width="${isFocus ? 7 : 5}"/>`);
+    // Name pill: above the avatar for ring agents in the top half (so the
+    // pill never collides with the focus agent), below otherwise.
+    const label = escXml(a.name);
+    const fs = isFocus ? 30 : 24;
+    const pillW = Math.min(340, label.length * fs * 0.62 + 44);
+    const pillH = fs + 22;
+    const above = !isFocus && y < cy;
+    const py = above ? y - r - 16 - pillH : y + r + 16;
+    parts.push(`<rect x="${x - pillW / 2}" y="${py}" width="${pillW}" height="${pillH}" rx="${pillH / 2}" fill="rgba(20,14,10,.82)"/>`);
+    parts.push(`<text x="${x}" y="${py + pillH / 2 + fs * 0.36}" font-family="DejaVu Sans, sans-serif" font-size="${fs}" font-weight="bold" text-anchor="middle" fill="#FFF6E8">${label}</text>`);
+  };
+
+  // Ring around the focus agent.
+  const R = 300;
+  others.forEach((a, i) => {
+    const ang = (i / Math.max(1, others.length)) * Math.PI * 2 - Math.PI / 2;
+    drawAgent(a, cx + Math.cos(ang) * R, cy + Math.sin(ang) * R * 0.62, 62, false);
+  });
+  if (focus) drawAgent(focus, cx, cy, 95, true);
+
+  // Header pill: room topic.
+  const topic = escXml(room.topic || room.id || "plaza");
+  const header = "Muse Commons — " + topic;
+  parts.push(`<rect x="36" y="30" width="${Math.min(760, header.length * 17 + 56)}" height="52" rx="26" fill="rgba(20,14,10,.82)"/>`);
+  parts.push(`<text x="60" y="64" font-family="DejaVu Sans, sans-serif" font-size="26" font-weight="bold" fill="#FFF6E8">${escXml(header)}</text>`);
+  // Vignette.
+  parts.push(`<radialGradient id="vig" cx="50%" cy="46%" r="75%"><stop offset="62%" stop-color="rgba(43,33,24,0)"/><stop offset="100%" stop-color="rgba(43,33,24,.20)"/></radialGradient>`);
+  parts.push(`<rect width="${W}" height="${H}" fill="url(#vig)"/>`);
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><defs>${defs.join("")}</defs>${parts.join("")}</svg>`;
+}
+
+let resvgCtor = null;
+function snapshotResvg() {
+  if (resvgCtor === null) {
+    try {
+      resvgCtor = require("@resvg/resvg-js").Resvg;
+    } catch {
+      resvgCtor = false;
+    }
+  }
+  if (!resvgCtor) {
+    const e = new Error("snapshots unavailable");
+    e.code = "NO_RENDERER";
+    throw e;
+  }
+  return resvgCtor;
 }
 
 function renderRoomSnapshot(roomId, focus) {
@@ -904,39 +1087,25 @@ function renderRoomSnapshot(roomId, focus) {
   }
   if (snapshotPending.has(key)) return snapshotPending.get(key);
   const job = (async () => {
-    const bin = process.env.CHROMIUM_BIN || "/opt/chrome-linux/chrome";
+    const room = rooms.get(roomId);
+    if (!room || room.visibility !== "public") {
+      const e = new Error("no such public room");
+      e.code = "NO_ROOM";
+      throw e;
+    }
+    const Resvg = snapshotResvg();
+    const svg = await buildSnapshotSvg(room, focus);
+    let png;
     try {
-      fs.accessSync(bin, fs.constants.X_OK);
+      png = new Resvg(svg, { fitTo: { mode: "width", value: 1280 } }).render().asPng();
     } catch {
-      const e = new Error("snapshots unavailable");
-      e.code = "NO_CHROMIUM";
+      const e = new Error("snapshot failed");
+      e.code = "RENDER_FAILED";
       throw e;
     }
     fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
-    const tmp = file + ".tmp-" + process.pid;
-    const url =
-      "http://127.0.0.1:" + PORT + "/?view=snapshot&room=" + encodeURIComponent(roomId) +
-      "&focus=" + encodeURIComponent(focus);
-    // execFile with an argument array: the URL is never interpolated
-    // into a shell string.
-    const args = [
-      "--headless",
-      "--disable-gpu",
-      "--no-sandbox",
-      "--hide-scrollbars",
-      "--window-size=1280,800",
-      "--screenshot=" + tmp,
-      "--timeout=20000",
-      url,
-    ];
-    await new Promise((resolve, reject) => {
-      execFile(bin, args, { timeout: 30000 }, (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-    fs.renameSync(tmp, file);
-    return fs.readFileSync(file);
+    fs.writeFileSync(file, png);
+    return png;
   })();
   snapshotPending.set(key, job);
   return job.finally(() => {
@@ -3328,9 +3497,9 @@ const httpServer = http.createServer((req, res) => {
   }
   // --- connector: room snapshot (PNG) ---
   // GET /api/rooms/<room_id>/snapshot.png?focus=<agent_name>
-  // Headless-chromium screenshot of the room's snapshot view, focus agent
-  // centered. Public rooms only. Cached 60s per (room, focus); in-flight
-  // generations are deduped. 503 when chromium is unavailable.
+  // Server-side SVG portrait rasterized with resvg (no browser needed),
+  // focus agent centered. Public rooms only. Cached 60s per (room, focus);
+  // in-flight generations are deduped. 503 when the renderer is unavailable.
   {
     const m = p.match(/^\/api\/rooms\/([^/]+)\/snapshot\.png$/);
     if (m && req.method === "GET") {
@@ -3370,7 +3539,7 @@ const httpServer = http.createServer((req, res) => {
           res.end(png);
         })
         .catch((e) => {
-          if (e && e.code === "NO_CHROMIUM") {
+          if (e && e.code === "NO_RENDERER") {
             res.writeHead(503, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "snapshots unavailable" }));
             return;

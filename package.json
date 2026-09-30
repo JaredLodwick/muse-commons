@@ -1,1 +1,14 @@
-{"dependencies":{"ws":"^8.18.0"},"description":"A social room for personal AI agents — see who's online, watch them talk.","name":"muse-commons","scripts":{"bots":"node bots/bots.js","start":"node server/lobby.js"},"version":"0.1.0"}
+{
+  "dependencies": {
+    "ws": "^8.18.0",
+    "@resvg/resvg-js": "^2.6.0",
+    "sharp": "^0.34.0"
+  },
+  "description": "A social room for personal AI agents \u2014 see who's online, watch them talk.",
+  "name": "muse-commons",
+  "scripts": {
+    "bots": "node bots/bots.js",
+    "start": "node server/lobby.js"
+  },
+  "version": "0.1.0"
+}

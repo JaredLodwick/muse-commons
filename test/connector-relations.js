@@ -9,15 +9,15 @@
 //   - friends: 403 without token, 403 with wrong/other-agent token,
 //     200 with the correct token (header and query param), correct list shape.
 //   - owner_token delivered on verified hello, stable across re-hellos.
-//   - snapshot: 503 when chromium is missing, 404 for private/nonexistent
-//     rooms, 400 for malicious focus, PNG + 60s caching with a stub binary.
+//   - snapshot: 200 with a real 1280x800 PNG, 404 for private/nonexistent
+//     rooms, 400 for malicious focus, 60s disk caching, and the SSRF guard
+//     refusing loopback avatar URLs.
 "use strict";
 const assert = require("assert");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
-const os = require("os");
 const path = require("path");
 const WebSocket = require("ws");
 const passport = require("../server/passport");
@@ -67,8 +67,19 @@ const fixture = http.createServer((req, res) => {
     return res.end(JSON.stringify(manifestFor(ID_B, "Bravo", { name: "Bravo Principal", visibility: "private" },
       `http://127.0.0.1:${FIXTURE_PORT}/bravo/avatar.png`)));
   }
+  // Bravo's manifest avatar_url points here (loopback): the snapshot
+  // renderer's SSRF guard must refuse it, so this counter must stay 0.
+  if (req.url === "/bravo/avatar.png") {
+    avatarHits.count++;
+    res.writeHead(200, { "Content-Type": "image/png" });
+    return res.end(ONE_PIXEL_PNG);
+  }
   res.writeHead(404); res.end();
 });
+const avatarHits = { count: 0 };
+// 1x1 transparent PNG.
+const ONE_PIXEL_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
 
 const ATTESTATION_PREFIX = "muse-commons/v1/attestation:";
 function signAttestation(priv, fields) {
@@ -333,65 +344,60 @@ async function run(agents, track, setLobby, setLobby2) {
   r = await get("/api/muse/Nobody/conversations");
   check("conversations for unknown muse -> 404", r.status === 404, r.status);
 
-  // --- snapshot ---
+  // --- snapshot (server-side SVG render, no browser) ---
   console.log("snapshot");
-  // Clear any cached renders from earlier runs: the 503 check below must
-  // exercise the no-chromium path, not serve a stale cached PNG.
-  try { fs.rmSync(path.join(__dirname, "..", "data", "snapshots"), { recursive: true, force: true }); } catch {}
+  // Re-hello both agents: the test client sends no heartbeats, so the
+  // lobby may have expired their presence during the earlier sections.
+  // The snapshot must render with Alfa and Bravo actually in the plaza.
+  r = await A.hello();
+  check("Alfa re-hello for snapshot", r.type === "hello_ok", r.type);
+  r = await B.hello();
+  check("Bravo re-hello for snapshot", r.type === "hello_ok", r.type);
+  r = await get("/api/places");
+  const plaza = JSON.parse(r.body.toString()).rooms.find((x) => x.room_id === "plaza");
+  check("Alfa and Bravo are plaza occupants for the snapshot",
+    plaza && plaza.occupants.includes("Alfa") && plaza.occupants.includes("Bravo"),
+    JSON.stringify(plaza && plaza.occupants));
+  // Clear any cached renders from earlier runs so the checks below
+  // exercise the live renderer, not a stale cached PNG.
+  const snapDir = path.join(__dirname, "..", "data", "snapshots");
+  try { fs.rmSync(snapDir, { recursive: true, force: true }); } catch {}
+  const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   r = await get(`/api/rooms/plaza/snapshot.png?focus=Alfa`);
-  check("snapshot 503 without chromium", r.status === 503 && JSON.parse(r.body.toString()).error === "snapshots unavailable", r.status);
-  // with CHROMIUM_BIN=/nonexistent the env default is irrelevant; also check 404s
+  check("snapshot 200", r.status === 200, r.status);
+  check("snapshot is image/png", r.headers["content-type"] === "image/png", r.headers["content-type"]);
+  check("snapshot body starts with PNG signature", r.body.slice(0, 8).equals(PNG_SIG));
+  check("snapshot is 1280x800",
+    r.body.readUInt32BE(16) === 1280 && r.body.readUInt32BE(20) === 800,
+    r.body.readUInt32BE(16) + "x" + r.body.readUInt32BE(20));
+  check("snapshot cache-control 60s", /max-age=60/.test(r.headers["cache-control"] || ""), r.headers["cache-control"]);
+  // Bravo's manifest avatar_url points at the loopback fixture server: the
+  // SSRF guard must refuse it, so the fixture sees zero avatar hits even
+  // though Bravo is in the room.
+  check("loopback avatar URL never fetched (SSRF guard)", avatarHits.count === 0, "hits=" + avatarHits.count);
+  const first = r.body;
+  const cacheFiles = fs.readdirSync(snapDir);
+  check("snapshot cached to disk", cacheFiles.length === 1, cacheFiles.join(","));
+  const cacheFile = path.join(snapDir, cacheFiles[0]);
+  const mtime1 = fs.statSync(cacheFile).mtimeMs;
+  await new Promise((r2) => setTimeout(r2, 60));
+  const t0 = Date.now();
+  r = await get(`/api/rooms/plaza/snapshot.png?focus=Alfa`);
+  const dt = Date.now() - t0;
+  check("cached snapshot identical bytes", r.status === 200 && r.body.equals(first), r.status);
+  check("second request served from cache (no re-render)", fs.statSync(cacheFile).mtimeMs === mtime1);
+  console.log(`(cached snapshot served in ${dt}ms)`);
+  // a different focus renders fresh
+  r = await get(`/api/rooms/plaza/snapshot.png?focus=Bravo`);
+  check("different focus renders separately", r.status === 200 && !r.body.equals(first), r.status);
+  check("loopback avatar still never fetched", avatarHits.count === 0, "hits=" + avatarHits.count);
+  // error paths
   r = await get(`/api/rooms/${encodeURIComponent(privId)}/snapshot.png?focus=Alfa`);
   check("snapshot 404 for private room", r.status === 404, r.status);
   r = await get(`/api/rooms/nonexistent-room-${RUN}/snapshot.png?focus=Alfa`);
   check("snapshot 404 for nonexistent room", r.status === 404, r.status);
   r = await get(`/api/rooms/plaza/snapshot.png?focus=../../etc/passwd`);
   check("snapshot 400 for malicious focus", r.status === 400, r.status);
-
-  // --- snapshot with a stub chromium binary: PNG + 60s caching ---
-  console.log("snapshot render + cache");
-  A.close(); B.close();
-  lobby.kill();
-  setLobby(null);
-  await new Promise((r) => { const t = setTimeout(r, 3000); lobby.on("exit", () => { clearTimeout(t); r(); }); });
-  const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "chromium-stub-"));
-  const countFile = path.join(stubDir, "renders.count");
-  const stub = path.join(stubDir, "chromium");
-  // Fake chromium: writes a counter-tagged PNG to --screenshot=<path>.
-  fs.writeFileSync(stub, `#!/usr/bin/env node
-const fs = require("fs");
-const out = process.argv.find((a) => a.startsWith("--screenshot="));
-if (!out) process.exit(1);
-let n = 1;
-try { n = parseInt(fs.readFileSync(${JSON.stringify(countFile)}, "utf8"), 10) + 1; } catch { /* first render */ }
-fs.writeFileSync(${JSON.stringify(countFile)}, String(n));
-fs.writeFileSync(out.slice("--screenshot=".length),
-  Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.from("stub-render-" + n)]));
-`);
-  fs.chmodSync(stub, 0o755);
-  const lobby2 = startLobby({ CHROMIUM_BIN: stub });
-  setLobby2(lobby2);
-  await waitForListening(lobby2);
-
-  const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-  r = await get(`/api/rooms/plaza/snapshot.png?focus=Alfa`);
-  check("snapshot 200 with stub chromium", r.status === 200, r.status);
-  check("snapshot is image/png", r.headers["content-type"] === "image/png", r.headers["content-type"]);
-  check("snapshot body starts with PNG signature", r.body.slice(0, 8).equals(PNG_SIG));
-  check("snapshot cache-control 60s", /max-age=60/.test(r.headers["cache-control"] || ""), r.headers["cache-control"]);
-  check("snapshot body rendered once", r.body.toString() === "stub-render-1" || r.body.includes("stub-render-1"));
-  const first = r.body.toString();
-  const t0 = Date.now();
-  r = await get(`/api/rooms/plaza/snapshot.png?focus=Alfa`);
-  const dt = Date.now() - t0;
-  check("cached snapshot identical bytes", r.status === 200 && r.body.toString() === first, r.status);
-  const renders = parseInt(fs.readFileSync(countFile, "utf8"), 10);
-  check("second request served from cache (no re-render)", renders === 1, "renders=" + renders);
-  console.log(`(cached snapshot served in ${dt}ms)`);
-  // a different focus renders fresh
-  r = await get(`/api/rooms/plaza/snapshot.png?focus=Bravo`);
-  check("different focus renders separately", r.status === 200 && r.body.toString() !== first, r.status);
-  check("second render counted", parseInt(fs.readFileSync(countFile, "utf8"), 10) === 2);
 }
 
 main().then(
