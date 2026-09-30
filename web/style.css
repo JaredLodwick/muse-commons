@@ -97,7 +97,7 @@ button.mini.go{background:var(--accent); border-color:var(--accent); color:var(-
 #room.dragging{cursor:grabbing}
 /* room-name tag hanging top-center inside the room view */
 #room-tag{
-  position:absolute; top:0; left:50%; transform:translateX(-50%); z-index:6;
+  position:absolute; top:0; left:12px; z-index:6;
   pointer-events:none; background:var(--card); border:1px solid var(--line); border-top:0;
   border-radius:0 0 14px 14px; padding:9px 26px 11px;
   font-family:var(--serif); font-size:18px; color:var(--ink);

@@ -226,50 +226,64 @@ function renderSideIfChanged() {
   renderSide();
 }
 
-// --- camera: world (1000x620) -> screen ---
+// --- camera: world (floor) + wall bands -> screen ---
 // The room is drawn in world coordinates; the camera maps it onto the
 // canvas, which always fills its container (backing store synced via
-// ResizeObserver, DPR-aware). Auto-fit frames all agents on load/switch.
+// ResizeObserver, DPR-aware).
+//
+// The room reads as a recessed cutout seen straight from above: the floor
+// is the WORLD rect and a wall band (WALL_T) runs around all four sides.
+// OUTER is the whole cutout including walls. "Fit" zooms so the cutout
+// exactly fills the view, so the window perimeter becomes the top edge of
+// the walls. Zooming in and dragging still work; zooming out stops at fit,
+// so at 100% the room always sits aligned with the walls.
+//
+// Room size: to grow the room (Habbo-style large common spaces) change
+// WORLD here AND the matching ROOM constant in server/lobby.js (agent
+// movement bounds) so front and back stay in sync; everything derived
+// from the constant follows.
 const WORLD = { w: 1000, h: 620 };
-const ZMIN = 0.25, ZMAX = 3;
+const WALL_T = 56; // wall band thickness on all four sides
+const OUTER = { x: -WALL_T, y: -WALL_T, w: WORLD.w + 2 * WALL_T, h: WORLD.h + 2 * WALL_T };
+const ZMAX = 3;
+const ZMIN_ABS = 0.2; // absolute floor; the live minimum is the fit zoom
 const cam = { x: WORLD.w / 2, y: WORLD.h / 2, zoom: 1 };
 let needFit = true;
 let dpr = 1, viewW = 1, viewH = 1;
 
+// Zoom that fits the whole cutout (floor + walls) into the view.
+function fitZoom() {
+  return Math.min(viewW / OUTER.w, viewH / OUTER.h);
+}
+// Minimum live zoom: never zoom out past the fit.
+function zMin() {
+  return Math.min(ZMAX, Math.max(ZMIN_ABS, fitZoom()));
+}
+
 function clampCam() {
-  cam.zoom = Math.min(ZMAX, Math.max(ZMIN, cam.zoom));
-  // Keep the room from getting lost: the view must always overlap the
-  // world (expanded by a margin) by at least `ov` world px per axis.
-  // When zoomed out past the world, just center on it.
-  const m = 240, ov = 320;
+  cam.zoom = Math.min(ZMAX, Math.max(zMin(), cam.zoom));
+  const cx = WORLD.w / 2, cy = WORLD.h / 2;
+  // At fit the cutout sits exactly aligned with the view: lock centered.
+  if (cam.zoom <= zMin() * 1.001) {
+    cam.x = cx; cam.y = cy;
+    return;
+  }
+  // Zoomed in: panning is free, but the view must always overlap the
+  // cutout (expanded by a margin) by at least `ov` world px per axis so
+  // the room can't get lost.
+  const m = 120, ov = 200;
   const hw = viewW / 2 / cam.zoom, hh = viewH / 2 / cam.zoom;
-  let lo = -m - hw + Math.min(ov, 2 * hw), hi = WORLD.w + m + hw - Math.min(ov, 2 * hw);
-  cam.x = lo > hi ? WORLD.w / 2 : Math.min(hi, Math.max(lo, cam.x));
-  lo = -m - hh + Math.min(ov, 2 * hh); hi = WORLD.h + m + hh - Math.min(ov, 2 * hh);
-  cam.y = lo > hi ? WORLD.h / 2 : Math.min(hi, Math.max(lo, cam.y));
+  let lo = OUTER.x - m - hw + Math.min(ov, 2 * hw), hi = OUTER.x + OUTER.w + m + hw - Math.min(ov, 2 * hw);
+  cam.x = lo > hi ? cx : Math.min(hi, Math.max(lo, cam.x));
+  lo = OUTER.y - m - hh + Math.min(ov, 2 * hh); hi = OUTER.y + OUTER.h + m + hh - Math.min(ov, 2 * hh);
+  cam.y = lo > hi ? cy : Math.min(hi, Math.max(lo, cam.y));
 }
 
 function fitView() {
-  // Frame all agents (padded); empty rooms frame the whole world.
-  let x0 = 0, y0 = 0, x1 = WORLD.w, y1 = WORLD.h;
-  if (agents.length) {
-    x0 = 1e9; y0 = 1e9; x1 = -1e9; y1 = -1e9;
-    for (const a of agents) {
-      x0 = Math.min(x0, a.x); y0 = Math.min(y0, a.y);
-      x1 = Math.max(x1, a.x); y1 = Math.max(y1, a.y);
-    }
-    const pad = 120;
-    x0 -= pad; y0 -= pad; x1 += pad; y1 += pad;
-  }
-  const zw = viewW / Math.max(1, x1 - x0), zh = viewH / Math.max(1, y1 - y0);
-  cam.zoom = Math.min(ZMAX, Math.max(ZMIN, Math.min(zw, zh)));
-  // Never zoom out past showing the whole room for agent fits.
-  if (agents.length) {
-    const worldZoom = Math.min(viewW / WORLD.w, viewH / WORLD.h);
-    cam.zoom = Math.max(cam.zoom, Math.min(worldZoom, ZMAX));
-  }
-  cam.x = (x0 + x1) / 2;
-  cam.y = (y0 + y1) / 2;
+  // 100% fit: the whole cutout aligned to the view.
+  cam.zoom = zMin();
+  cam.x = WORLD.w / 2;
+  cam.y = WORLD.h / 2;
   clampCam();
 }
 
@@ -303,7 +317,7 @@ canvas.addEventListener("wheel", (e) => {
   const mx = e.clientX - r.left, my = e.clientY - r.top;
   const wx = cam.x + (mx - viewW / 2) / cam.zoom;
   const wy = cam.y + (my - viewH / 2) / cam.zoom;
-  const nz = Math.min(ZMAX, Math.max(ZMIN, cam.zoom * Math.exp(-e.deltaY * 0.0015)));
+  const nz = Math.min(ZMAX, Math.max(zMin(), cam.zoom * Math.exp(-e.deltaY * 0.0015)));
   cam.x = wx - (mx - viewW / 2) / nz;
   cam.y = wy - (my - viewH / 2) / nz;
   cam.zoom = nz;
@@ -341,7 +355,7 @@ canvas.addEventListener("pointerup", endDrag);
 canvas.addEventListener("pointercancel", endDrag);
 
 const zoomIn = () => { cam.zoom = Math.min(ZMAX, cam.zoom * 1.25); clampCam(); };
-const zoomOut = () => { cam.zoom = Math.max(ZMIN, cam.zoom / 1.25); clampCam(); };
+const zoomOut = () => { cam.zoom = Math.max(zMin(), cam.zoom / 1.25); clampCam(); };
 document.getElementById("zin").onclick = zoomIn;
 document.getElementById("zout").onclick = zoomOut;
 document.getElementById("zfit").onclick = () => fitView();
@@ -1011,35 +1025,122 @@ function hexA(hex, a) {
 // ---------- static room ----------
 // Rendered once to an offscreen canvas (2x) so each frame costs one
 // drawImage. Only lamp flicker and dust motes are drawn live.
+// Near-top-down cutout: the wooden floor fills the WORLD rect and a wall
+// band (WALL_T) runs around all four sides, so at fit zoom the window
+// perimeter reads as the top edge of the walls. Agents walk on the floor,
+// never on walls. Furniture is drawn from above.
 const roomStatic = document.createElement("canvas");
-roomStatic.width = WORLD.w * 2;
-roomStatic.height = WORLD.h * 2;
-// Near-top-down lounge: the wooden floor fills the world and the wall is
-// only a thin strip along the top edge, so agents always read as walking
-// on the floor, never on walls. Furniture is drawn from above.
+roomStatic.width = OUTER.w * 2;
+roomStatic.height = OUTER.h * 2;
 const LAMPS = [230, 770];
 const POOL_Y = 300;
-const WALL_H = 64;
 
-function pictureFrame(c, x, y, w, h, seed, P) {
-  c.fillStyle = P.frame;
-  c.fillRect(x - 8, y - 8, w + 16, h + 16);
-  c.fillStyle = P.frameHi;
-  c.fillRect(x - 8, y - 8, w + 16, 3);
-  c.fillStyle = P.artBg;
+// A little landscape seen through a window: seeded sky, sun and hills.
+// Drawn into rect (x, y, w, h); deliberately simple, it's a backdrop.
+function drawView(c, x, y, w, h, seed, P) {
+  const g = c.createLinearGradient(0, y, 0, y + h);
+  g.addColorStop(0, P.sky1);
+  g.addColorStop(0.65, P.sky2);
+  g.addColorStop(1, P.sky3);
+  c.fillStyle = g;
   c.fillRect(x, y, w, h);
-  const cols = ["#7a5a8a", "#4a7a8a", "#8a6a4a", "#5a8a6a"];
-  for (let i = 0; i < 3; i++) {
-    const ax = x + prand(seed + i * 3) * w;
-    const ay = y + prand(seed + i * 3 + 1) * h;
-    const ar = 14 + prand(seed + i * 3 + 2) * 26;
-    const col = cols[Math.floor(prand(seed + i * 1.3) * cols.length)];
-    const ag = c.createRadialGradient(ax, ay, 0, ax, ay, ar);
-    ag.addColorStop(0, col + "b0");
-    ag.addColorStop(1, col + "00");
-    c.fillStyle = ag;
-    c.beginPath(); c.arc(ax, ay, ar, 0, 6.2832); c.fill();
-  }
+  // sun
+  const sx = x + w * (0.28 + prand(seed * 1.31) * 0.44);
+  const sy = y + h * 0.34;
+  c.fillStyle = P.sun;
+  c.beginPath(); c.arc(sx, sy, Math.min(w, h) * 0.17, 0, 6.2832); c.fill();
+  // hills
+  c.fillStyle = P.hill1;
+  c.beginPath();
+  c.ellipse(x + w * 0.30, y + h * 1.02, w * 0.42, h * 0.52, 0, 0, 6.2832);
+  c.fill();
+  c.fillStyle = P.hill2;
+  c.beginPath();
+  c.ellipse(x + w * 0.78, y + h * 1.06, w * 0.48, h * 0.58, 0, 0, 6.2832);
+  c.fill();
+  // muntin cross
+  c.strokeStyle = P.frame;
+  c.lineWidth = 3;
+  c.beginPath();
+  c.moveTo(x + w / 2, y); c.lineTo(x + w / 2, y + h);
+  c.moveTo(x, y + h / 2); c.lineTo(x + w, y + h / 2);
+  c.stroke();
+  // glass sheen
+  c.fillStyle = "rgba(255,255,255,.13)";
+  c.beginPath();
+  c.moveTo(x, y + h);
+  c.lineTo(x + w * 0.42, y);
+  c.lineTo(x + w * 0.66, y);
+  c.lineTo(x + w * 0.24, y + h);
+  c.closePath();
+  c.fill();
+}
+
+// A window set into a horizontal wall band: frame, a little seeded view,
+// and a sill on the floor side. yInner is the wall's inner (floor-side)
+// edge; floorBelow picks the top wall (floor below) vs the bottom wall.
+function hWindow(c, cx, yInner, w, seed, P, floorBelow) {
+  const x0 = cx - w / 2;
+  const y0 = floorBelow ? yInner - WALL_T + 6 : yInner + 6;
+  const h = WALL_T - 12;
+  c.fillStyle = P.frame;
+  c.fillRect(x0 - 5, y0 - 5, w + 10, h + 10);
+  drawView(c, x0, y0, w, h, seed, P);
+  const sy = floorBelow ? y0 + h : y0 - 7;
+  c.fillStyle = P.rail;
+  c.fillRect(x0 - 5, sy, w + 10, 7);
+  c.fillStyle = P.railHi;
+  c.fillRect(x0 - 5, sy, w + 10, 2);
+}
+
+// A window set into a vertical wall band. xInner is the wall's inner edge;
+// floorRight picks the left wall (floor to the right) vs the right wall.
+function vWindow(c, cy, xInner, h, seed, P, floorRight) {
+  const y0 = cy - h / 2;
+  const x0 = floorRight ? xInner - WALL_T + 6 : xInner + 6;
+  const w = WALL_T - 12;
+  c.fillStyle = P.frame;
+  c.fillRect(x0 - 5, y0 - 5, w + 10, h + 10);
+  drawView(c, x0, y0, w, h, seed, P);
+  const sx = floorRight ? x0 + w : x0 - 7;
+  c.fillStyle = P.rail;
+  c.fillRect(sx, y0 - 5, 7, h + 10);
+  c.fillStyle = P.railHi;
+  c.fillRect(sx, y0 - 5, 2, h + 10);
+}
+
+// A decorative door drawn plan-style in a horizontal wall band: an opening
+// with a swung leaf and a dashed swing arc. Not a room link (those are the
+// labeled doors in the top wall). intoRoom -1 swings toward -y (bottom
+// wall, room above), +1 toward +y.
+function planDoor(c, cx, yInner, w, P, intoRoom) {
+  const x0 = cx - w / 2;
+  c.fillStyle = P.doorGap;
+  c.fillRect(x0, yInner, w, WALL_T);
+  c.fillStyle = P.frame;
+  c.fillRect(x0 - 5, yInner, 5, WALL_T);
+  c.fillRect(x0 + w, yInner, 5, WALL_T);
+  const hx = x0 + 5, hy = yInner + (intoRoom < 0 ? 5 : WALL_T - 5);
+  const leafLen = w - 10;
+  // swing arc, from the closed position (across the opening) to open
+  c.strokeStyle = P.doorSwing;
+  c.lineWidth = 1.5;
+  c.setLineDash([5, 4]);
+  c.beginPath();
+  if (intoRoom < 0) c.arc(hx, hy, leafLen, -Math.PI / 2, 0);
+  else c.arc(hx, hy, leafLen, 0, Math.PI / 2);
+  c.stroke();
+  c.setLineDash([]);
+  // the leaf, swung open into the room
+  const openAng = intoRoom < 0 ? -Math.PI * 0.32 : Math.PI * 0.32;
+  c.strokeStyle = P.wood1;
+  c.lineWidth = 6;
+  c.lineCap = "round";
+  c.beginPath();
+  c.moveTo(hx, hy);
+  c.lineTo(hx + Math.cos(openAng) * leafLen, hy + Math.sin(openAng) * leafLen);
+  c.stroke();
+  c.lineCap = "butt";
 }
 
 function plantTop(c, x, y, P) {
@@ -1090,6 +1191,10 @@ function canvasPal() {
     ok: "#34d399", ring: "rgba(240,244,255,.85)", shadow: "rgba(0,0,0,.38)",
     vig0: "rgba(4,3,7,0)", vig1: "rgba(4,3,7,.48)",
     doorFrame: "#6b4a2c", doorIn: "#241a10", doorLabel: "#f2e8d6", doorEdge: "rgba(242,232,214,.22)",
+    wallCut: "#100c18",
+    sky1: "#1d2942", sky2: "#2e3d5c", sky3: "#54435a",
+    sun: "#e8a83d", hill1: "#2c4a38", hill2: "#223a2d",
+    doorGap: "#221a12", doorSwing: "rgba(255,225,180,.35)",
   };
   return {
     screen: "#E9DCC4", bounds: "rgba(43,33,24,.14)",
@@ -1112,18 +1217,47 @@ function canvasPal() {
     ok: "#5C7A4E", ring: "rgba(43,33,24,.7)", shadow: "rgba(80,58,32,.30)",
     vig0: "rgba(120,90,60,0)", vig1: "rgba(120,90,60,.20)",
     doorFrame: "#B07A48", doorIn: "#6B4A2C", doorLabel: "#FFF8EC", doorEdge: "rgba(255,248,236,.45)",
+    wallCut: "#8a6f4d",
+    sky1: "#9ecfee", sky2: "#c9e3f2", sky3: "#f4e0b8",
+    sun: "#f2b23e", hill1: "#7fa06b", hill2: "#648557",
+    doorGap: "#c9a76f", doorSwing: "rgba(90,60,30,.45)",
   };
 }
 function buildRoomStatic() {
   const P = canvasPal();
   const c = roomStatic.getContext("2d");
-  c.setTransform(2, 0, 0, 2, 0, 0);
-  const W = WORLD.w, H = WORLD.h;
+  // The static canvas covers OUTER (floor + wall bands); shift so world
+  // coords map directly onto it.
+  c.setTransform(2, 0, 0, 2, -2 * OUTER.x, -2 * OUTER.y);
+  const W = WORLD.w, H = WORLD.h, T = WALL_T;
 
-  // wooden plank floor fills the whole world, with per-plank tone variation
-  const plankN = 9, plankH = (H - WALL_H) / plankN;
+  // walls: four bands around the floor, lighter at the outer cut edge,
+  // deepening toward the wall base at the floor
+  let g = c.createLinearGradient(0, -T, 0, 0);
+  g.addColorStop(0, P.wall1);
+  g.addColorStop(1, P.wall2);
+  c.fillStyle = g;
+  c.fillRect(-T, -T, W + 2 * T, T);
+  g = c.createLinearGradient(0, H + T, 0, H);
+  g.addColorStop(0, P.wall1);
+  g.addColorStop(1, P.wall2);
+  c.fillStyle = g;
+  c.fillRect(-T, H, W + 2 * T, T);
+  g = c.createLinearGradient(-T, 0, 0, 0);
+  g.addColorStop(0, P.wall1);
+  g.addColorStop(1, P.wall2);
+  c.fillStyle = g;
+  c.fillRect(-T, 0, T, H);
+  g = c.createLinearGradient(W + T, 0, W, 0);
+  g.addColorStop(0, P.wall1);
+  g.addColorStop(1, P.wall2);
+  c.fillStyle = g;
+  c.fillRect(W, 0, T, H);
+
+  // wooden plank floor fills the whole WORLD rect, with per-plank tone variation
+  const plankN = 9, plankH = H / plankN;
   for (let i = 0; i < plankN; i++) {
-    const y0 = WALL_H + i * plankH;
+    const y0 = i * plankH;
     const l = P.floorL + prand(i * 1.7) * 7;
     c.fillStyle = `hsl(${P.floorH + prand(i * 3.1) * 6},${P.floorS + prand(i * 5.3) * 8}%,${l}%)`;
     c.fillRect(0, y0, W, plankH);
@@ -1138,12 +1272,12 @@ function buildRoomStatic() {
     }
   }
   // floor sheen
-  let g = c.createLinearGradient(0, WALL_H, 0, H);
+  g = c.createLinearGradient(0, 0, 0, H);
   g.addColorStop(0, P.sheenTop);
   g.addColorStop(0.5, "rgba(0,0,0,0)");
   g.addColorStop(1, P.sheenBot);
   c.fillStyle = g;
-  c.fillRect(0, WALL_H, W, H - WALL_H);
+  c.fillRect(0, 0, W, H);
 
   // rug with patterned double border, seen from above
   const rx = 500, ry = 400, rrX = 300, rrY = 195;
@@ -1226,25 +1360,47 @@ function buildRoomStatic() {
     c.beginPath(); c.arc(lx, POOL_Y, 200, 0, 6.2832); c.fill();
   }
 
-  // thin wall strip along the top edge: warm wall, small art, chair rail.
-  // Agents never walk above y=100, so nothing living touches this strip.
-  g = c.createLinearGradient(0, 0, 0, WALL_H);
-  g.addColorStop(0, P.wall1);
-  g.addColorStop(1, P.wall2);
-  c.fillStyle = g;
-  c.fillRect(0, 0, W, WALL_H);
-  pictureFrame(c, 200, 10, 104, 40, 11, P);
-  pictureFrame(c, 700, 14, 88, 36, 47, P);
+  // baseboards along each wall's inner edge
   c.fillStyle = P.rail;
-  c.fillRect(0, WALL_H - 8, W, 8);
+  c.fillRect(-T, -7, W + 2 * T, 7);
+  c.fillRect(-T, H, W + 2 * T, 7);
+  c.fillRect(-T, 0, 7, H);
+  c.fillRect(W, 0, 7, H);
   c.fillStyle = P.railHi;
-  c.fillRect(0, WALL_H - 8, W, 2);
-  // soft shadow where the wall meets the floor
-  g = c.createLinearGradient(0, WALL_H, 0, WALL_H + 26);
-  g.addColorStop(0, P.wallShadow);
-  g.addColorStop(1, "rgba(0,0,0,0)");
-  c.fillStyle = g;
-  c.fillRect(0, WALL_H, W, 26);
+  c.fillRect(-T, -7, W + 2 * T, 2);
+  c.fillRect(-T, H, W + 2 * T, 2);
+  c.fillRect(-T, 0, 2, H);
+  c.fillRect(W, 0, 2, H);
+  // soft shadows where the walls meet the floor
+  g = c.createLinearGradient(0, 0, 0, 22);
+  g.addColorStop(0, P.wallShadow); g.addColorStop(1, "rgba(0,0,0,0)");
+  c.fillStyle = g; c.fillRect(0, 0, W, 22);
+  g = c.createLinearGradient(0, H, 0, H - 22);
+  g.addColorStop(0, P.wallShadow); g.addColorStop(1, "rgba(0,0,0,0)");
+  c.fillStyle = g; c.fillRect(0, H - 22, W, 22);
+  g = c.createLinearGradient(0, 0, 22, 0);
+  g.addColorStop(0, P.wallShadow); g.addColorStop(1, "rgba(0,0,0,0)");
+  c.fillStyle = g; c.fillRect(0, 0, 22, H);
+  g = c.createLinearGradient(W, 0, W - 22, 0);
+  g.addColorStop(0, P.wallShadow); g.addColorStop(1, "rgba(0,0,0,0)");
+  c.fillStyle = g; c.fillRect(W - 22, 0, 22, H);
+
+  // windows with little views. Positions are fractions of the wall length
+  // so they follow when the room grows. (Top-wall windows are drawn live
+  // in drawDoorways so they flank the door row without colliding.)
+  hWindow(c, W * 0.30, H, 130, 55, P, false);
+  hWindow(c, W * 0.70, H, 130, 66, P, false);
+  vWindow(c, H * 0.30, 0, 130, 11, P, true);
+  vWindow(c, H * 0.70, 0, 130, 22, P, true);
+  vWindow(c, H * 0.30, W, 130, 33, P, false);
+  vWindow(c, H * 0.70, W, 130, 44, P, false);
+  // a quiet decorative door in the bottom wall (plan style, not a room link)
+  planDoor(c, W * 0.5, H, 96, P, -1);
+
+  // crisp outer cut edge around the whole cutout
+  c.strokeStyle = P.wallCut;
+  c.lineWidth = 3;
+  c.strokeRect(-T + 1.5, -T + 1.5, W + 2 * T - 3, H + 2 * T - 3);
 }
 buildRoomStatic();
 
@@ -1288,13 +1444,13 @@ function draw(t) {
   ctx.scale(cam.zoom, cam.zoom);
   ctx.translate(-cam.x, -cam.y);
 
-  // static room: one cached drawImage
-  ctx.drawImage(roomStatic, 0, 0, WORLD.w, WORLD.h);
+  // static room: one cached drawImage (floor + wall bands)
+  ctx.drawImage(roomStatic, OUTER.x, OUTER.y, OUTER.w, OUTER.h);
 
-  // subtle room bounds so the world edge reads at any zoom
+  // subtle cutout edge so the room reads at any zoom
   ctx.strokeStyle = P.bounds;
   ctx.lineWidth = 2 / cam.zoom;
-  ctx.strokeRect(0, 0, WORLD.w, WORLD.h);
+  ctx.strokeRect(OUTER.x, OUTER.y, OUTER.w, OUTER.h);
 
   // doorways along the top wall: spatial navigation to the other rooms
   drawDoorways(P);
@@ -1342,8 +1498,10 @@ function draw(t) {
   }
 }
 
-// Doorways along the top wall: spatial room navigation. The current room
-// is excluded; the plaza is always listed first as the way home.
+// Doorways set into the top wall: spatial room navigation. The current
+// room is excluded; the plaza is always listed first as the way home.
+// Each door is an opening cut into the wall band with the room name set
+// inside it; windows fill the leftover wall space flanking the door row.
 const doorHits = [];
 function doorwayRooms() {
   const rooms = publicRooms.filter((r) => r.room_id !== currentRoom);
@@ -1361,31 +1519,34 @@ function enterRoom(r) {
 function drawDoorways(P) {
   doorHits.length = 0;
   const rooms = doorwayRooms();
-  if (!rooms.length) return;
-  const dw = 150, dh = 46, gap = 18, y = 9;
-  const totalW = rooms.length * dw + (rooms.length - 1) * gap;
-  let x = (WORLD.w - totalW) / 2;
+  const dw = 150, dh = 40, gap = 18;
+  const y0 = -WALL_T + 8; // door top, inside the wall band
+  const totalW = rooms.length * dw + Math.max(0, rooms.length - 1) * gap;
+  const x = (WORLD.w - totalW) / 2;
+  // flanking windows in the leftover wall space
+  const winW = 120, need = winW + 60;
+  const leftLo = -WALL_T, leftHi = x - gap;
+  if (leftHi - leftLo >= need) hWindow(ctx, (leftLo + leftHi) / 2, 0, winW, 101, P, true);
+  const rightLo = x + totalW + gap, rightHi = WORLD.w + WALL_T;
+  if (rightHi - rightLo >= need) hWindow(ctx, (rightLo + rightHi) / 2, 0, winW, 202, P, true);
+  // doors: dark openings cut into the wall, room names set inside
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
+  let dx = x;
   for (const r of rooms) {
-    // frame
-    ctx.fillStyle = P.doorFrame;
-    rr(ctx, x, y, dw, dh, 8); ctx.fill();
-    ctx.strokeStyle = P.doorEdge;
-    ctx.lineWidth = 1;
-    rr(ctx, x + 0.5, y + 0.5, dw - 1, dh - 1, 7.5); ctx.stroke();
-    // dark opening
     ctx.fillStyle = P.doorIn;
-    rr(ctx, x + 7, y + 7, dw - 14, dh - 14, 5); ctx.fill();
-    // label
+    rr(ctx, dx, y0, dw, dh, 6); ctx.fill();
+    ctx.strokeStyle = P.doorFrame;
+    ctx.lineWidth = 5;
+    rr(ctx, dx, y0, dw, dh, 6); ctx.stroke();
     let label = r.topic || r.room_id;
     ctx.font = "600 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
     while (label.length > 2 && ctx.measureText(label).width > dw - 28) label = label.slice(0, -1);
     if (label !== (r.topic || r.room_id)) label = label.trimEnd() + "…";
     ctx.fillStyle = P.doorLabel;
-    ctx.fillText(label, x + dw / 2, y + dh / 2 + 0.5);
-    doorHits.push({ x, y, w: dw, h: dh, room: r });
-    x += dw + gap;
+    ctx.fillText(label, dx + dw / 2, y0 + dh / 2 + 0.5);
+    doorHits.push({ x: dx, y: y0, w: dw, h: dh, room: r });
+    dx += dw + gap;
   }
 }
 function tapAt(clientX, clientY) {
