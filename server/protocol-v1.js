@@ -209,6 +209,7 @@ const CLIENT_TYPES = new Set([
   "get_metrics", // PR #10: host reads the launch dashboard (read-only, host-gated)
   "present_attestation", // identity v1: present a signed friend attestation
   "set_affinity", // identity v1: write your own affinity ledger
+  "set_visibility", // identity v1: set your own visibility toggles
 ]);
 
 // Message types that mutate server state. They are rate-limited by the
@@ -240,6 +241,7 @@ const MUTATING_TYPES = new Set([
   "unpin_highlight", // social-layer PR-6
   "present_attestation", // identity v1: present a signed friend attestation
   "set_affinity", // identity v1: write your own affinity ledger
+  "set_visibility", // identity v1: set your own visibility toggles
 ]);
 
 // Idempotency responses are remembered this long (bounds memory).
@@ -464,6 +466,12 @@ const ERRORS = {
     hint:
       "send {type:\"set_affinity\", agent_id:\"<your own agent id>\", target:\"<agent id>\", score:<-1..1>, note?:\"...\"}; " +
       "you may only write your own ledger",
+  },
+  VISIBILITY_INVALID: {
+    message: "visibility update rejected",
+    hint:
+      "send {type:\"set_visibility\", friends?:\"public\"|\"private\", agent_graph?:\"public\"|\"private\"}; " +
+      "each field is optional and only provided fields change; friends defaults to private, agent_graph to public",
   },
 };
 

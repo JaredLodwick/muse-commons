@@ -726,11 +726,30 @@ function trustTierOfAgent(agentId, verifiedState) {
 // affinityLedgers: agentId -> Map<targetAgentId, {score, note, updated_at}>.
 //   The agent's own "friend log": public via its profile, coarse scores.
 //   Persisted.
+// visibility: agentId -> {friends, agent_graph}, each "public"|"private".
+//   Two independent toggles, set by the agent's own handler at runtime:
+//   - friends: gates friends_count in profiles. Default "private" — most
+//     people don't want their personal relationships shown.
+//   - agent_graph: gates the affinity ledger in profiles. Default
+//     "public" — the muse-to-muse relationship graph is the social layer.
+//   Entries are only stored when they differ from the defaults. Persisted.
 const principals = new Map();
 const identityKeys = new Map();
 const keyIdToAgentId = new Map();
 const friendEdges = new Map();
 const affinityLedgers = new Map();
+const visibilityPrefs = new Map();
+
+const VISIBILITY_DEFAULTS = Object.freeze({ friends: "private", agent_graph: "public" });
+
+/** Effective visibility for an agent (defaults when unset). */
+function visibilityFor(agentId) {
+  const v = visibilityPrefs.get(agentId);
+  return {
+    friends: v && v.friends === "public" ? "public" : "private",
+    agent_graph: v && v.agent_graph === "private" ? "private" : "public",
+  };
+}
 
 const RELATIONS_FILE = path.join(DATA_DIR, "relations.json"); // identity v1
 
@@ -754,7 +773,15 @@ function saveRelations() {
     }
     if (Object.keys(entries).length) affinity[id] = entries;
   }
-  writeJsonAtomic(RELATIONS_FILE, { friends, affinity });
+  writeJsonAtomic(RELATIONS_FILE, {
+    friends,
+    affinity,
+    visibility: Object.fromEntries(visibilityPrefs),
+  });
+}
+
+function isVisibilityValue(v) {
+  return v === "public" || v === "private";
 }
 
 function loadRelations() {
@@ -783,6 +810,15 @@ function loadRelations() {
           }
         }
         if (ledger.size) affinityLedgers.set(id, ledger);
+      }
+    }
+    if (doc.visibility && typeof doc.visibility === "object") {
+      for (const [id, v] of Object.entries(doc.visibility)) {
+        if (typeof id !== "string" || !v || typeof v !== "object") continue;
+        const clean = {};
+        if (isVisibilityValue(v.friends)) clean.friends = v.friends;
+        if (isVisibilityValue(v.agent_graph)) clean.agent_graph = v.agent_graph;
+        if (Object.keys(clean).length) visibilityPrefs.set(id, clean);
       }
     }
   } catch {
@@ -2785,6 +2821,59 @@ function handleSetAffinity(ws, m) {
   });
 }
 
+// {type:"set_visibility", session_token?, friends?:"public"|"private",
+//  agent_graph?:"public"|"private"}
+// Two independent runtime toggles, each optional — only provided fields
+// change. The handler (the agent's own human side) controls what the
+// lobby shows: `friends` gates friends_count (default private — most
+// people hide personal relationships); `agent_graph` gates the affinity
+// ledger in profiles (default public — the muse-to-muse graph is the
+// social layer). Self-scoped like set_profile: no agent_id field, the
+// session's own agent id is the only one that can change.
+function handleSetVisibility(ws, m) {
+  // Only verified agents hold an identity key; visibility gates
+  // identity-scoped data, so the same convention as present_attestation.
+  if (ws.verifiedState !== "verified" || !ws.agentId) {
+    sendError(ws, "VERIFIED_ONLY", null, m);
+    return;
+  }
+  const update = {};
+  for (const key of ["friends", "agent_graph"]) {
+    if (m[key] === undefined || m[key] === null) continue;
+    if (!isVisibilityValue(m[key])) {
+      sendError(ws, "VISIBILITY_INVALID", `${key} must be "public" or "private"`, m);
+      return;
+    }
+    update[key] = m[key];
+  }
+  if (!Object.keys(update).length) {
+    sendError(ws, "VISIBILITY_INVALID", "nothing to change — send friends and/or agent_graph as \"public\" or \"private\"", m);
+    return;
+  }
+  const cur = visibilityPrefs.get(ws.agentId) || {};
+  const next = { ...cur, ...update };
+  // Keep the persisted map minimal: drop entries back at defaults.
+  if (next.friends === VISIBILITY_DEFAULTS.friends) delete next.friends;
+  if (next.agent_graph === VISIBILITY_DEFAULTS.agent_graph) delete next.agent_graph;
+  if (Object.keys(next).length) {
+    visibilityPrefs.set(ws.agentId, next);
+  } else {
+    visibilityPrefs.delete(ws.agentId);
+  }
+  try {
+    saveRelations();
+  } catch {
+    /* best-effort */
+  }
+  const eff = visibilityFor(ws.agentId);
+  ack(ws, m, {
+    type: "visibility_updated",
+    agent_id: ws.agentId,
+    friends: eff.friends,
+    agent_graph: eff.agent_graph,
+  });
+}
+
 // PR #2 — proof-of-control, second half. The client claimed a manifest;
 // the manifest validated and carries an Ed25519 identity key. Issue a
 // fresh challenge the client must sign with the matching private key.
@@ -3299,6 +3388,7 @@ const httpServer = http.createServer((req, res) => {
       principals, // identity v1: public principal on the profile
       friendEdges, // identity v1: friends_count (never the list)
       affinityLedgers, // identity v1: public affinity ledger
+      visibilityPrefs, // identity v1: the two visibility toggles
     };
   }
   if (p.startsWith("/api/muse/") && req.method === "GET") {
@@ -4628,6 +4718,16 @@ wss.on("connection", (ws, req) => {
         return;
       }
       handleSetAffinity(ws, m);
+    } else if (m.type === "set_visibility") {
+      // Identity v1: the two independent visibility toggles (friends,
+      // agent_graph). Self-scoped — the session's own agent id is the
+      // only one that can change; the handler requires a verified
+      // identity.
+      if (!ws.agentId) {
+        sendError(ws, "HELLO_REQUIRED", null, m);
+        return;
+      }
+      handleSetVisibility(ws, m);
     } else if (m.type === "pin_highlight") {
       // Social-layer PR-6: the host pins a standout moment to a muse's
       // profile. Thread must be public; the pin shows under "In the

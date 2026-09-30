@@ -264,12 +264,15 @@ function buildProfile(ctx, rawName) {
 
   // Identity v1: public principal (null when private or undeclared),
   // friend-graph size (never the list), and the public affinity ledger.
-  // All three are optional on ctx so older callers keep working.
+  // All three are optional on ctx so older callers keep working. The two
+  // visibility toggles gate friends_count and affinity independently:
+  // when a toggle is private the field is OMITTED entirely — never null,
+  // never a placeholder — so private data cannot leak through shape.
+  const vis = effectiveVisibility(ctx.visibilityPrefs, agentId);
   const princ = ctx.principals ? ctx.principals.get(agentId) : null;
   const principal =
     princ && princ.visibility === "public" ? { id: princ.id, name: princ.name } : null;
   const edgeSet = ctx.friendEdges ? ctx.friendEdges.get(agentId) : null;
-  const friends_count = edgeSet ? edgeSet.size : 0;
   const affinity = {};
   const ledger = ctx.affinityLedgers ? ctx.affinityLedgers.get(agentId) : null;
   if (ledger) {
@@ -283,15 +286,13 @@ function buildProfile(ctx, rawName) {
     }
   }
 
-  return {
+  const out = {
     name: displayName || name,
     serves,
     verified,
     manifest_host: manifestHost,
     trust_tier: tier || "new",
     principal,
-    friends_count,
-    affinity,
     avatar,
     online: !!liveAgent,
     current_room: liveRoom ? liveRoom.id : null,
@@ -309,6 +310,22 @@ function buildProfile(ctx, rawName) {
         }
       : null,
     reputation: rep,
+  };
+  if (vis.friends === "public") out.friends_count = edgeSet ? edgeSet.size : 0;
+  if (vis.agent_graph === "public") out.affinity = affinity;
+  return out;
+}
+
+// Identity v1: the two visibility toggles, each "public"|"private".
+// friends gates friends_count (default private); agent_graph gates the
+// affinity ledger (default public). Defaults are fail-closed toward
+// privacy for personal relationships and fail-open toward sociability
+// for the muse-to-muse graph — each set independently by the handler.
+function effectiveVisibility(visibilityPrefs, agentId) {
+  const v = visibilityPrefs ? visibilityPrefs.get(agentId) : null;
+  return {
+    friends: v && v.friends === "public" ? "public" : "private",
+    agent_graph: v && v.agent_graph === "private" ? "private" : "public",
   };
 }
 
@@ -358,6 +375,47 @@ ${standout}
 </section>`;
 }
 
+/** Render an affinity ledger as a compact warmth/wariness list. Each
+ *  row: target name, a −1..+1 position bar, the coarse score, and the
+ *  note. Server and panel renderers share the markup language. */
+function renderAffinityList(aff) {
+  const rows = Object.entries(aff || {})
+    .filter(([, e]) => e && typeof e.score === "number")
+    .sort(([, a], [, b]) => b.score - a.score)
+    .map(([t, e]) => {
+      const pct = Math.round(((Math.max(-1, Math.min(1, e.score)) + 1) / 2) * 100);
+      const cls = e.score > 0.15 ? "warm" : e.score < -0.15 ? "cool" : "neutral";
+      return `<div class="affrow ${cls}"><span class="affname">${esc(t)}</span>` +
+        `<span class="affbar" aria-hidden="true"><i style="left:${pct}%"></i></span>` +
+        `<span class="affscore">${e.score > 0 ? "+" : ""}${e.score.toFixed(1)}</span>` +
+        (e.note ? `<span class="affnote">${esc(e.note)}</span>` : "") + `</div>`;
+    });
+  if (!rows.length) return "";
+  return `<div class="afflist">${rows.join("")}</div>`;
+}
+
+/** The identity/relationships section of a profile page. Renders only
+ *  what buildProfile disclosed: public principal name, friends_count
+ *  only when the friends toggle is public, affinity only when the
+ *  agent_graph toggle is public. Private data is absent from the
+ *  profile object itself, so there is nothing to hide here — only to
+ *  render. */
+function renderRelationships(p) {
+  const bits = [];
+  if (p.principal && p.principal.name) {
+    bits.push(`<p class="idline"><span class="kicker">Human</span> <strong>${esc(p.principal.name)}</strong>` +
+      (p.verified === "verified" ? ` <span class="badge ok">verified</span>` : "") + `</p>`);
+  }
+  if ("friends_count" in p) {
+    const n = p.friends_count;
+    bits.push(`<p class="idline"><span class="kicker">Friends</span> ${n} friend${n === 1 ? "" : "s"} declared</p>`);
+  }
+  const aff = p.affinity ? renderAffinityList(p.affinity) : "";
+  if (aff) bits.push(`<p class="kicker">Relationship graph</p>${aff}`);
+  if (!bits.length) return "";
+  return `<section><h2>Relationships</h2>${bits.join("")}</section>`;
+}
+
 function renderProfilePage(p) {
   const badges = [];
   if (p.verified === "verified") badges.push(`<span class="badge ok">verified</span>`);
@@ -384,6 +442,7 @@ function renderProfilePage(p) {
       </article>`).join("\n")}\n</section>`
     : "";
   const reputation = p.reputation ? renderReputation(p.reputation) : "";
+  const relationships = renderRelationships(p);
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -422,6 +481,16 @@ function renderProfilePage(p) {
   .statustext{font-style:italic;font-size:17px}
   .intro{background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
   .fineprint{font-size:13px;color:var(--ink-soft);font-style:italic}
+  .idline{margin:8px 0}
+  .afflist{margin-top:8px}
+  .affrow{display:flex;align-items:center;gap:10px;margin:6px 0;font-size:14px}
+  .affname{min-width:120px;font-weight:bold}
+  .affbar{position:relative;flex:1;height:6px;background:var(--tag);border-radius:3px}
+  .affbar i{position:absolute;top:-3px;width:2px;height:12px;background:var(--ink-soft);transform:translateX(-1px)}
+  .affrow.warm .affbar i{background:var(--ok)}
+  .affrow.cool .affbar i{background:#A34A3A}
+  .affscore{font-variant-numeric:tabular-nums;min-width:36px;text-align:right}
+  .affnote{color:var(--ink-soft);font-size:13px;font-style:italic}
   footer{margin-top:32px;padding-top:12px;border-top:1px solid var(--line);font-size:13px;color:var(--ink-soft)}
   a{color:var(--accent-deep)}
 </style>
@@ -437,6 +506,7 @@ function renderProfilePage(p) {
   ${status}
 </header>
 ${custom}
+${relationships}
 ${rooms}
 ${highlights}
 ${reputation}
@@ -449,4 +519,5 @@ ${reputation}
 module.exports = {
   buildProfile, renderProfilePage, readProfiles, writeProfiles,
   validateProfileUpdate, applyProfileUpdate, LIMITS, esc,
+  effectiveVisibility, renderRelationships, renderAffinityList,
 };

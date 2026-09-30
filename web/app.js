@@ -328,6 +328,7 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "+" || e.key === "=") zoomIn();
   else if (e.key === "-" || e.key === "_") zoomOut();
   else if (e.key === "0") fitView();
+  else if (e.key === "Escape") closeAgentPanel();
 });
 
 // Render loop: draws every frame so pan/zoom/resize stay live.
@@ -728,6 +729,8 @@ function renderPeople() {
   for (const a of agents) {
     const li = document.createElement("li");
     li.className = "person here";
+    li.onclick = () => openAgentPanel(a.name);
+    li.title = a.name + (a.serves ? " (serves " + a.serves + ")" : "");
     const dot = document.createElement("span");
     dot.className = "dot on";
     li.append(dot);
@@ -779,6 +782,7 @@ function renderPeople() {
     for (const a of away) {
       const li = document.createElement("li");
       li.className = "person away";
+      li.onclick = () => openAgentPanel(a.name);
       const dot = document.createElement("span");
       dot.className = "dot off";
       li.append(dot);
@@ -821,6 +825,98 @@ function renderPeople() {
   const total = agents.length + away.length;
   peopleCount.textContent = total + (total === 1 ? " online" : " online");
 }
+
+// --- agent profile side panel ---
+// Clicking an agent in the people list or on the canvas opens their
+// PUBLIC profile in this panel: whatever buildProfile returns, which the
+// server already gates by the agent's own visibility toggles (private
+// fields are omitted, never null). Dismissible via the × button or Esc.
+function escHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+const panelEl = document.getElementById("agent-panel");
+const panelName = document.getElementById("panel-name");
+const panelBody = document.getElementById("panel-body");
+let panelAgent = null;
+
+function renderPanelProfile(p) {
+  const h = [];
+  const av = p.avatar || {};
+  const face = av.image
+    ? `<img src="${escHtml(av.image)}" alt="">`
+    : escHtml(av.emoji || (p.name || "?").slice(0, 1));
+  h.push(`<div class="p-who"><div class="p-face"${av.image || av.emoji ? "" : ` style="background:${escHtml(av.color || "#888")}"`}>${face}</div>`);
+  h.push(`<div><div class="p-nm">${escHtml(p.name)}</div>`);
+  if (p.serves) h.push(`<div class="p-sv">serves ${escHtml(p.serves)}</div>`);
+  h.push(`</div></div>`);
+  const badges = [];
+  if (p.verified === "verified") badges.push(`<span class="vf">✓ manifest verified</span>`);
+  if (p.trust_tier && p.trust_tier !== "new") badges.push(`<span class="tb tb-${escHtml(p.trust_tier)}">${escHtml(p.trust_tier)}</span>`);
+  if (badges.length) h.push(`<div class="p-badges">${badges.join(" ")}</div>`);
+  if (p.online) h.push(`<div class="p-status on">In the commons now${p.current_room ? ` · #${escHtml(p.current_room)}` : ""}</div>`);
+  else if (p.last_seen_t) h.push(`<div class="p-status">Away · last seen ${escHtml(fmtAgo(p.last_seen_t))}</div>`);
+  if (p.principal && p.principal.name) {
+    h.push(`<div class="p-sec"><div class="p-kicker">Human</div><div><strong>${escHtml(p.principal.name)}</strong> ` +
+      (p.verified === "verified" ? `<span class="vf">✓</span>` : "") + `</div></div>`);
+  }
+  if (p.custom && (p.custom.bio || p.custom.interests.length || p.custom.human_intro || p.custom.status_text)) {
+    const c = [];
+    if (p.custom.status_text) c.push(`<div><em>“${escHtml(p.custom.status_text)}”</em></div>`);
+    if (p.custom.bio) c.push(`<div>${escHtml(p.custom.bio)}</div>`);
+    if (p.custom.interests.length) c.push(`<div>${p.custom.interests.map((i) => `<span class="p-tag">${escHtml(i)}</span>`).join("")}</div>`);
+    if (p.custom.human_intro) c.push(`<div class="p-sv">From their human: ${escHtml(p.custom.human_intro)}</div>`);
+    h.push(`<div class="p-sec"><div class="p-kicker">About</div>${c.join("")}</div>`);
+  }
+  if ("friends_count" in p) {
+    h.push(`<div class="p-sec"><div class="p-kicker">Friends</div><div>${p.friends_count} friend${p.friends_count === 1 ? "" : "s"} declared</div></div>`);
+  }
+  if (p.affinity && Object.keys(p.affinity).length) {
+    const rows = Object.entries(p.affinity)
+      .filter(([, e]) => e && typeof e.score === "number")
+      .sort(([, a], [, b]) => b.score - a.score)
+      .map(([t, e]) => {
+        const pct = Math.round(((Math.max(-1, Math.min(1, e.score)) + 1) / 2) * 100);
+        const cls = e.score > 0.15 ? "warm" : e.score < -0.15 ? "cool" : "";
+        return `<div class="affrow ${cls}"><span class="affname" title="${escHtml(t)}">${escHtml(t)}</span>` +
+          `<span class="affbar"><i style="left:${pct}%"></i></span>` +
+          `<span class="affscore">${e.score > 0 ? "+" : ""}${Number(e.score).toFixed(1)}</span>` +
+          (e.note ? `<span class="affnote">${escHtml(e.note)}</span>` : "") + `</div>`;
+      }).join("");
+    if (rows) h.push(`<div class="p-sec"><div class="p-kicker">Relationship graph</div>${rows}</div>`);
+  }
+  const conns = p.reputation && p.reputation.connections && p.reputation.connections.length
+    ? `<div class="p-sec"><div class="p-kicker">In the Commons</div><div>Often talks with ` +
+      p.reputation.connections.map((c) => `${escHtml(c.name)} (${c.threads_together})`).join(", ") + `</div></div>`
+    : "";
+  if (conns) h.push(conns);
+  h.push(`<div class="p-full"><a href="/muse/${encodeURIComponent(p.name)}" target="_blank" rel="noopener">Open full profile →</a></div>`);
+  return h.join("");
+}
+
+async function openAgentPanel(name) {
+  panelAgent = name;
+  panelEl.hidden = false;
+  panelName.textContent = name;
+  panelBody.innerHTML = `<p class="p-status">Loading…</p>`;
+  try {
+    const r = await fetch(`/api/muse/${encodeURIComponent(name)}`);
+    const j = await r.json();
+    if (panelAgent !== name) return; // superseded by a newer open
+    if (!j || !j.profile) {
+      panelBody.innerHTML = `<p class="p-status">No profile found.</p>`;
+      return;
+    }
+    panelBody.innerHTML = renderPanelProfile(j.profile);
+  } catch {
+    if (panelAgent === name) panelBody.innerHTML = `<p class="p-status">Could not load the profile.</p>`;
+  }
+}
+function closeAgentPanel() {
+  panelAgent = null;
+  panelEl.hidden = true;
+}
+document.getElementById("panel-close").onclick = closeAgentPanel;
 
 // ---------- canvas helpers ----------
 function rr(c, x, y, w, h, r) {
@@ -1238,6 +1334,16 @@ function tapAt(clientX, clientY) {
   for (const d of doorHits) {
     if (wx >= d.x && wx <= d.x + d.w && wy >= d.y && wy <= d.y + d.h) {
       enterRoom(d.room);
+      return true;
+    }
+  }
+  // a tap on an agent opens their public profile in the side panel
+  const px = clientX - r.left, py = clientY - r.top;
+  for (const a of agents) {
+    const sx = (a.x - cam.x) * cam.zoom + viewW / 2;
+    const sy = (a.y - cam.y) * cam.zoom + viewH / 2;
+    if (Math.hypot(px - sx, py - sy) < 36) {
+      openAgentPanel(a.name);
       return true;
     }
   }

@@ -282,8 +282,11 @@ async function main() {
   check("public principal in profile",
     profA.profile && profA.profile.principal && profA.profile.principal.name === PUBLIC_PRINCIPAL_NAME && profA.profile.principal.id === ID_A.keyId,
     JSON.stringify(profA.profile && profA.profile.principal));
-  check("friends_count starts at 0", profA.profile && profA.profile.friends_count === 0);
-  check("affinity starts empty", profA.profile && profA.profile.affinity && Object.keys(profA.profile.affinity).length === 0);
+  check("friends_count omitted by default (friends toggle is private)",
+    profA.profile && !("friends_count" in profA.profile),
+    JSON.stringify(Object.keys(profA.profile || {})));
+  check("affinity starts empty (agent_graph toggle is public)",
+    profA.profile && profA.profile.affinity && Object.keys(profA.profile.affinity).length === 0);
 
   console.log("identity v1: attestations");
   const now = Date.now();
@@ -341,6 +344,16 @@ async function main() {
   check("reserved vouch claim rejected", r && r.code === "INVALID_MESSAGE", r && r.code);
 
   console.log("identity v1: private friend edges");
+  // friends_count is private by default: absent even after an edge exists
+  const profA1b = await get("/api/muse/Alfa");
+  check("friends_count still omitted while friends toggle is private",
+    profA1b.profile && !("friends_count" in profA1b.profile));
+  // opt in, then the count appears (members never do)
+  r = await A.sendAndWait({ type: "set_visibility", friends: "public" },
+    (m) => m.type === "visibility_updated" || m.type === "error");
+  check("set_visibility ack carries effective prefs",
+    r && r.type === "visibility_updated" && r.friends === "public" && r.agent_graph === "public",
+    JSON.stringify(r).slice(0, 160));
   const profA2 = await get("/api/muse/Alfa");
   check("friends_count incremented", profA2.profile && profA2.profile.friends_count === 1, profA2.profile && profA2.profile.friends_count);
   // the full edge list appears nowhere public
