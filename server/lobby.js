@@ -308,6 +308,10 @@ function negotiateScopes(m, ws) {
 function authorizeWrite(ws, m) {
   const need = protocol.SCOPE_FOR_TYPE[m.type];
   if (!need) return null;
+  // DM v1: viewer sockets (legacy, no agent identity) may attempt DMs; the
+  // handler admits them only with a claimed agent name (stamped unverified)
+  // and otherwise answers CLAIM_REQUIRED — clearer than a scope error.
+  if (m.type === "dm" && !ws.protocolVersion && !ws.agentId) return null;
   if (ws.protocolVersion) {
     const tok = typeof m.session_token === "string" ? m.session_token : "";
     if (!tok) return "SESSION_TOKEN_REQUIRED";
@@ -2477,13 +2481,16 @@ function resolveDMTarget(toName) {
 // Metrics get an aggregate count; the audit log gets metadata only.
 function deliverDM(ws, m, fromName, fromId, target) {
   const toId = target.id;
-  const key = dmThreadKey(fromId, toId);
+  // Unverified (viewer-claimed) senders get a "web:<slug>" sender key so
+  // their threads never merge with the real agent's verified threads.
+  const senderKey = fromId || "web:" + slug(fromName);
+  const key = dmThreadKey(senderKey, toId);
   let thread = dmThreads.get(key);
   if (!thread) {
-    thread = { key, participants: [fromId, toId], names: {}, log: [], seq: 0 };
+    thread = { key, participants: [senderKey, toId], names: {}, log: [], seq: 0 };
     dmThreads.set(key, thread);
   }
-  thread.names[fromId] = fromName;
+  thread.names[senderKey] = fromName;
   thread.names[toId] = target.name;
   const text = String(m.text).slice(0, 280);
   thread.seq += 1;
@@ -2491,7 +2498,8 @@ function deliverDM(ws, m, fromName, fromId, target) {
     type: "dm",
     thread_id: key,
     from: fromName,
-    fromId,
+    fromId: fromId || null,
+    unverified: !fromId,
     to: target.name,
     toId,
     text,
@@ -2500,7 +2508,12 @@ function deliverDM(ws, m, fromName, fromId, target) {
   };
   thread.log.push(payload);
   if (thread.log.length > DM_LOG_KEEP) thread.log.splice(0, thread.log.length - DM_LOG_KEEP);
-  for (const s of socketsForAgent(fromId)) send(s, payload);
+  // Sender echo only for real sessions: socketsForAgent(null) would match
+  // every viewer socket (ws.agentId === null), so it must stay guarded.
+  // Guest (viewer) senders get a direct echo on their own socket so the
+  // web UI can render the sent message.
+  if (fromId) for (const s of socketsForAgent(fromId)) send(s, payload);
+  else if (ws.readyState === 1) send(ws, payload);
   const toSockets = socketsForAgent(toId);
   if (toSockets.length) {
     for (const s of toSockets) send(s, payload);
@@ -5238,7 +5251,13 @@ wss.on("connection", (ws, req) => {
       // DM v1: direct message to an agent by display name. Mirrors the
       // say/talk from-stamping: v1 clients are stamped from the session
       // identity (one client can never send as another agent); legacy
-      // clients keep the claim-based `from` with the same reconciliation.
+      // agent clients keep the claim-based `from` with the same
+      // reconciliation. Viewers (no agent identity) may only send as
+      // their claimed agent name, stamped unverified.
+      if (!ws.agentId && !ws.claimedAgent) {
+        sendError(ws, "CLAIM_REQUIRED", "claim your agent's name before sending DMs", m);
+        return;
+      }
       let fromName;
       let fromId;
       if (ws.protocolVersion) {
@@ -5248,9 +5267,11 @@ wss.on("connection", (ws, req) => {
         }
         fromName = ws.agentName;
         fromId = ws.agentId;
-      } else {
+      } else if (ws.agentId) {
         fromName = m.from;
-        if (ws.agentId && ws.agentName && fromName === ws.agentName) fromId = ws.agentId;
+        if (ws.agentName && fromName === ws.agentName) fromId = ws.agentId;
+      } else {
+        fromName = ws.claimedAgent; // viewer: only ever the claimed name
       }
       const toName = m.to;
       if (!fromName || !toName || !m.text) {
@@ -5289,7 +5310,9 @@ wss.on("connection", (ws, req) => {
       // requester must be a thread participant — otherwise the thread's
       // existence is never confirmed (NO_SUCH_THREAD), so strangers can't
       // probe threads. NOT in MUTATING_TYPES: no scope, no idempotency.
-      const requesterId = ws.agentId || null;
+      // Viewers read their own unverified threads via the "web:<slug>"
+      // sender key derived from their claimed agent name.
+      const requesterId = ws.agentId || (ws.claimedAgent ? "web:" + slug(ws.claimedAgent) : null);
       const withName = String(m.with || "").trim();
       const target = withName ? resolveDMTarget(withName) : null;
       const key = requesterId && target ? dmThreadKey(requesterId, target.id) : null;

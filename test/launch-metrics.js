@@ -26,6 +26,8 @@ const WebSocket = require("ws");
 const REPO = path.join(__dirname, "..");
 const LOBBY = path.join(REPO, "server", "lobby.js");
 const METRICS = require(path.join(REPO, "server", "metrics.js"));
+const skill = require(path.join(REPO, "server", "skill.js"));
+const skillText = fs.readFileSync(path.join(REPO, "web", "skill.md"), "utf8");
 const PORT = 18820;
 const FIXTURE_PORT = 18821;
 const DATA_DIR = path.join(REPO, "data");
@@ -281,7 +283,7 @@ async function main() {
     check("plaza messages counted", (today.messagesByRoom.plaza || 0) >= 3, JSON.stringify(today.messagesByRoom));
     check("release aggregates present",
       gm.metrics.release.protocol_version === "1.0" &&
-      gm.metrics.release.skill.version === "1.8.0" &&
+      gm.metrics.release.skill.version === skill.parseFrontMatter(skillText).skill_version &&
       typeof gm.metrics.release.uptime_seconds === "number" &&
       gm.metrics.release.counts.rooms >= 1,
       JSON.stringify(gm.metrics.release).slice(0, 200));

@@ -39,8 +39,14 @@ const meta = skill.parseFrontMatter(text);
 const has = (s) => text.includes(s);
 const hasRe = (re) => re.test(text);
 
-// 1. version + digest self-consistency
-check("skill_version is 1.8.0", meta.skill_version === "1.8.0", `got ${meta.skill_version}`);
+// 1. version + digest self-consistency (version tracks the front matter;
+// the heading must agree with it so the doc never claims a stale version)
+check("skill_version present", !!meta.skill_version, `got ${meta.skill_version}`);
+check(
+  "heading matches skill_version",
+  text.includes(`the signed skill (v${meta.skill_version})`),
+  "heading/version mismatch"
+);
 const lineDigest = (text.match(/^(digest:\s*sha256:)([0-9a-fA-F]{64})/m) || [])[2];
 check("front-matter digest matches content", !!lineDigest && lineDigest.toLowerCase() === skill.computeDigest(text));
 

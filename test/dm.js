@@ -410,7 +410,57 @@ async function main() {
     check("public metrics carry no DM text", health.status === 200 && !health.body.includes(SECRET));
     check("messages_dm counts the 3 DMs (aggregate only)", today.messages_dm === dmBase + 3, `got ${today.messages_dm}, base ${dmBase}`);
 
-    for (const rec of [a, b, b2, va1, va2, a3, vb2, c, d, e, q, host, v1a, v1b, p, r]) rec.close();
+    console.log("viewer DMs as claimed name, stamped unverified");
+    const vClaim = T("DmVw");
+    const v = await openAgent(null, { kind: "viewer", room: "plaza", agent_name: vClaim });
+    const vText = `viewer-dm-${RUN}`;
+    const vOkP = v.sendAndWait({ type: "dm", to: b.name, text: vText }, (m) => m.type === "dm_ok");
+    const vEchoP = v.waitFor((m) => m.type === "dm" && m.text === vText);
+    const bVdmP = b.waitFor((m) => m.type === "dm" && m.text === vText);
+    const [vOk, vEcho, bVdm] = await Promise.all([vOkP, vEchoP, bVdmP]);
+    check("viewer dm_ok", !!vOk && typeof vOk.thread_id === "string", JSON.stringify(vOk));
+    check("viewer thread key is guest-scoped", !!vOk && vOk.thread_id.includes(":web:"), vOk && vOk.thread_id);
+    check("guest sender gets echo on own socket", !!vEcho && vEcho.unverified === true && vEcho.fromId === null, JSON.stringify(vEcho));
+    check(
+      "recipient sees unverified:true, fromId null, claimed name",
+      !!bVdm && bVdm.unverified === true && bVdm.fromId === null && bVdm.from === vClaim,
+      JSON.stringify(bVdm)
+    );
+
+    console.log("viewer without a claim cannot DM");
+    const v0 = await openAgent(null, { kind: "viewer", room: "plaza", agent_name: "" });
+    const claimErr = await v0.sendAndWait({ type: "dm", to: b.name, text: `noclaim-${RUN}` }, (m) => m.type === "error");
+    check("no claim → CLAIM_REQUIRED", !!claimErr && claimErr.code === "CLAIM_REQUIRED", JSON.stringify(claimErr));
+
+    console.log("guest threads never merge with the agent's own thread");
+    const dupName = T("DmDup");
+    const dupAgent = await openAgent(dupName);
+    const dupViewer = await openAgent(null, { kind: "viewer", room: "plaza", agent_name: dupName });
+    const gText = `guest-dup-${RUN}`;
+    const aText = `agent-dup-${RUN}`;
+    const gOk = await dupViewer.sendAndWait({ type: "dm", to: b.name, text: gText }, (m) => m.type === "dm_ok");
+    const aOk = await dupAgent.sendAndWait({ type: "dm", from: dupName, to: b.name, text: aText }, (m) => m.type === "dm_ok");
+    check(
+      "guest and agent threads differ",
+      !!gOk && !!aOk && gOk.thread_id !== aOk.thread_id,
+      `${gOk && gOk.thread_id} vs ${aOk && aOk.thread_id}`
+    );
+    const gHist = await dupViewer.sendAndWait({ type: "dm_history", with: b.name }, (m) => m.type === "dm_history_ok");
+    check(
+      "guest history shows guest thread only",
+      !!gHist && gHist.thread_id === gOk.thread_id &&
+        gHist.entries.some((e) => e.text === gText) && !gHist.entries.some((e) => e.text === aText),
+      JSON.stringify(gHist && gHist.entries.map((e) => e.text))
+    );
+    const aHist = await dupAgent.sendAndWait({ type: "dm_history", with: b.name }, (m) => m.type === "dm_history_ok");
+    check(
+      "agent history shows agent thread only",
+      !!aHist && aHist.thread_id === aOk.thread_id &&
+        aHist.entries.some((e) => e.text === aText) && !aHist.entries.some((e) => e.text === gText),
+      JSON.stringify(aHist && aHist.entries.map((e) => e.text))
+    );
+
+    for (const rec of [a, b, b2, va1, va2, a3, vb2, c, d, e, q, host, v1a, v1b, p, r, v, v0, dupAgent, dupViewer]) rec.close();
     console.log(failures === 0 ? "ALL DM TESTS PASSED" : `${failures} FAILURES`);
   } finally {
     server.kill();
