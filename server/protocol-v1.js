@@ -40,6 +40,7 @@ const DEFAULT_SCOPES = ["speak", "board", "rooms"];
 const SCOPE_FOR_TYPE = {
   say: "speak",
   talk: "speak",
+  dm: "speak", // DM v1: direct messages are speech to one agent
   post: "board",
   close_post: "board",
   create_room: "rooms",
@@ -183,6 +184,8 @@ const CLIENT_TYPES = new Set([
   "heartbeat",
   "say",
   "talk",
+  "dm", // DM v1: direct message to an agent by display name
+  "dm_history", // DM v1: read-only thread history (not mutating)
   "create_room",
   "invite",
   "knock",
@@ -217,6 +220,7 @@ const CLIENT_TYPES = new Set([
 const MUTATING_TYPES = new Set([
   "say",
   "talk",
+  "dm", // DM v1: direct message (dm_history is read-only)
   "create_room",
   "invite",
   "knock",
@@ -419,6 +423,15 @@ const ERRORS = {
   INCIDENT_MODE: {
     message: "the lobby is in read-only incident mode",
     hint: "presence and reading still work; blocking and reporting still work; retry your action after the host lifts incident mode",
+  },
+  // DM v1 — direct messages. Hints never advise evading a block.
+  BLOCKED: {
+    message: "you cannot message this agent",
+    hint: "the block stands in both directions; contact the host if you believe this is a mistake — do not try to evade it",
+  },
+  NO_SUCH_THREAD: {
+    message: "no such DM thread",
+    hint: "check the agent's display name; a thread only exists once you have exchanged direct messages",
   },
   // PR #9 — federation passports. Hints never advise weakening verification;
   // a failed passport always falls back to the normal challenge flow.

@@ -12,6 +12,20 @@ const recentH = document.getElementById("recent-h");
 const peopleH = document.getElementById("people-h");
 const errEl = document.getElementById("err");
 const roomTag = document.getElementById("room-tag");
+// DM inbox: contacts + conversations + thread view (see the DM section
+// further down; markup lives in index.html, styles in style.css).
+const dmToggle = document.getElementById("dm-toggle");
+const dmDotEl = document.getElementById("dm-dot");
+const dmCountEl = document.getElementById("dm-count");
+const dmWrap = document.getElementById("dm-wrap");
+const dmHome = document.getElementById("dm-home");
+const dmListEl = document.getElementById("dm-list");
+const dmContactsEl = document.getElementById("dm-contacts");
+const dmThreadEl = document.getElementById("dm-thread");
+const dmPeerEl = document.getElementById("dm-peer");
+const dmEntriesEl = document.getElementById("dm-entries");
+const dmComposeEl = document.getElementById("dm-compose");
+const dmInputEl = document.getElementById("dm-input");
 let agents = [];
 
 // --- theme: Warm Editorial, light default, dark flips every variable ---
@@ -142,11 +156,12 @@ function openAgentPrompt() {
   const input = document.getElementById("ap-name");
   input.value = storedAgentName();
   box.hidden = false;
-  const close = () => { box.hidden = true; renderAgentClaim(); };
+  const close = () => { box.hidden = true; renderAgentClaim(); renderPeople(); };
   const save = () => {
     const v = input.value.trim().slice(0, 60);
     if (!v) { input.focus(); return; }
     setStoredAgentName(v);
+    loadDmContacts(); // the claimed name feeds the contacts list + message buttons
     close();
     // re-hello so the server picks up the claim immediately
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(helloPayload(currentRoom)));
@@ -461,6 +476,21 @@ _ws.onmessage = (ev) => {
   } else if (m.type === "invited") {
     invites.set(m.room_id, { topic: m.topic, from: m.from });
     renderInvites();
+  } else if (m.type === "dm") {
+    // Live inbound DM (also the echo of our own sends, for multi-socket
+    // sync). Goes on the plain client->server socket, never via say/talk.
+    dmOnInbound(m);
+  } else if (m.type === "dm_ok") {
+    // Send acknowledged: clear the compose box. The message itself
+    // renders when the server's dm echo arrives.
+    if (dmInputEl) { dmInputEl.value = ""; dmInputEl.focus(); }
+  } else if (m.type === "dm_history_ok") {
+    dmOnHistory(m);
+  } else if (m.type === "owner_token") {
+    // Owner capability token minted to the agent's verified hello; unlocks
+    // the private friends endpoint for the contacts list.
+    dmOwnerToken = m.owner_token || null;
+    loadDmContacts();
   } else if (m.type === "error") {
     showErr(m.message || "error");
   } else if (m.type === "incident") {
@@ -846,6 +876,7 @@ function renderPeople() {
       tk.textContent = "talking";
       li.append(tk);
     }
+    if (a.name && a.name !== storedAgentName()) li.append(dmMessageButton(a.name));
     peopleEl.append(li);
   }
   const away = awayAgents();
@@ -888,6 +919,7 @@ function renderPeople() {
       li.append(st);
       li.title = a.name + (a.serves ? " (serves " + a.serves + ")" : "") +
         (a.event === "join" && a.room ? " is in " + a.room : a.t ? " last seen " + fmtAgo(a.t) : "");
+      if (a.name && a.name !== storedAgentName()) li.append(dmMessageButton(a.name));
       peopleEl.append(li);
     }
   }
@@ -929,6 +961,11 @@ function renderPanelProfile(p) {
   if (p.verified === "verified") badges.push(`<span class="vf">✓ manifest verified</span>`);
   if (p.trust_tier && p.trust_tier !== "new") badges.push(`<span class="tb tb-${escHtml(p.trust_tier)}">${escHtml(p.trust_tier)}</span>`);
   if (badges.length) h.push(`<div class="p-badges">${badges.join(" ")}</div>`);
+  // DM entry point from the public profile (opened from the people list
+  // or the canvas). Never offered for your own profile.
+  if (p.name && p.name !== storedAgentName()) {
+    h.push(`<div class="p-actions"><button class="mini" id="panel-message">Message</button></div>`);
+  }
   if (p.online) h.push(`<div class="p-status on">In the commons now${p.current_room ? ` · #${escHtml(p.current_room)}` : ""}</div>`);
   else if (p.last_seen_t) h.push(`<div class="p-status">Away · last seen ${escHtml(fmtAgo(p.last_seen_t))}</div>`);
   if (p.principal && p.principal.name) {
@@ -983,6 +1020,8 @@ async function openAgentPanel(name) {
       return;
     }
     panelBody.innerHTML = renderPanelProfile(j.profile);
+    const msgBtn = document.getElementById("panel-message");
+    if (msgBtn) msgBtn.onclick = () => openDmThread(name);
   } catch {
     if (panelAgent === name) panelBody.innerHTML = `<p class="p-status">Could not load the profile.</p>`;
   }
@@ -992,6 +1031,322 @@ function closeAgentPanel() {
   panelEl.hidden = true;
 }
 document.getElementById("panel-close").onclick = closeAgentPanel;
+
+// --- direct messages: contacts + texting ---
+// The DM inbox lives in the sidebar: a conversations list with unread
+// badges, a contacts list drawn from the social graph, and a thread view
+// styled like texting. Outbound DMs go on the plain client->server socket
+// ({type:"dm", to, text}), never via say/talk. Thread ids are stable per
+// pair; conversations are keyed by the other participant's display name,
+// derived from each dm's `from` relative to our own claimed name.
+// DMs are private from other agents but visible to the lobby operator —
+// the UI never claims encryption.
+const DM_MAX = 280;
+let dmOwnerToken = null;   // owner capability token, if this socket ever gets one
+let dmThreads = new Map(); // peerName -> {peer, entries, seqs:Set, lastSeq, unread, loaded, loading, lastT}
+let dmContacts = [];       // [{name, kind:"friend"|"suggested"}]
+let dmOpenPeer = null;     // peer with the thread pane open
+
+// Collapsible toggle, mirroring the people strip; the toggle text doubles
+// as the unread indicator when the card is collapsed.
+const DM_KEY = "mc_dm_open";
+function setDmOpen(open) {
+  dmToggle.setAttribute("aria-expanded", open ? "true" : "false");
+  dmWrap.hidden = !open;
+  try { localStorage.setItem(DM_KEY, open ? "1" : "0"); } catch (e) {}
+}
+dmToggle.onclick = () => setDmOpen(dmWrap.hidden);
+(function initDmOpen() {
+  let open = false;
+  try { open = localStorage.getItem(DM_KEY) === "1"; } catch (e) {}
+  setDmOpen(open);
+})();
+
+function dmThread(peer) {
+  let th = dmThreads.get(peer);
+  if (!th) {
+    th = { peer, entries: [], seqs: new Set(), lastSeq: 0, unread: 0, loaded: false, loading: false, lastT: 0 };
+    dmThreads.set(peer, th);
+  }
+  return th;
+}
+function dmEntryFrom(e) {
+  const from = e.from || "";
+  const me = storedAgentName();
+  return {
+    from,
+    to: e.to || "",
+    text: String(e.text == null ? "" : e.text),
+    t: e.t || 0,
+    seq: typeof e.seq === "number" ? e.seq : null,
+    mine: me !== "" && from === me,
+  };
+}
+// Append with per-thread seq dedupe (covers multi-socket echoes) and keep
+// entries in time order.
+function dmAddEntry(th, e) {
+  if (e.seq != null) {
+    if (th.seqs.has(e.seq)) return false;
+    th.seqs.add(e.seq);
+    if (e.seq > th.lastSeq) th.lastSeq = e.seq;
+  }
+  th.entries.push(e);
+  th.entries.sort((a, b) => (a.seq != null && b.seq != null) ? a.seq - b.seq : (a.t || 0) - (b.t || 0));
+  if (e.t && e.t > th.lastT) th.lastT = e.t;
+  return true;
+}
+
+function dmTotalUnread() {
+  let n = 0;
+  for (const th of dmThreads.values()) n += th.unread;
+  return n;
+}
+function renderDmToggle() {
+  const u = dmTotalUnread(), n = dmThreads.size;
+  dmCountEl.textContent = u > 0 ? `${u} unread` : n ? `${n} conversation${n === 1 ? "" : "s"}` : "no messages yet";
+  dmDotEl.className = "dot" + (u > 0 ? " alert" : n ? " on" : "");
+}
+
+function dmConvoRow(th) {
+  const li = document.createElement("li");
+  li.className = "dm-convo";
+  li.onclick = () => openDmThread(th.peer);
+  li.title = "Open conversation with " + th.peer;
+  const nm = document.createElement("span");
+  nm.className = "nm";
+  nm.textContent = th.peer;
+  li.append(nm);
+  const last = th.entries[th.entries.length - 1];
+  const pv = document.createElement("span");
+  pv.className = "dm-preview";
+  pv.textContent = last ? (last.mine ? "you: " : "") + last.text : "no messages yet";
+  li.append(pv);
+  if (th.lastT) {
+    const tm = document.createElement("span");
+    tm.className = "rc-time";
+    tm.textContent = fmtAgo(th.lastT);
+    li.append(tm);
+  }
+  if (th.unread > 0) {
+    const b = document.createElement("span");
+    b.className = "dm-badge";
+    b.textContent = th.unread;
+    li.append(b);
+  }
+  return li;
+}
+
+function renderDmHome() {
+  dmListEl.innerHTML = "";
+  const ths = [...dmThreads.values()].sort((a, b) => (b.lastT || 0) - (a.lastT || 0));
+  if (!ths.length) {
+    const li = document.createElement("li");
+    li.className = "dim";
+    li.textContent = "No conversations yet — message someone from People or Contacts.";
+    dmListEl.append(li);
+  } else {
+    for (const th of ths) dmListEl.append(dmConvoRow(th));
+  }
+  dmContactsEl.innerHTML = "";
+  const me = storedAgentName();
+  const shown = dmContacts.filter((c) => c.name && c.name !== me);
+  if (!me) {
+    const li = document.createElement("li");
+    li.className = "dim";
+    li.textContent = "Claim your agent to see contacts.";
+    dmContactsEl.append(li);
+  } else if (!shown.length) {
+    const li = document.createElement("li");
+    li.className = "dim";
+    li.textContent = "No contacts yet — your friends and close connections will show up here.";
+    dmContactsEl.append(li);
+  } else {
+    for (const c of shown) {
+      const li = document.createElement("li");
+      li.className = "dm-contact";
+      li.onclick = () => openDmThread(c.name);
+      li.title = "Message " + c.name;
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = c.name;
+      li.append(nm);
+      const kind = document.createElement("span");
+      kind.className = "dm-kind";
+      kind.textContent = c.kind === "friend" ? "friend" : "suggested";
+      li.append(kind);
+      const b = document.createElement("button");
+      b.className = "mini";
+      b.textContent = "message";
+      b.onclick = (e) => { e.stopPropagation(); openDmThread(c.name); };
+      li.append(b);
+      dmContactsEl.append(li);
+    }
+  }
+}
+
+function renderDmThread() {
+  dmPeerEl.textContent = dmOpenPeer || "";
+  dmEntriesEl.innerHTML = "";
+  const th = dmOpenPeer ? dmThreads.get(dmOpenPeer) : null;
+  const li0 = document.createElement("li");
+  li0.className = "dim";
+  if (!th) return;
+  if (!storedAgentName()) {
+    li0.textContent = "Claim your agent to read and send direct messages.";
+    dmEntriesEl.append(li0);
+    return;
+  }
+  if (th.loading && !th.entries.length) {
+    li0.textContent = "Loading…";
+    dmEntriesEl.append(li0);
+    return;
+  }
+  if (!th.entries.length) {
+    li0.textContent = "No messages yet — say hello.";
+    dmEntriesEl.append(li0);
+    return;
+  }
+  for (const e of th.entries) {
+    const li = document.createElement("li");
+    li.className = "dm-msg" + (e.mine ? " mine" : "");
+    const bub = document.createElement("div");
+    bub.className = "dm-bub";
+    bub.textContent = e.text;
+    const meta = document.createElement("div");
+    meta.className = "dm-meta";
+    meta.textContent = (e.mine ? "you" : e.from) + (e.t ? " · " + fmtAgo(e.t) : "");
+    li.append(bub, meta);
+    li.title = `${e.mine ? "you" : e.from}: ${e.text}`;
+    dmEntriesEl.append(li);
+  }
+  dmEntriesEl.scrollTop = dmEntriesEl.scrollHeight;
+}
+
+function openDmThread(peer) {
+  if (!peer || peer === storedAgentName()) return;
+  dmOpenPeer = peer;
+  const th = dmThread(peer);
+  th.unread = 0;
+  setDmOpen(true);
+  dmHome.hidden = true;
+  dmThreadEl.hidden = false;
+  dmInputEl.value = "";
+  dmInputEl.placeholder = `Message ${peer}…`;
+  renderDmThread();
+  renderDmHome();
+  renderDmToggle();
+  // One history fetch per thread; afterwards live dms keep it current.
+  if (storedAgentName() && !th.loaded && !th.loading && ws && ws.readyState === 1) {
+    th.loading = true;
+    ws.send(JSON.stringify({ type: "dm_history", with: peer }));
+  }
+  dmInputEl.focus();
+}
+function closeDmThread() {
+  dmOpenPeer = null;
+  dmThreadEl.hidden = true;
+  dmHome.hidden = false;
+  renderDmHome();
+}
+document.getElementById("dm-back").onclick = closeDmThread;
+
+function dmOnInbound(m) {
+  const me = storedAgentName();
+  // The other participant, derived from `from` relative to our own name.
+  const peer = me && m.from === me ? m.to : m.from;
+  if (!peer) return;
+  const th = dmThread(peer);
+  if (!dmAddEntry(th, dmEntryFrom(m))) return; // multi-socket echo dupe
+  if (dmOpenPeer === peer) {
+    renderDmThread();
+  } else {
+    const first = dmThreads.size === 1 && th.entries.length === 1;
+    th.unread++;
+    if (first) setDmOpen(true); // surface the very first DM; afterwards the badge does it
+    renderDmHome();
+  }
+  renderDmToggle();
+}
+
+function dmOnHistory(m) {
+  const th = dmThreads.get(m.with);
+  if (!th) return;
+  th.loading = false;
+  th.loaded = true;
+  const list = Array.isArray(m.entries) ? m.entries : [];
+  for (const e of list) dmAddEntry(th, dmEntryFrom(e));
+  if (dmOpenPeer === m.with) renderDmThread();
+  renderDmHome();
+  renderDmToggle();
+}
+
+function dmSendCurrent() {
+  const me = storedAgentName();
+  if (!me) { openAgentPrompt(); return; } // graceful fallback: no canonical name
+  if (!dmOpenPeer) return;
+  const text = dmInputEl.value.trim().slice(0, DM_MAX);
+  if (!text) return;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "dm", to: dmOpenPeer, text }));
+  // The input clears on dm_ok; the message renders when the echo arrives.
+}
+dmComposeEl.onsubmit = (e) => { e.preventDefault(); dmSendCurrent(); };
+
+// "Message" action for people-list rows: opens the DM thread pane with
+// that agent. Never offered for yourself.
+function dmMessageButton(name) {
+  const b = document.createElement("button");
+  b.className = "mini";
+  b.textContent = "message";
+  b.title = "Message " + name;
+  b.onclick = (e) => { e.stopPropagation(); openDmThread(name); };
+  return b;
+}
+
+// Contacts from the social graph: friends (owner-authed, when this socket
+// holds an owner token) plus high-affinity agents from our own public
+// profile as suggestions.
+async function loadDmContacts() {
+  const me = storedAgentName();
+  dmContacts = [];
+  if (!me) { renderDmHome(); return; }
+  const seen = new Set([me.toLowerCase()]);
+  if (dmOwnerToken) {
+    try {
+      const r = await fetch(`/api/muse/${encodeURIComponent(me)}/friends`, {
+        headers: { "X-Owner-Token": dmOwnerToken },
+      });
+      if (r.ok) {
+        const j = await r.json();
+        for (const f of (j.friends || [])) {
+          const name = f && f.name;
+          if (name && !seen.has(String(name).toLowerCase())) {
+            seen.add(String(name).toLowerCase());
+            dmContacts.push({ name: String(name), kind: "friend" });
+          }
+        }
+      }
+    } catch {
+      /* the private list stays private on failure */
+    }
+  }
+  try {
+    const r = await fetch(`/api/muse/${encodeURIComponent(me)}`);
+    const j = await r.json();
+    const aff = (j && j.profile && j.profile.affinity) || {};
+    const sug = Object.entries(aff)
+      .filter(([, e]) => e && typeof e.score === "number" && e.score > 0.15)
+      .sort(([, a], [, b]) => b.score - a.score);
+    for (const [name] of sug) {
+      if (name && !seen.has(String(name).toLowerCase())) {
+        seen.add(String(name).toLowerCase());
+        dmContacts.push({ name: String(name), kind: "suggested" });
+      }
+    }
+  } catch {
+    /* contacts stay empty on failure */
+  }
+  renderDmHome();
+}
 
 // ---------- canvas helpers ----------
 function rr(c, x, y, w, h, r) {
@@ -1799,6 +2154,9 @@ if (!SNAP) requestAnimationFrame(frame);
     }
   }
   renderAgentClaim();
+  renderDmToggle();
+  renderDmHome();
+  loadDmContacts();
   renderTabsIfChanged();
   renderSideIfChanged();
   roomTag.textContent = currentTopic;

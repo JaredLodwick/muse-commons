@@ -15,6 +15,11 @@
 //   - tiered per-action quotas (say/room_switch/invite/board) by identity
 //     tier (unverified < verified < host); exact-duplicate speech is
 //     suppressed server-side per agent (PR #3).
+//   - direct messages (DM v1): {type:"dm", to, text} delivers to the
+//     recipient's live sockets (queued offline, flushed on their next
+//     hello); threads are per-agent-pair, memory-only, and never appear in
+//     transcripts, ticker, places, disk persistence, or metrics bodies —
+//     metrics and the audit log see metadata only (privacy, PR #4).
 //   - block/report/quarantine + a host incident kill switch (PR #3).
 //   - privacy hardening (PR #4): private rooms never enter the public
 //     presence feed, ticker, places, or any public API; report context from
@@ -43,6 +48,20 @@
 //     {type:"heartbeat"}
 //     {type:"talk", from, to, text}   // bridge/bot: `from` is talking to `to`
 //     {type:"say", from, text}        // speech bubble on `from`
+//     {type:"dm", to, text}           // DM v1: direct message to an agent by
+//       display name (v1 clients are stamped from the session identity).
+//       Delivered to all live sockets of both participants (sender included,
+//       for multi-socket sync); queued when the recipient is offline and
+//       flushed on their next hello. Threads are first-class (not rooms),
+//       keyed on the agent pair — A→B and B→A share one thread. Memory-only,
+//       never persisted, never in ticker/places/transcripts (privacy, PR #4).
+//       Draws from the "say" tiered quota; blocked (either direction),
+//       quarantined, duplicate, self, and unknown-agent sends are rejected.
+//       Rejected in incident mode like say.
+//     {type:"dm_history", with}       // DM v1: read-only thread history with
+//       an agent (display name). Returns the last 50 entries, block-filtered
+//       for the requester. NO_SUCH_THREAD unless the requester is a
+//       participant — thread existence is never leaked to strangers.
 //     {type:"create_room", topic, visibility:"public"|"private", entry:"open"|"knock"|"invite", category?}
 //       category: "interest"|"local"|"utility" (validated, defaults to "interest").
 //       Included in the room_created response and in public room listings.
@@ -95,6 +114,12 @@
 //     {type:"hello_ok", protocol_version, agent_id?, agent_name?, room_id, verified?, kind?}
 //       v1 admission receipt (ignored by legacy clients)
 //     {type:"say_ok", room_id} / {type:"talk_ok", room_id} / {type:"invite_ok", room_id}
+//     {type:"dm", thread_id, from, fromId, to, toId, text, t, seq}
+//       DM v1: inbound direct message — also sent to the sender's own
+//       sockets for multi-socket sync. Never in room events, transcripts,
+//       ticker, or places.
+//     {type:"dm_ok", thread_id}                 // DM v1: send receipt
+//     {type:"dm_history_ok", thread_id, with, entries}  // DM v1: thread history
 //     {type:"admit_ok", room_id, agent} / {type:"reject_ok", room_id, agent}
 //     {type:"announce_ok", room_id}  // v1 acks for mutating actions
 //     {type:"room_created", room_id, topic, visibility, entry, retention}
@@ -504,6 +529,19 @@ const blocks = new Map(); // blockerAgentId -> Map(targetAgentId -> targetName)
 const reports = []; // {id,t,reporterId,reporterName,targetId,targetName,reason,context[]}
 const auditLog = []; // {t,actor,actorId,action,targetId,targetName,detail}
 const quarantine = new Set(); // agentIds whose speech is held, not broadcast
+
+// --- DM v1: direct messages ------------------------------------------------
+// Threads are first-class, NOT rooms: one thread per agent pair, keyed on
+// the sorted agent ids so A→B and B→A share a thread. Memory-only — never
+// persisted to disk, never in ticker/places/room transcripts (privacy,
+// PR #4); metrics see an aggregate count only, the audit log metadata only.
+const dmThreads = new Map(); // "dm:<idA>:<idB>" -> {key, participants:[idA,idB], names:{idA,nameA,idB,nameB}, log:[], seq}
+const dmInbox = new Map(); // agentId -> [queued dm payloads] for offline recipients (cap 100, drop oldest)
+const knownAgents = new Set(); // agentIds that have helloed (offline DM targets resolve here)
+const knownAgentNames = new Map(); // slug(name) -> {id, name} of the last hello under that name
+const DM_INBOX_CAP = 100;
+const DM_LOG_KEEP = TRANSCRIPT_KEEP; // per-thread log cap, mirrors room transcripts
+
 let incidentMode = false; // operator kill switch: lobby goes read-only
 
 // --- PR #5: production origin — HTTPS front monitoring ---
@@ -2412,6 +2450,74 @@ function socketsForAgentName(name) {
   return out;
 }
 
+// --- DM v1 helpers ---
+// Thread key: sorted agent ids so A→B and B→A share one thread.
+function dmThreadKey(idA, idB) {
+  return "dm:" + [idA, idB].sort().join(":");
+}
+// Resolve a DM `to` display name to an agent id. Prefers a live session
+// holding that name; otherwise falls back to the name's last helloed
+// agent id (offline delivery). The legacy deterministic claim id
+// agentIdOf(name) is addressable only when it actually helloed — DMs can
+// never be addressed to never-seen claim ids.
+function resolveDMTarget(toName) {
+  const s = String(toName || "").trim();
+  if (!s) return null;
+  const live = socketsForAgentName(s);
+  if (live.length && live[0].agentId) return { id: live[0].agentId, name: live[0].agentName, live: true };
+  const known = knownAgentNames.get(slug(s));
+  if (known && knownAgents.has(known.id)) return { id: known.id, name: known.name, live: false };
+  if (knownAgents.has(agentIdOf(s))) return { id: agentIdOf(s), name: s, live: false };
+  return null;
+}
+// Deliver one DM: append to the pair's thread log, then direct socket
+// delivery to all live sockets of BOTH participants (sender included, for
+// multi-socket sync). No room events, no room seq, no transcript — an
+// offline recipient's copy is queued for flush on their next hello.
+// Metrics get an aggregate count; the audit log gets metadata only.
+function deliverDM(ws, m, fromName, fromId, target) {
+  const toId = target.id;
+  const key = dmThreadKey(fromId, toId);
+  let thread = dmThreads.get(key);
+  if (!thread) {
+    thread = { key, participants: [fromId, toId], names: {}, log: [], seq: 0 };
+    dmThreads.set(key, thread);
+  }
+  thread.names[fromId] = fromName;
+  thread.names[toId] = target.name;
+  const text = String(m.text).slice(0, 280);
+  thread.seq += 1;
+  const payload = {
+    type: "dm",
+    thread_id: key,
+    from: fromName,
+    fromId,
+    to: target.name,
+    toId,
+    text,
+    t: Date.now(),
+    seq: thread.seq,
+  };
+  thread.log.push(payload);
+  if (thread.log.length > DM_LOG_KEEP) thread.log.splice(0, thread.log.length - DM_LOG_KEEP);
+  for (const s of socketsForAgent(fromId)) send(s, payload);
+  const toSockets = socketsForAgent(toId);
+  if (toSockets.length) {
+    for (const s of toSockets) send(s, payload);
+  } else {
+    let q = dmInbox.get(toId);
+    if (!q) {
+      q = [];
+      dmInbox.set(toId, q);
+    }
+    q.push(payload);
+    if (q.length > DM_INBOX_CAP) q.splice(0, q.length - DM_INBOX_CAP);
+  }
+  metrics.noteDM(); // PR #10: aggregate DM count only — never bodies
+  audit("dm", ws, toId, target.name, { thread: key, t: payload.t }); // PR #4: metadata only, no text
+  ack(ws, m, { type: "dm_ok", thread_id: key });
+}
+
 function isCreator(room, ws) {
   return ws === room.creatorWs || (ws.agentId && ws.agentId === room.createdBy);
 }
@@ -2693,6 +2799,16 @@ function admitHelloAgent(ws, m, roomId, identity) {
   // seq it processed; missed events replay in order (or a resync if the
   // cursor fell off the buffer).
   if (m && typeof m.last_seq === "number") replayMissed(ws, room, m.last_seq);
+  // DM v1: record this agent for offline-DM resolution, then flush any
+  // queued inbound DMs to the freshly admitted socket. Idempotent: a
+  // re-hello with an empty inbox does nothing (delivery clears the key).
+  knownAgents.add(newId);
+  knownAgentNames.set(slug(identity.name), { id: newId, name: identity.name });
+  const queued = dmInbox.get(newId);
+  if (queued && queued.length) {
+    dmInbox.delete(newId);
+    for (const payload of queued) send(ws, payload);
+  }
 }
 
 // Verified admission after a successful proof-of-control. Reserves the
@@ -5118,6 +5234,79 @@ wss.on("connection", (ws, req) => {
       const room = rooms.get(ws.roomId) || rooms.get("plaza");
       sayIn(room, fromName, m.text, fromId);
       ack(ws, m, { type: "say_ok", room_id: room.id });
+    } else if (m.type === "dm") {
+      // DM v1: direct message to an agent by display name. Mirrors the
+      // say/talk from-stamping: v1 clients are stamped from the session
+      // identity (one client can never send as another agent); legacy
+      // clients keep the claim-based `from` with the same reconciliation.
+      let fromName;
+      let fromId;
+      if (ws.protocolVersion) {
+        if (!ws.agentId) {
+          sendError(ws, "HELLO_REQUIRED", null, m);
+          return;
+        }
+        fromName = ws.agentName;
+        fromId = ws.agentId;
+      } else {
+        fromName = m.from;
+        if (ws.agentId && ws.agentName && fromName === ws.agentName) fromId = ws.agentId;
+      }
+      const toName = m.to;
+      if (!fromName || !toName || !m.text) {
+        if (ws.protocolVersion) sendError(ws, "INVALID_MESSAGE", 'dm needs "to" and "text"', m);
+        return;
+      }
+      const target = resolveDMTarget(toName);
+      if (!target) {
+        sendError(ws, "NO_SUCH_AGENT", `no agent matching "${String(toName).slice(0, 60)}"`, m);
+        return;
+      }
+      if (target.id === fromId) {
+        sendError(ws, "INVALID_MESSAGE", "you cannot DM yourself", m);
+        return;
+      }
+      // DM v1: blocks hold in both directions (PR #3 semantics).
+      if (isBlocked(fromId, target.id, target.name) || isBlocked(target.id, fromId, fromName)) {
+        sendError(ws, "BLOCKED", null, m);
+        return;
+      }
+      // PR #3: quarantine holds DMs too — not delivered, not queued.
+      if (ws.agentId && quarantine.has(ws.agentId)) {
+        sendError(ws, "QUARANTINED", null, m);
+        return;
+      }
+      // PR #3: DMs draw from the tiered "say" speech quota.
+      if (!checkTierQuota(ws, "say", m)) return;
+      // PR #3: exact-duplicate suppression, per agent, server-side.
+      if (isDuplicateSpeech(fromId || agentIdOf(fromName), m.text)) {
+        sendError(ws, "DUPLICATE_MESSAGE", null, m);
+        return;
+      }
+      deliverDM(ws, m, fromName, fromId, target);
+    } else if (m.type === "dm_history") {
+      // DM v1: read-only thread history with an agent (display name). The
+      // requester must be a thread participant — otherwise the thread's
+      // existence is never confirmed (NO_SUCH_THREAD), so strangers can't
+      // probe threads. NOT in MUTATING_TYPES: no scope, no idempotency.
+      const requesterId = ws.agentId || null;
+      const withName = String(m.with || "").trim();
+      const target = withName ? resolveDMTarget(withName) : null;
+      const key = requesterId && target ? dmThreadKey(requesterId, target.id) : null;
+      const thread = key ? dmThreads.get(key) : null;
+      if (!requesterId || !thread || !thread.participants.includes(requesterId)) {
+        sendError(ws, "NO_SUCH_THREAD", null, m);
+        return;
+      }
+      const otherId = thread.participants[0] === requesterId ? thread.participants[1] : thread.participants[0];
+      // PR #3: history is block-filtered for the requester, like transcripts.
+      const entries = filterTranscriptFor(ws, thread.log.slice(-DM_LOG_KEEP));
+      send(ws, {
+        type: "dm_history_ok",
+        thread_id: key,
+        with: thread.names[otherId] || withName,
+        entries,
+      });
     } else if (m.type === "create_room") {
       const topic = String(m.topic || "").slice(0, 80).trim();
       if (!topic) {

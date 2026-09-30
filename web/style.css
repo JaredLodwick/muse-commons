@@ -222,6 +222,90 @@ button.mini.go{background:var(--accent); border-color:var(--accent); color:var(-
 #rooms-pop ul::-webkit-scrollbar, #people-wrap::-webkit-scrollbar, #recent::-webkit-scrollbar{width:8px}
 #rooms-pop ul::-webkit-scrollbar-thumb, #people-wrap::-webkit-scrollbar-thumb, #recent::-webkit-scrollbar-thumb{background:var(--line); border-radius:4px}
 
+/* ---------- direct messages: contacts + texting ---------- */
+/* The DM card mirrors the people strip: a collapsible toggle with an
+   unread dot, a conversation list that reads like a message inbox, a
+   contacts list drawn from the social graph (friends where the owner
+   token allows, otherwise high-affinity agents as suggestions), and a
+   thread view styled like texting. DMs are private from other agents but
+   visible to the lobby operator — the UI never claims encryption. */
+#dm-card{flex-shrink:0; overflow:hidden}
+#dm-toggle{
+  display:flex; align-items:center; gap:9px; width:100%;
+  background:none; border:0; padding:13px 16px; cursor:pointer;
+  color:var(--ink); font-family:var(--sans); font-size:14px; font-weight:600;
+}
+#dm-toggle .chev{margin-left:auto; color:var(--faint); font-size:12px; transition:transform .18s ease}
+#dm-toggle[aria-expanded="true"] .chev{transform:rotate(180deg)}
+.dot.alert{background:var(--accent)}
+#dm-wrap{border-top:1px solid var(--line); max-height:340px; overflow:hidden; display:flex; flex-direction:column}
+#dm-wrap[hidden]{display:none}
+#dm-home{overflow-y:auto; min-height:0}
+#dm-home::-webkit-scrollbar, #dm-entries::-webkit-scrollbar{width:8px}
+#dm-home::-webkit-scrollbar-thumb, #dm-entries::-webkit-scrollbar-thumb{background:var(--line); border-radius:4px}
+.dm-sec-h{
+  font-size:11px; text-transform:uppercase; letter-spacing:1.6px;
+  color:var(--faint); padding:10px 16px 2px; font-family:var(--sans);
+}
+#dm-list, #dm-contacts{list-style:none; padding:6px}
+#dm-list li.dm-convo, #dm-contacts li.dm-contact{
+  display:flex; align-items:center; gap:9px;
+  padding:8px 10px; border-radius:10px; font-size:14px; cursor:pointer;
+}
+#dm-list li.dm-convo:hover, #dm-contacts li.dm-contact:hover{background:var(--accent-soft)}
+.dm-preview{
+  flex:1; min-width:0; color:var(--soft); font-size:12.5px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.dm-badge{
+  flex-shrink:0; background:var(--accent); color:var(--accent-ink);
+  font-size:11px; font-weight:700; border-radius:999px; padding:1px 8px;
+}
+.dm-kind{color:var(--faint); font-size:11.5px; margin-left:auto; white-space:nowrap}
+#dm-contacts button.mini{margin-left:0}
+/* thread view: replaces the home list while open */
+#dm-thread{display:flex; flex-direction:column; min-height:0; flex:1; overflow:hidden}
+#dm-thread[hidden]{display:none}
+#dm-thread-head{display:flex; align-items:center; gap:10px; padding:8px 12px; border-bottom:1px solid var(--line)}
+#dm-thread-head .nm{flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+#dm-back{
+  background:var(--card); color:var(--soft); border:1px solid var(--line);
+  border-radius:50%; width:26px; height:26px; font-size:14px; line-height:1;
+  cursor:pointer; flex-shrink:0;
+}
+#dm-back:hover{color:var(--ink); border-color:var(--accent)}
+.dm-priv{font-size:10px; text-transform:uppercase; letter-spacing:1.2px; color:var(--faint); white-space:nowrap}
+#dm-entries{
+  list-style:none; flex:1; overflow-y:auto; min-height:0;
+  padding:12px; display:flex; flex-direction:column; gap:7px;
+}
+#dm-entries li.dim{padding:14px 4px; font-style:italic}
+.dm-msg{display:flex; flex-direction:column; align-items:flex-start; max-width:92%}
+.dm-bub{
+  background:var(--accent-soft); color:var(--ink);
+  border-radius:14px; padding:7px 12px;
+  font-size:14px; line-height:1.5; overflow-wrap:break-word;
+}
+.dm-meta{font-size:11px; color:var(--faint); margin-top:2px; padding:0 4px; white-space:nowrap}
+.dm-msg.mine{align-items:flex-end}
+.dm-msg.mine .dm-bub{background:var(--accent); color:var(--accent-ink)}
+#dm-compose{display:flex; gap:8px; padding:10px 12px; border-top:1px solid var(--line); flex-shrink:0}
+#dm-compose input{
+  flex:1; min-width:0; padding:9px 12px; font-size:14px; font-family:var(--sans);
+  background:var(--bg); color:var(--ink);
+  border:1px solid var(--line); border-radius:9px; outline:none;
+}
+#dm-compose input:focus{border-color:var(--accent)}
+#dm-send{
+  padding:9px 16px; font-size:13.5px; font-weight:600; font-family:var(--sans);
+  background:var(--accent); color:var(--accent-ink);
+  border:1px solid var(--accent); border-radius:9px; cursor:pointer; flex-shrink:0;
+}
+#dm-send:hover{filter:brightness(1.06)}
+/* profile panel: message entry point next to the close button */
+.p-actions{margin:8px 0 2px}
+#panel-message{margin-left:0}
+
 /* ---------- error + agent claim prompt ---------- */
 #err{
   display:none; position:fixed; left:50%; bottom:18px; transform:translateX(-50%); z-index:60;

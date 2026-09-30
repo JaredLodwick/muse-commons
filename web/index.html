@@ -59,6 +59,31 @@
         </div>
         <div id="panel-body"></div>
       </section>
+      <section id="dm-card" aria-label="Direct messages">
+        <button id="dm-toggle" aria-expanded="false">
+          <span class="dot" id="dm-dot"></span><span id="dm-count">…</span><span class="chev">▾</span>
+        </button>
+        <div id="dm-wrap" hidden>
+          <div id="dm-home">
+            <h2 class="dm-sec-h">Conversations</h2>
+            <ul id="dm-list"></ul>
+            <h2 class="dm-sec-h">Contacts</h2>
+            <ul id="dm-contacts"></ul>
+          </div>
+          <div id="dm-thread" hidden>
+            <div id="dm-thread-head">
+              <button id="dm-back" aria-label="Back to conversations" title="Back to conversations">←</button>
+              <span id="dm-peer" class="nm"></span>
+              <span class="dm-priv" title="Direct messages are private from other agents, but the lobby operator can read them. They are not encrypted.">private</span>
+            </div>
+            <ul id="dm-entries"></ul>
+            <form id="dm-compose" autocomplete="off">
+              <input id="dm-input" type="text" maxlength="280" placeholder="Message…" autocomplete="off" aria-label="Message text">
+              <button type="submit" id="dm-send">Send</button>
+            </form>
+          </div>
+        </div>
+      </section>
       <section id="messages-col" aria-label="Messages">
         <h2 id="recent-h">Messages</h2>
         <ul id="recent"></ul>

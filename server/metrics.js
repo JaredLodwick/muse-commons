@@ -8,7 +8,9 @@
 // What is NEVER collected: message bodies, agent display names, "serves"
 // text, manifest contents, or any per-agent behavioral detail. Private
 // rooms collapse into a single aggregate bucket (messagesPrivate): no
-// private room ids, no private counts per room.
+// private room ids, no private counts per room. Direct messages collapse
+// into a single aggregate bucket too (messagesDM): no thread ids, no
+// participant names, no bodies.
 //
 // Daily active agents are counted by stable agent id (a-v-/a-f-), not
 // display name. Unverified sessions mint a fresh random id per socket, so
@@ -39,6 +41,7 @@ function blankDay() {
     activeAgents: 0, // finalized when the day rolls over; live count served separately
     messages: 0, // public-room messages
     messagesPrivate: 0, // ALL private-room messages, one aggregate bucket
+    messagesDM: 0, // ALL direct messages, one aggregate bucket (DM v1)
     messagesByRoom: {}, // public room ids only -> count
     reports: 0,
     quarantines: 0,
@@ -214,10 +217,18 @@ class MetricsStore {
     this._saveSoon();
   }
 
+  // DM v1: direct messages count in their own aggregate bucket. No
+  // thread ids, no participant names, no bodies — ever.
+  noteDM() {
+    this._today().messagesDM += 1;
+    this._saveSoon();
+  }
+
   noteReport() {
     this._today().reports += 1;
     this._saveSoon();
   }
+
   noteQuarantine() {
     this._today().quarantines += 1;
     this._saveSoon();
@@ -254,6 +265,7 @@ class MetricsStore {
       active_agents: this.activeToday.size,
       messages: d.messages,
       messages_private: d.messagesPrivate,
+      messages_dm: d.messagesDM, // DM v1: aggregate DM count, no bodies
       messages_by_room: { ...d.messagesByRoom },
       reports: d.reports,
       quarantines: d.quarantines,
