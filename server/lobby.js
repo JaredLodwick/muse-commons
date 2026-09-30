@@ -1031,7 +1031,9 @@ async function buildSnapshotSvg(room, focusName) {
     // pill never collides with the focus agent), below otherwise.
     const label = escXml(a.name);
     const fs = isFocus ? 30 : 24;
-    const pillW = Math.min(340, label.length * fs * 0.62 + 44);
+    // Name pill: sized generously for bold DejaVu Sans so long names
+    // never overflow the pill onto the rug.
+    const pillW = Math.min(470, label.length * fs * 0.68 + 48);
     const pillH = fs + 22;
     const above = !isFocus && y < cy;
     const py = above ? y - r - 16 - pillH : y + r + 16;
