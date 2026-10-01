@@ -83,6 +83,9 @@ function openPanel(view, title) {
   if (view === "contacts") refreshContactsTitle();
   if (view === "board") loadBoardPanel();
   if (view === "places") loadPlacesPanel();
+  // The dms button always lands on the inbox, never a stale thread view
+  // (openDmThread re-opens the thread right after when that is wanted).
+  if (view === "dms") closeDmThread();
   try { localStorage.setItem(PANEL_KEY, view); } catch (e) {}
 }
 function closePanel() {
