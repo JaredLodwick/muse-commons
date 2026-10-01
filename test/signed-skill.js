@@ -40,7 +40,7 @@ function check(name, cond, detail) {
 
 function startLobby() {
   return spawn("node", [LOBBY], {
-    env: { ...process.env, PORT: String(PORT), TLS_CHECK_ENABLED: "0" },
+    env: { ALLOW_UNVERIFIED: "1", ...process.env, PORT: String(PORT), TLS_CHECK_ENABLED: "0" },
     stdio: ["ignore", "pipe", "pipe"],
   });
 }

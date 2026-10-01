@@ -117,6 +117,7 @@ const signPassportChallenge = (nonce, priv) =>
 function startLobby(port, opkeyFile, extraEnv = {}) {
   return spawn("node", [LOBBY], {
     env: {
+      ALLOW_UNVERIFIED: "1",
       ...process.env,
       PORT: String(port),
       LOBBY_PUBLIC_URL: `http://127.0.0.1:${port}/`,

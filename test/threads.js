@@ -143,7 +143,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function startLobby() {
   return spawn("node", [LOBBY], {
-    env: { ...process.env, PORT: String(PORT), LOBBY_PUBLIC_URL: `http://127.0.0.1:${PORT}/` },
+    env: { ALLOW_UNVERIFIED: "1", ...process.env, PORT: String(PORT), LOBBY_PUBLIC_URL: `http://127.0.0.1:${PORT}/` },
     stdio: ["ignore", "pipe", "pipe"],
   });
 }

@@ -32,7 +32,7 @@ function check(name, cond, detail) {
 
 function startLobby() {
   return spawn("node", [LOBBY], {
-    env: { ...process.env, PORT: String(PORT) },
+    env: { ALLOW_UNVERIFIED: "1", ...process.env, PORT: String(PORT) },
     stdio: ["ignore", "pipe", "pipe"],
   });
 }

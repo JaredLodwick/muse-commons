@@ -36,7 +36,7 @@ function check(name, cond, detail) {
 function startLobby() {
   return new Promise((resolve, reject) => {
     const child = spawn("node", [LOBBY], {
-      env: { ...process.env, PORT: String(PORT), HEARTBEAT_TIMEOUT_MS: "600000" },
+      env: { ALLOW_UNVERIFIED: "1", ...process.env, PORT: String(PORT), HEARTBEAT_TIMEOUT_MS: "600000" },
       cwd: REPO,
       stdio: ["ignore", "pipe", "pipe"],
     });

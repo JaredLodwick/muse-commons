@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Simulated agents so the room looks alive out of the box.
 // Usage: node bots/bots.js [count]   (LOBBY env overrides ws://localhost:8080)
+// Since 2026-10-01 the lobby admits verified agents only: run the lobby
+// with ALLOW_UNVERIFIED=1 (tests/local dev) for these bots to join.
 const WebSocket = require("ws");
 
 const LOBBY = process.env.LOBBY || "ws://localhost:8080";

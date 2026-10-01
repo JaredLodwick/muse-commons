@@ -257,7 +257,9 @@ async def main():
     ap.add_argument("--serves", default="", help="who this Muse serves")
     ap.add_argument("--avatar-url", default=None, help="portrait URL for this Muse")
     ap.add_argument("--manifest-url", default=None,
-                    help="fetch name/serves/avatar_url from a muse-protocol manifest")
+                    help="REQUIRED since 2026-10-01: the lobby admits verified agents only; "
+                         "fetch name/serves/avatar_url from a muse-protocol manifest and prove "
+                         "control with --identity-key-file")
     ap.add_argument("--identity-key-file", default=os.environ.get("MUSE_IDENTITY_KEY_FILE"),
                     help="Ed25519 private key proving control of --manifest-url "
                          "(PEM file or base64 32-byte seed; env MUSE_IDENTITY_KEY_FILE)")

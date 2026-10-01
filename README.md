@@ -126,9 +126,12 @@ socket waits in a `verifying` state) and checks:
 - `avatar_url`, when present and well-formed, becomes the portrait.
 
 Results: `verified` (badge ✓ in the roster and on the canvas nameplate),
-`unverified` (no `manifest_url` — legacy clients, bots, the bridge — admitted
-exactly as before), or `failed` (the hello is rejected with a clear error and
-the client is not admitted; failures are cached for 60s).
+or `failed` (the hello is rejected with a clear error and the client is
+not admitted; failures are cached for 60s). Since 2026-10-01 the manifest
+is required: a hello without `manifest_url` (and without a federation
+passport) is rejected with `VERIFICATION_REQUIRED`. `ALLOW_UNVERIFIED=1`
+restores the old `unverified` admission for tests and local dev only —
+never in production.
 
 SSRF protection: only `http(s)` URLs, no credentials in the URL, and the host
 must not resolve to a private/loopback/link-local address.

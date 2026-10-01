@@ -16,6 +16,7 @@ const REPO = path.join(__dirname, "..");
 const LOBBY = path.join(REPO, "server", "lobby.js");
 const PORT1 = 18771; // MANIFEST_ALLOW_PRIVATE=1 (fixture manifests are loopback)
 const PORT2 = 18772; // strict SSRF (no private IPs)
+const PORT3 = 18773; // production entry policy (no ALLOW_UNVERIFIED)
 const FIXTURE_PORT = 18770;
 
 // PR #2: the fixture manifests carry a real Ed25519 identity key so the
@@ -85,7 +86,7 @@ const fixture = http.createServer((req, res) => {
 
 function startLobby(port, extraEnv = {}) {
   const child = spawn("node", [LOBBY], {
-    env: { ...process.env, PORT: String(port), ...extraEnv },
+    env: { ALLOW_UNVERIFIED: "1", ...process.env, PORT: String(port), ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"],
   });
   return child;
@@ -190,8 +191,16 @@ async function main() {
     LOBBY_PUBLIC_URL: `http://127.0.0.1:${PORT1}/`,
   });
   const s2 = startLobby(PORT2, { LOBBY_PUBLIC_URL: `http://127.0.0.1:${PORT2}/` });
+  // Production entry policy: override the test default to disable the
+  // ALLOW_UNVERIFIED hatch (verified-only door).
+  const s3 = startLobby(PORT3, {
+    LOBBY_PUBLIC_URL: `http://127.0.0.1:${PORT3}/`,
+    ALLOW_UNVERIFIED: "",
+    MANIFEST_ALLOW_PRIVATE: "1", // fixture manifests are loopback
+  });
   await waitForListening(s1, PORT1);
   await waitForListening(s2, PORT2);
+  await waitForListening(s3, PORT3);
   const fix = (p) => `http://127.0.0.1:${FIXTURE_PORT}${p}`;
 
   console.log("manifest verification");
@@ -255,6 +264,22 @@ async function main() {
   });
   check("non-http(s) manifest_url rejected", !r.ok && /http\(s\)/.test(r.error || ""), r.error);
 
+  // 9. verified-only entry (production policy, no ALLOW_UNVERIFIED):
+  //    agent hello without manifest_url -> VERIFICATION_REQUIRED
+  console.log("verified-only entry policy");
+  r = await helloAndWait(PORT3, { type: "hello", name: "NoIdMuse", serves: "Nobody" });
+  check("no-manifest hello rejected", !r.ok && r.code === "VERIFICATION_REQUIRED", r.code || r.error);
+  // ...but a viewer subscription still works (read-only, never an agent)
+  const vst = await viewerState(PORT3);
+  check("viewer hello still admitted", vst.ok, JSON.stringify(vst).slice(0, 120));
+  // ...and a manifest hello still verifies on the strict server
+  // (nolobbies fixture: the lobby-allowlist check is optional)
+  r = await helloAndWait(PORT3, {
+    type: "hello", name: "NoLobbyMuse", manifest_url: fix("/nolobbies/.well-known/muse-protocol.json"),
+  });
+  check("manifest hello admitted on strict server", r.ok && r.agent.verified === "verified",
+    (r.agent && r.agent.verified) || r.error);
+
   console.log("ssrf protection (strict server, no MANIFEST_ALLOW_PRIVATE)");
   const hitsBeforePrivate = fixtureHits;
   r = await helloAndWait(PORT2, {
@@ -293,6 +318,7 @@ async function main() {
   fixture.close();
   s1.kill();
   s2.kill();
+  s3.kill();
   console.log(failures ? `\n${failures} FAILURE(S)` : "\nALL PASS");
   process.exit(failures ? 1 : 0);
 }

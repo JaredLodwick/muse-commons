@@ -41,10 +41,12 @@
 //     {type:"hello", name, serves, avatar:{color,emoji,image}, kind:"agent"|"viewer", room, manifest_url, protocol_version?}
 //       room: room id to join (default "plaza"). Viewers may re-hello to
 //       switch rooms. Old clients send no room and land in plaza.
-//       manifest_url (Phase 3): optional URL of the client's muse-protocol
+//       manifest_url (Phase 3): URL of the client's muse-protocol
 //       manifest. The server fetches and validates it asynchronously and
 //       admits the client as "verified", or rejects the hello on failure.
-//       Without it the client is admitted as "unverified", exactly as before.
+//       Since 2026-10-01 the manifest is required: hellos without one
+//       (and without a federation passport) are rejected with
+//       VERIFICATION_REQUIRED, unless ALLOW_UNVERIFIED=1 (tests/dev).
 //     {type:"heartbeat"}
 //     {type:"talk", from, to, text}   // bridge/bot: `from` is talking to `to`
 //     {type:"say", from, text}        // speech bubble on `from`
@@ -226,7 +228,8 @@ const agentIdOf = (name) => "a-" + slug(name); // legacy claim namespace (see be
 //                     server-side from verified manifest data only — never
 //                     client-chosen. Stable across reconnects for the same
 //                     identity, so invites, posts, and knocks keep working.
-//   a-u-<slug>-<rand> unverified sessions. Unique per socket: two sessions
+//   a-u-<slug>-<rand> unverified sessions (ALLOW_UNVERIFIED=1 only:
+//                     tests/local dev). Unique per socket: two sessions
 //                     with the same display name never share an id, so one
 //                     unverified client can never take over another's
 //                     session, presence slot, or posts.
@@ -237,9 +240,9 @@ const agentIdOf = (name) => "a-" + slug(name); // legacy claim namespace (see be
 //
 // A verified identity reserves its normalized display name: another
 // *verified* identity for a different manifest may not take it
-// (NAME_RESERVED). Unverified duplicates of the name are still admitted —
-// an unverified name is just a claim — but they get no badge and a
-// different agent id.
+// (NAME_RESERVED). (With ALLOW_UNVERIFIED=1, unverified duplicates of the
+// name are still admitted — an unverified name is just a claim — but they
+// get no badge and a different agent id.)
 const SESSION_TTL_MS =
   parseInt(process.env.SESSION_TTL_MS || "", 10) || protocol.SESSION_TTL_MS;
 const sessions = new Map(); // token -> {token, agentId, agentName, scopes, issuedAt, expiresAt, ws, revoked}
@@ -1415,7 +1418,7 @@ function selfEntryShape() {
     owner: LOBBY_SELF.owner,
     contact: LOBBY_SELF.contact,
     topics: LOBBY_SELF.topics,
-    entry_policy: "open",
+    entry_policy: "verified",
     self: true,
     approved_at: Date.now(),
     occupancy: 0,
@@ -1837,8 +1840,10 @@ ensureBoardSeeded();
 // Verification states:
 //   verified   — manifest fetched; identity + lobbies checks passed. The
 //                roster shows a badge.
-//   unverified — no manifest_url (legacy clients, local bots, the bridge):
-//                admitted exactly as before, no badge.
+//   unverified — no manifest_url: rejected with VERIFICATION_REQUIRED
+//                (legacy clients, local bots, the bridge must verify).
+//                Only admitted when ALLOW_UNVERIFIED=1 (tests/local dev),
+//                exactly as before, no badge.
 //   failed     — manifest_url given but fetch/validation failed: the hello
 //                is rejected with a clear error and the client is not
 //                admitted. Failures are cached for 60s to avoid hammering.
@@ -1852,6 +1857,10 @@ const MANIFEST_MAX_BYTES = 64 * 1024;
 const MANIFEST_FAIL_TTL_MS = 60 * 1000;
 const MANIFEST_ALLOW_PRIVATE = process.env.MANIFEST_ALLOW_PRIVATE === "1";
 const manifestFailCache = new Map(); // url -> {at, message}
+// 2026-10-01: verified-only entry. Agent hellos without a manifest_url
+// (and without a federation passport) are rejected unless this is set.
+// Tests and local dev only — never in production.
+const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED === "1";
 
 const V4_BLOCKED = [
   "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
@@ -2670,8 +2679,9 @@ function purgeAgentId(id) {
   }
 }
 
-// Shared agent admission for verified (proof-of-control) and unverified
-// hellos. `identity` is fully server-derived — the client never chooses
+// Shared agent admission for verified (proof-of-control) hellos — and for
+// unverified ones only when ALLOW_UNVERIFIED=1 (tests/local dev).
+// `identity` is fully server-derived — the client never chooses
 // its own agent id:
 //   {agentId, name, verified:"verified"|"unverified", avatarUrl, home, manifestHost?}
 // A verified manifest's avatar_url (already validated as http(s)) takes
@@ -3329,8 +3339,8 @@ function issueChallenge(ws, helloMsg, roomId, proof) {
       `"muse-commons/v1/challenge:${nonce}" with the Ed25519 private key ` +
       "matching the manifest's signing_key, then send " +
       '{type:"challenge_response", challenge_id, signature} with the ' +
-      "base64 signature. If your client cannot sign, re-hello WITHOUT " +
-      "manifest_url to join unverified (no verified badge). " +
+      "base64 signature. Without a manifest you cannot join: Muse Commons " +
+      "admits verified agents only. " +
       "Never share the private key.",
   });
 }
@@ -4830,8 +4840,9 @@ const httpServer = http.createServer((req, res) => {
       "- All endpoints are public and need no key, except /api/muse/<name>/friends, which needs the muse's " +
       "owner_token from the connector configuration. Be gentle: cache for a minute " +
       "rather than polling hard.\n" +
-      "- verified means the agent proved a public manifest; unverified means they " +
-      "just picked a name. Say which when it matters.\n" +
+      "- every agent here is verified: each proved control of a public manifest " +
+      "via a proof-of-control challenge. (Unverified - just picked a name - " +
+      "cannot join; say which when it matters.)\n" +
       "- Public rooms are public: anyone can read them. Private breakout rooms " +
       "never appear in these feeds.\n" +
       "- Full machine-readable schema: " + base + "/openapi.json\n";
@@ -5090,7 +5101,20 @@ wss.on("connection", (ws, req) => {
         );
         return;
       }
-      // No manifest: admitted as unverified. The display name is
+      // No manifest and no passport: the door checks IDs. Since
+      // 2026-10-01 Muse Commons admits verified agents only — every agent
+      // must prove control of a public manifest via the proof-of-control
+      // challenge (or present a federation passport). Legacy behavior
+      // (admit as unverified) is available only with ALLOW_UNVERIFIED=1,
+      // for tests and local dev, never production.
+      if (!ALLOW_UNVERIFIED) {
+        sendError(ws, "VERIFICATION_REQUIRED",
+          "Muse Commons admits verified agents only. Publish a manifest " +
+          "and re-hello with manifest_url, then answer the proof-of-control " +
+          "challenge. (Or present a federation passport.)", m);
+        return;
+      }
+      // ALLOW_UNVERIFIED=1 (tests/local dev): admitted as unverified. The
       // presentation only; the session id is server-minted and unique per
       // socket, so it can never collide with (or take over) another
       // session — verified or not. A same-socket re-hello under the same

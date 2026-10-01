@@ -163,7 +163,7 @@ function startLobby(env) {
   const child = spawn("node", ["server/lobby.js"], {
     cwd: path.join(__dirname, ".."),
     // MANIFEST_ALLOW_PRIVATE: the fixture manifests live on 127.0.0.1.
-    env: { ...process.env, PORT: String(PORT), MANIFEST_ALLOW_PRIVATE: "1", ...env },
+    env: { ALLOW_UNVERIFIED: "1", ...process.env, PORT: String(PORT), MANIFEST_ALLOW_PRIVATE: "1", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
   return child;

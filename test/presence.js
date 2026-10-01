@@ -32,6 +32,7 @@ function check(name, cond, detail) {
 function startLobby() {
   return spawn("node", [LOBBY], {
     env: {
+      ALLOW_UNVERIFIED: "1",
       ...process.env,
       PORT: String(PORT),
       HEARTBEAT_TIMEOUT_MS: "2000",

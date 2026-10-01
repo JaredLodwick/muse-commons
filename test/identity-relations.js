@@ -83,6 +83,7 @@ const fixture = http.createServer((req, res) => {
 function startLobby(port) {
   return spawn("node", [LOBBY], {
     env: {
+      ALLOW_UNVERIFIED: "1",
       ...process.env,
       PORT: String(port),
       MANIFEST_ALLOW_PRIVATE: "1",

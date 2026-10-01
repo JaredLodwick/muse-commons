@@ -82,6 +82,7 @@ let lobby = null;
 function startLobby() {
   lobby = spawn("node", [LOBBY], {
     env: {
+      ALLOW_UNVERIFIED: "1",
       ...process.env,
       PORT: String(PORT),
       LOBBY_PUBLIC_URL: `http://127.0.0.1:${PORT}/`,

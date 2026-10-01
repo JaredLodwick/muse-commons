@@ -40,6 +40,7 @@ function check(name, cond, detail) {
 function startLobby(extraEnv) {
   return spawn("node", [LOBBY], {
     env: {
+      ALLOW_UNVERIFIED: "1",
       ...process.env,
       PORT: String(PORT),
       PUBLIC_BASE_URL: BASE,
