@@ -110,17 +110,14 @@ function refreshContactsTitle() {
   panelTitleEl.textContent = "People · " + n + (n === 1 ? " online" : " online");
 }
 
-// --- rooms popover: compact directory fallback next to the doorways ---
-const roomsBtn = document.getElementById("rooms-btn");
+// --- rooms popover (invites + knock requests) ---
+// Design 2026-09-30: the Rooms button was removed from the places panel,
+// so this popover currently has no trigger. Kept with its render logic so
+// invites/knocks have a surface to return to.
 const roomsPop = document.getElementById("rooms-pop");
 function setRoomsPop(open) {
   roomsPop.hidden = !open;
-  roomsBtn.setAttribute("aria-expanded", open ? "true" : "false");
 }
-roomsBtn.onclick = (e) => { e.stopPropagation(); setRoomsPop(roomsPop.hidden); };
-document.addEventListener("click", (e) => {
-  if (!roomsPop.hidden && !roomsPop.contains(e.target) && e.target !== roomsBtn) setRoomsPop(false);
-});
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !roomsPop.hidden) setRoomsPop(false);
 });
