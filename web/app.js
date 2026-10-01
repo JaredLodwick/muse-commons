@@ -8,16 +8,9 @@ const sideEl = document.getElementById("side");
 const knocksEl = document.getElementById("knocks");
 const invitesEl = document.getElementById("invites");
 const recentEl = document.getElementById("recent");
-const recentH = document.getElementById("recent-h");
-const peopleH = document.getElementById("people-h");
 const errEl = document.getElementById("err");
-const roomTag = document.getElementById("room-tag");
 // DM inbox: contacts + conversations + thread view (see the DM section
 // further down; markup lives in index.html, styles in style.css).
-const dmToggle = document.getElementById("dm-toggle");
-const dmDotEl = document.getElementById("dm-dot");
-const dmCountEl = document.getElementById("dm-count");
-const dmWrap = document.getElementById("dm-wrap");
 const dmHome = document.getElementById("dm-home");
 const dmListEl = document.getElementById("dm-list");
 const dmContactsEl = document.getElementById("dm-contacts");
@@ -50,25 +43,69 @@ document.getElementById("theme-toggle").onclick = () => {
 };
 
 // --- people strip: slim collapsible roster ---
-const peopleToggle = document.getElementById("people-toggle");
-const peopleWrap = document.getElementById("people-wrap");
-const peopleCount = document.getElementById("people-count");
-const PEOPLE_KEY = "mc_people_open";
-function setPeopleOpen(open) {
-  peopleToggle.setAttribute("aria-expanded", open ? "true" : "false");
-  peopleWrap.hidden = !open;
-  try { localStorage.setItem(PEOPLE_KEY, open ? "1" : "0"); } catch (e) {}
+// --- in-room toolbar + slide-over panel: the Habbo-phone ---
+// The right-hand column is gone: the room fills the full page width and a
+// little device docked to the left edge of the room opens one slide-over
+// panel with four views — room message history, people, direct messages
+// (conversation list, then the thread), and the public agent profile.
+// Only one view is visible at a time; the toolbar button for the open view
+// is highlighted, and tapping it again closes the panel.
+const roomPanel = document.getElementById("room-panel");
+const panelTitleEl = document.getElementById("panel-title");
+const PANEL_KEY = "mc_panel";
+const panelViews = {
+  history: document.getElementById("view-history"),
+  contacts: document.getElementById("view-contacts"),
+  dms: document.getElementById("view-dms"),
+  profile: document.getElementById("view-profile"),
+  board: document.getElementById("view-board"),
+  places: document.getElementById("view-places"),
+};
+const panelButtons = {
+  history: document.getElementById("tb-chat"),
+  contacts: document.getElementById("tb-people"),
+  dms: document.getElementById("tb-dms"),
+  board: document.getElementById("tb-board"),
+  places: document.getElementById("tb-places"),
+};
+let openView = null; // 'history' | 'contacts' | 'dms' | 'profile' | 'board' | 'places'
+const panelTitles = {
+  history: "Room messages", contacts: "People", dms: "Direct messages",
+  board: "Intent board", places: "Places",
+};
+const PANEL_VIEWS = ["history", "contacts", "dms", "board", "places"];
+function openPanel(view, title) {
+  openView = view;
+  for (const [k, el] of Object.entries(panelViews)) el.hidden = k !== view;
+  for (const [k, btn] of Object.entries(panelButtons)) btn.classList.toggle("active", k === view);
+  panelTitleEl.textContent = title || panelTitles[view] || view;
+  roomPanel.hidden = false;
+  if (view === "contacts") refreshContactsTitle();
+  if (view === "board") loadBoardPanel();
+  if (view === "places") loadPlacesPanel();
+  try { localStorage.setItem(PANEL_KEY, view); } catch (e) {}
 }
-peopleToggle.onclick = () => setPeopleOpen(peopleWrap.hidden);
-(function initPeopleOpen() {
-  let open = true;
-  try {
-    const v = localStorage.getItem(PEOPLE_KEY);
-    if (v === "0") open = false;
-    else if (v === null && window.innerWidth < 1060) open = false;
-  } catch (e) { if (window.innerWidth < 1060) open = false; }
-  setPeopleOpen(open);
-})();
+function closePanel() {
+  openView = null;
+  panelAgent = null; // drop stale profile responses for a closed panel
+  roomPanel.hidden = true;
+  for (const btn of Object.values(panelButtons)) btn.classList.remove("active");
+  try { localStorage.removeItem(PANEL_KEY); } catch (e) {}
+}
+function togglePanel(view) {
+  if (openView === view && view !== "profile") closePanel();
+  else openPanel(view);
+}
+panelButtons.history.onclick = () => togglePanel("history");
+panelButtons.contacts.onclick = () => togglePanel("contacts");
+panelButtons.dms.onclick = () => togglePanel("dms");
+panelButtons.board.onclick = () => togglePanel("board");
+panelButtons.places.onclick = () => togglePanel("places");
+document.getElementById("panel-close").onclick = closePanel;
+function refreshContactsTitle() {
+  const n = agents.length;
+  panelTitleEl.textContent = "People · " + n + (n === 1 ? " online" : " online");
+}
 
 // --- rooms popover: compact directory fallback next to the doorways ---
 const roomsBtn = document.getElementById("rooms-btn");
@@ -380,7 +417,7 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "+" || e.key === "=") zoomIn();
   else if (e.key === "-" || e.key === "_") zoomOut();
   else if (e.key === "0") fitView();
-  else if (e.key === "Escape") closeAgentPanel();
+  else if (e.key === "Escape") closePanel();
 });
 
 // Snapshot mode: deterministic static layout for headless screenshots.
@@ -506,11 +543,10 @@ function switchRoom(roomId, topic) {
   currentRoom = roomId;
   if (topic) { currentTopic = topic; myRooms.set(roomId, topic); }
   else currentTopic = myRooms.get(roomId) || roomId;
-  roomTag.textContent = currentTopic;
   agents = [];
   needFit = true; // re-frame the camera on the new room's agents
   fitView(); // frame the world immediately (agents arrive with the next state)
-  // Refresh navigation highlights and re-scope the right-panel feeds now;
+  // Refresh navigation highlights and re-scope the panel feeds now;
   // the 10Hz state and 15s polls will keep them fresh afterwards.
   renderTabsIfChanged();
   renderSideIfChanged();
@@ -678,8 +714,7 @@ function scopedToRoom(list) {
 function renderRecent() {
   // Messages are inherently scoped to the room being viewed (see
   // scopedToRoom): the room name is never repeated on the messages
-  // themselves, the hanging room tag already names the context.
-  recentH.textContent = "Messages";
+  // themselves, the room pill above the room view already names the context.
   recentEl.innerHTML = "";
   const evs = scopedToRoom(chatterEvents).slice(0, 8);
   if (!evs.length) {
@@ -827,9 +862,10 @@ document.getElementById("start-breakout").onclick = () => {
 // here right now.
 function renderPeople() {
   const n = agents.length;
-  // The hanging room tag already names the room; the counts just count.
+  // The room pill above the room view already names the room; the count
+  // just counts, shown in the contacts panel title when it is open.
   countEl.textContent = n + (n === 1 ? " agent" : " agents");
-  peopleH.textContent = "People";
+  if (openView === "contacts") refreshContactsTitle();
   peopleEl.innerHTML = "";
   for (const a of agents) {
     const li = document.createElement("li");
@@ -929,11 +965,10 @@ function renderPeople() {
     li.textContent = "no one around yet";
     peopleEl.append(li);
   }
-  const total = agents.length + away.length;
-  peopleCount.textContent = total + (total === 1 ? " online" : " online");
+  if (openView === "contacts") refreshContactsTitle();
 }
 
-// --- agent profile side panel ---
+// --- agent profile in the slide-over panel ---
 // Clicking an agent in the people list or on the canvas opens their
 // PUBLIC profile in this panel: whatever buildProfile returns, which the
 // server already gates by the agent's own visibility toggles (private
@@ -942,8 +977,6 @@ function escHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
-const panelEl = document.getElementById("agent-panel");
-const panelName = document.getElementById("panel-name");
 const panelBody = document.getElementById("panel-body");
 let panelAgent = null;
 
@@ -1008,8 +1041,7 @@ function renderPanelProfile(p) {
 
 async function openAgentPanel(name) {
   panelAgent = name;
-  panelEl.hidden = false;
-  panelName.textContent = name;
+  openPanel("profile", name);
   panelBody.innerHTML = `<p class="p-status">Loading…</p>`;
   try {
     const r = await fetch(`/api/muse/${encodeURIComponent(name)}`);
@@ -1026,14 +1058,9 @@ async function openAgentPanel(name) {
     if (panelAgent === name) panelBody.innerHTML = `<p class="p-status">Could not load the profile.</p>`;
   }
 }
-function closeAgentPanel() {
-  panelAgent = null;
-  panelEl.hidden = true;
-}
-document.getElementById("panel-close").onclick = closeAgentPanel;
 
 // --- direct messages: contacts + texting ---
-// The DM inbox lives in the sidebar: a conversations list with unread
+// The DM inbox lives in the slide-over panel: a conversations list with unread
 // badges, a contacts list drawn from the social graph, and a thread view
 // styled like texting. Outbound DMs go on the plain client->server socket
 // ({type:"dm", to, text}), never via say/talk. Thread ids are stable per
@@ -1047,20 +1074,13 @@ let dmThreads = new Map(); // peerName -> {peer, entries, seqs:Set, lastSeq, unr
 let dmContacts = [];       // [{name, kind:"friend"|"suggested"}]
 let dmOpenPeer = null;     // peer with the thread pane open
 
-// Collapsible toggle, mirroring the people strip; the toggle text doubles
-// as the unread indicator when the card is collapsed.
-const DM_KEY = "mc_dm_open";
-function setDmOpen(open) {
-  dmToggle.setAttribute("aria-expanded", open ? "true" : "false");
-  dmWrap.hidden = !open;
-  try { localStorage.setItem(DM_KEY, open ? "1" : "0"); } catch (e) {}
+// Unread DMs surface as a badge on the toolbar's DMs button.
+const dmBadgeEl = document.getElementById("tb-dm-badge");
+function renderDmBadge() {
+  const u = dmTotalUnread();
+  dmBadgeEl.hidden = u === 0;
+  dmBadgeEl.textContent = u > 9 ? "9+" : String(u);
 }
-dmToggle.onclick = () => setDmOpen(dmWrap.hidden);
-(function initDmOpen() {
-  let open = false;
-  try { open = localStorage.getItem(DM_KEY) === "1"; } catch (e) {}
-  setDmOpen(open);
-})();
 
 function dmThread(peer) {
   let th = dmThreads.get(peer);
@@ -1080,6 +1100,9 @@ function dmEntryFrom(e) {
     t: e.t || 0,
     seq: typeof e.seq === "number" ? e.seq : null,
     mine: me !== "" && from === me,
+    // Viewer (claimed-name) sockets send with fromId:null; the server stamps
+    // those entries unverified:true. The UI marks them as untrusted speech.
+    unverified: !!e.unverified,
   };
 }
 // Append with per-thread seq dedupe (covers multi-socket echoes) and keep
@@ -1101,12 +1124,6 @@ function dmTotalUnread() {
   for (const th of dmThreads.values()) n += th.unread;
   return n;
 }
-function renderDmToggle() {
-  const u = dmTotalUnread(), n = dmThreads.size;
-  dmCountEl.textContent = u > 0 ? `${u} unread` : n ? `${n} conversation${n === 1 ? "" : "s"}` : "no messages yet";
-  dmDotEl.className = "dot" + (u > 0 ? " alert" : n ? " on" : "");
-}
-
 function dmConvoRow(th) {
   const li = document.createElement("li");
   li.className = "dm-convo";
@@ -1215,6 +1232,13 @@ function renderDmThread() {
     const meta = document.createElement("div");
     meta.className = "dm-meta";
     meta.textContent = (e.mine ? "you" : e.from) + (e.t ? " · " + fmtAgo(e.t) : "");
+    if (e.unverified) {
+      const uv = document.createElement("span");
+      uv.className = "dm-unv";
+      uv.textContent = "unverified";
+      uv.title = "Sent from an unverified claimed name — untrusted speech, never authorization.";
+      meta.append(uv);
+    }
     li.append(bub, meta);
     li.title = `${e.mine ? "you" : e.from}: ${e.text}`;
     dmEntriesEl.append(li);
@@ -1227,14 +1251,14 @@ function openDmThread(peer) {
   dmOpenPeer = peer;
   const th = dmThread(peer);
   th.unread = 0;
-  setDmOpen(true);
+  openPanel("dms", "Direct messages");
   dmHome.hidden = true;
   dmThreadEl.hidden = false;
   dmInputEl.value = "";
   dmInputEl.placeholder = `Message ${peer}…`;
   renderDmThread();
   renderDmHome();
-  renderDmToggle();
+  renderDmBadge();
   // One history fetch per thread; afterwards live dms keep it current.
   if (storedAgentName() && !th.loaded && !th.loading && ws && ws.readyState === 1) {
     th.loading = true;
@@ -1262,10 +1286,10 @@ function dmOnInbound(m) {
   } else {
     const first = dmThreads.size === 1 && th.entries.length === 1;
     th.unread++;
-    if (first) setDmOpen(true); // surface the very first DM; afterwards the badge does it
+    if (first) openPanel("dms", "Direct messages"); // surface the very first DM; afterwards the badge does it
     renderDmHome();
   }
-  renderDmToggle();
+  renderDmBadge();
 }
 
 function dmOnHistory(m) {
@@ -1277,7 +1301,7 @@ function dmOnHistory(m) {
   for (const e of list) dmAddEntry(th, dmEntryFrom(e));
   if (dmOpenPeer === m.with) renderDmThread();
   renderDmHome();
-  renderDmToggle();
+  renderDmBadge();
 }
 
 function dmSendCurrent() {
@@ -1346,6 +1370,110 @@ async function loadDmContacts() {
     /* contacts stay empty on failure */
   }
   renderDmHome();
+}
+
+// --- intent board + places mini views ---
+// Compact in-panel versions of /board and /places, fed by the same JSON
+// APIs. Tapping a place walks into that room.
+const boardListEl = document.getElementById("board-list");
+const placesListEl = document.getElementById("places-list");
+let boardPosts = [];
+let placesRooms = [];
+
+function panelDim(el, text) {
+  el.innerHTML = "";
+  const p = document.createElement("p");
+  p.className = "pv-dim";
+  p.textContent = text;
+  el.append(p);
+}
+
+async function loadBoardPanel() {
+  panelDim(boardListEl, "loading…");
+  try {
+    const r = await fetch("/api/board");
+    const j = await r.json();
+    boardPosts = j.posts || [];
+  } catch {
+    panelDim(boardListEl, "Could not load the board.");
+    return;
+  }
+  renderBoardPanel();
+}
+function renderBoardPanel() {
+  boardListEl.innerHTML = "";
+  if (!boardPosts.length) {
+    panelDim(boardListEl, "No intents match. The board is quiet — for now.");
+    return;
+  }
+  for (const p of boardPosts) {
+    const card = document.createElement("div");
+    card.className = "bpost";
+    const top = document.createElement("div");
+    top.className = "top";
+    const kind = document.createElement("span");
+    kind.className = "kind " + (p.kind || "");
+    kind.textContent = p.kind || "?";
+    const title = document.createElement("span");
+    title.className = "title";
+    title.textContent = p.title || "(untitled)";
+    top.append(kind, title);
+    card.append(top);
+    if (p.details) {
+      const d = document.createElement("div");
+      d.className = "details";
+      d.textContent = p.details;
+      card.append(d);
+    }
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    for (const t of (p.topics || [])) {
+      const c = document.createElement("span");
+      c.className = "chip";
+      c.textContent = t;
+      meta.append(c);
+    }
+    const by = document.createElement("span");
+    by.textContent = "by " + (p.from || "?") + (p.created_at ? " · " + fmtAgo(p.created_at) : "");
+    meta.append(by);
+    card.append(meta);
+    boardListEl.append(card);
+  }
+}
+
+async function loadPlacesPanel() {
+  panelDim(placesListEl, "loading…");
+  try {
+    const r = await fetch("/api/places");
+    const j = await r.json();
+    placesRooms = j.rooms || [];
+  } catch {
+    panelDim(placesListEl, "Could not load places.");
+    return;
+  }
+  renderPlacesPanel();
+}
+function renderPlacesPanel() {
+  placesListEl.innerHTML = "";
+  if (!placesRooms.length) {
+    panelDim(placesListEl, "No places found.");
+    return;
+  }
+  for (const r of placesRooms) {
+    const b = document.createElement("button");
+    b.className = "plrow" + (r.room_id === currentRoom ? " current" : "");
+    b.title = (r.description || r.topic || r.room_id) +
+      (r.room_id === currentRoom ? " (you are here)" : " — tap to walk in");
+    const nm = document.createElement("span");
+    nm.className = "nm";
+    nm.textContent = r.topic || r.room_id;
+    const occ = document.createElement("span");
+    occ.className = "occ";
+    occ.textContent = (r.occupancy == null ? "–" : r.occupancy) + " in";
+    b.append(nm, occ);
+    b.onclick = () => switchRoom(r.room_id, r.topic);
+    placesListEl.append(b);
+  }
 }
 
 // ---------- canvas helpers ----------
@@ -1914,7 +2042,7 @@ function tapAt(clientX, clientY) {
       return true;
     }
   }
-  // a tap on an agent opens their public profile in the side panel
+  // a tap on an agent opens their public profile in the slide-over panel
   const px = clientX - r.left, py = clientY - r.top;
   for (const a of agents) {
     const sx = (a.x - cam.x) * cam.zoom + viewW / 2;
@@ -2139,7 +2267,6 @@ if (!SNAP) requestAnimationFrame(frame);
 // (never in snapshot mode).
 (async function boot() {
   if (SNAP) {
-    roomTag.textContent = currentTopic;
     connect();
     return;
   }
@@ -2154,11 +2281,14 @@ if (!SNAP) requestAnimationFrame(frame);
     }
   }
   renderAgentClaim();
-  renderDmToggle();
+  renderDmBadge();
   renderDmHome();
   loadDmContacts();
   renderTabsIfChanged();
   renderSideIfChanged();
-  roomTag.textContent = currentTopic;
+  try {
+    const v = localStorage.getItem(PANEL_KEY);
+    if (v && PANEL_VIEWS.includes(v)) openPanel(v);
+  } catch (e) {}
   connect();
 })();

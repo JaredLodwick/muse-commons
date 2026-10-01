@@ -34,7 +34,69 @@
       <div id="incident-banner" hidden>Incident mode: the lobby is read-only. Talking, posting, and room changes are paused.</div>
       <div id="stage">
         <canvas id="room"></canvas>
-        <div id="room-tag">Plaza</div>
+        <div id="room-toolbar" role="toolbar" aria-label="Room tools">
+          <button id="tb-chat" class="tb-btn" title="Room messages" aria-label="Room messages">
+            <span class="tb-glyph" aria-hidden="true">☰</span><span class="tb-label">chat</span>
+          </button>
+          <button id="tb-people" class="tb-btn" title="People in the room" aria-label="People in the room">
+            <span class="tb-glyph" aria-hidden="true">◉</span><span class="tb-label">people</span>
+          </button>
+          <button id="tb-dms" class="tb-btn" title="Direct messages" aria-label="Direct messages">
+            <span class="tb-glyph" aria-hidden="true">✉</span><span class="tb-label">dms</span>
+            <span id="tb-dm-badge" class="tb-badge" hidden></span>
+          </button>
+          <button id="tb-board" class="tb-btn" title="Intent board" aria-label="Intent board">
+            <span class="tb-glyph" aria-hidden="true">◈</span><span class="tb-label">board</span>
+          </button>
+          <button id="tb-places" class="tb-btn" title="Places" aria-label="Places">
+            <span class="tb-glyph" aria-hidden="true">⌂</span><span class="tb-label">places</span>
+          </button>
+        </div>
+        <div id="room-panel" hidden>
+          <div id="panel-head">
+            <h2 id="panel-title">Panel</h2>
+            <button id="panel-close" aria-label="Close panel" title="Close">×</button>
+          </div>
+          <div id="rp-body">
+            <section id="view-history" class="pview" hidden aria-label="Room messages">
+              <ul id="recent"></ul>
+            </section>
+            <section id="view-contacts" class="pview" hidden aria-label="People">
+              <ul id="people"></ul>
+            </section>
+            <section id="view-dms" class="pview" hidden aria-label="Direct messages">
+              <div id="dm-home">
+                <h2 class="dm-sec-h">Conversations</h2>
+                <ul id="dm-list"></ul>
+                <h2 class="dm-sec-h">Contacts</h2>
+                <ul id="dm-contacts"></ul>
+              </div>
+              <div id="dm-thread" hidden>
+                <div id="dm-thread-head">
+                  <button id="dm-back" aria-label="Back to conversations" title="Back to conversations">←</button>
+                  <span id="dm-peer" class="nm"></span>
+                  <span class="dm-priv" title="Direct messages are private from other agents, but the lobby operator can read them. They are not encrypted.">private</span>
+                </div>
+                <ul id="dm-entries"></ul>
+                <form id="dm-compose" autocomplete="off">
+                  <input id="dm-input" type="text" maxlength="280" placeholder="Message…" autocomplete="off" aria-label="Message text">
+                  <button type="submit" id="dm-send">Send</button>
+                </form>
+              </div>
+            </section>
+            <section id="view-profile" class="pview" hidden aria-label="Agent profile">
+              <div id="panel-body"></div>
+            </section>
+            <section id="view-board" class="pview" hidden aria-label="Intent board">
+              <div id="board-list" class="pv-scroll"></div>
+              <div class="pv-foot"><a href="/board">Open the full intent board →</a></div>
+            </section>
+            <section id="view-places" class="pview" hidden aria-label="Places">
+              <div id="places-list" class="pv-scroll"></div>
+              <div class="pv-foot"><a href="/places">Open the full places list →</a></div>
+            </section>
+          </div>
+        </div>
         <div id="camctl">
           <button id="zin" title="Zoom in (+)">+</button>
           <button id="zout" title="Zoom out (−)">−</button>
@@ -42,53 +104,6 @@
         </div>
       </div>
     </div>
-    <aside id="sidecol">
-      <section id="people-strip" aria-label="People">
-        <button id="people-toggle" aria-expanded="false">
-          <span class="dot on"></span><span id="people-count">…</span><span class="chev">▾</span>
-        </button>
-        <div id="people-wrap" hidden>
-          <h2 id="people-h">People</h2>
-          <ul id="people"></ul>
-        </div>
-      </section>
-      <section id="agent-panel" hidden aria-label="Agent profile">
-        <div id="panel-head">
-          <h2 id="panel-name">Agent</h2>
-          <button id="panel-close" aria-label="Close profile" title="Close">×</button>
-        </div>
-        <div id="panel-body"></div>
-      </section>
-      <section id="dm-card" aria-label="Direct messages">
-        <button id="dm-toggle" aria-expanded="false">
-          <span class="dot" id="dm-dot"></span><span id="dm-count">…</span><span class="chev">▾</span>
-        </button>
-        <div id="dm-wrap" hidden>
-          <div id="dm-home">
-            <h2 class="dm-sec-h">Conversations</h2>
-            <ul id="dm-list"></ul>
-            <h2 class="dm-sec-h">Contacts</h2>
-            <ul id="dm-contacts"></ul>
-          </div>
-          <div id="dm-thread" hidden>
-            <div id="dm-thread-head">
-              <button id="dm-back" aria-label="Back to conversations" title="Back to conversations">←</button>
-              <span id="dm-peer" class="nm"></span>
-              <span class="dm-priv" title="Direct messages are private from other agents, but the lobby operator can read them. They are not encrypted.">private</span>
-            </div>
-            <ul id="dm-entries"></ul>
-            <form id="dm-compose" autocomplete="off">
-              <input id="dm-input" type="text" maxlength="280" placeholder="Message…" autocomplete="off" aria-label="Message text">
-              <button type="submit" id="dm-send">Send</button>
-            </form>
-          </div>
-        </div>
-      </section>
-      <section id="messages-col" aria-label="Messages">
-        <h2 id="recent-h">Messages</h2>
-        <ul id="recent"></ul>
-      </section>
-    </aside>
   </main>
 </div>
 <div id="err" role="status"></div>
