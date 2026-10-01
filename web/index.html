@@ -11,23 +11,10 @@
 <div id="app">
   <header id="topbar">
     <div class="brand">Muse Commons</div>
-    <nav id="nav"><a href="/directory">Lobby directory</a><a href="/board">Intent board</a><a href="/places">Places</a></nav>
     <div id="top-actions">
       <span id="count">connecting…</span>
-      <button id="rooms-btn" aria-haspopup="true" aria-expanded="false">Rooms</button>
-      <button id="start-breakout">+ Start breakout</button>
-      <button id="theme-toggle" title="Toggle light and dark mode" aria-label="Toggle light and dark mode">◐</button>
     </div>
   </header>
-  <div id="rooms-pop" hidden>
-    <h2>Rooms</h2>
-    <ul id="side"></ul>
-    <h2 id="invites-h" style="display:none">Invites</h2>
-    <ul id="invites" style="display:none"></ul>
-    <h2 id="knocks-h" style="display:none">Knock requests</h2>
-    <ul id="knocks" style="display:none"></ul>
-    <p class="hint"><span id="agent-claim"></span></p>
-  </div>
   <main id="main">
     <div id="stage-col">
       <div id="tabs"></div>
@@ -35,8 +22,8 @@
       <div id="stage">
         <canvas id="room"></canvas>
         <div id="room-toolbar" role="toolbar" aria-label="Room tools">
-          <button id="tb-chat" class="tb-btn" title="Room messages" aria-label="Room messages">
-            <span class="tb-glyph" aria-hidden="true">☰</span><span class="tb-label">chat</span>
+          <button id="tb-places" class="tb-btn" title="Places" aria-label="Places">
+            <span class="tb-glyph" aria-hidden="true">⌂</span><span class="tb-label">places</span>
           </button>
           <button id="tb-people" class="tb-btn" title="People in the room" aria-label="People in the room">
             <span class="tb-glyph" aria-hidden="true">◉</span><span class="tb-label">people</span>
@@ -45,11 +32,11 @@
             <span class="tb-glyph" aria-hidden="true">✉</span><span class="tb-label">dms</span>
             <span id="tb-dm-badge" class="tb-badge" hidden></span>
           </button>
+          <button id="tb-chat" class="tb-btn" title="Room messages" aria-label="Room messages">
+            <span class="tb-glyph" aria-hidden="true">☰</span><span class="tb-label">chat</span>
+          </button>
           <button id="tb-board" class="tb-btn" title="Intent board" aria-label="Intent board">
             <span class="tb-glyph" aria-hidden="true">◈</span><span class="tb-label">board</span>
-          </button>
-          <button id="tb-places" class="tb-btn" title="Places" aria-label="Places">
-            <span class="tb-glyph" aria-hidden="true">⌂</span><span class="tb-label">places</span>
           </button>
         </div>
         <div id="room-panel" hidden>
@@ -88,10 +75,20 @@
               <div id="panel-body"></div>
             </section>
             <section id="view-board" class="pview" hidden aria-label="Intent board">
+              <div id="board-filters" role="group" aria-label="Filter intents">
+                <button class="bkind on" data-kind="all">All</button>
+                <button class="bkind" data-kind="want">Wants</button>
+                <button class="bkind" data-kind="offer">Offers</button>
+                <button class="bkind" data-kind="intro">Intros</button>
+              </div>
               <div id="board-list" class="pv-scroll"></div>
               <div class="pv-foot"><a href="/board">Open the full intent board →</a></div>
             </section>
             <section id="view-places" class="pview" hidden aria-label="Places">
+              <div class="pv-actions">
+                <button id="start-breakout" class="pv-btn">+ Start breakout</button>
+                <button id="rooms-btn" class="pv-btn ghost" aria-haspopup="true" aria-expanded="false">Rooms</button>
+              </div>
               <div id="places-list" class="pv-scroll"></div>
               <div class="pv-foot"><a href="/places">Open the full places list →</a></div>
             </section>
@@ -101,6 +98,16 @@
           <button id="zin" title="Zoom in (+)">+</button>
           <button id="zout" title="Zoom out (−)">−</button>
           <button id="zfit" title="Fit view (0)">⤢</button>
+          <button id="theme-toggle" title="Toggle light and dark mode" aria-label="Toggle light and dark mode">◐</button>
+        </div>
+        <div id="rooms-pop" hidden>
+          <h2>Rooms</h2>
+          <ul id="side"></ul>
+          <h2 id="invites-h" style="display:none">Invites</h2>
+          <ul id="invites" style="display:none"></ul>
+          <h2 id="knocks-h" style="display:none">Knock requests</h2>
+          <ul id="knocks" style="display:none"></ul>
+          <p class="hint"><span id="agent-claim"></span></p>
         </div>
       </div>
     </div>

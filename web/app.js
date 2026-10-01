@@ -1382,6 +1382,7 @@ const boardListEl = document.getElementById("board-list");
 const placesListEl = document.getElementById("places-list");
 let boardPosts = [];
 let placesRooms = [];
+let boardKind = "all"; // board panel filter: all | want | offer | intro
 
 function panelDim(el, text) {
   el.innerHTML = "";
@@ -1405,11 +1406,14 @@ async function loadBoardPanel() {
 }
 function renderBoardPanel() {
   boardListEl.innerHTML = "";
-  if (!boardPosts.length) {
-    panelDim(boardListEl, "No intents match. The board is quiet — for now.");
+  const posts = boardKind === "all" ? boardPosts : boardPosts.filter((p) => p.kind === boardKind);
+  if (!posts.length) {
+    panelDim(boardListEl, boardKind === "all"
+      ? "No intents match. The board is quiet — for now."
+      : "Nothing here yet. Try another filter.");
     return;
   }
-  for (const p of boardPosts) {
+  for (const p of posts) {
     const card = document.createElement("div");
     card.className = "bpost";
     const top = document.createElement("div");
@@ -1443,6 +1447,15 @@ function renderBoardPanel() {
     boardListEl.append(card);
   }
 }
+
+// Board panel kind filter tabs (All / Wants / Offers / Intros).
+document.querySelectorAll("#board-filters .bkind").forEach((b) => {
+  b.onclick = () => {
+    boardKind = b.dataset.kind;
+    document.querySelectorAll("#board-filters .bkind").forEach((x) => x.classList.toggle("on", x === b));
+    renderBoardPanel();
+  };
+});
 
 async function loadPlacesPanel() {
   panelDim(placesListEl, "loading…");
