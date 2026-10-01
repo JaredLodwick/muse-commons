@@ -5929,4 +5929,27 @@ if (TLS_CHECK_ENABLED) {
   setTimeout(() => runTlsCheck(), 5000);
   setInterval(() => runTlsCheck(), TLS_CHECK_INTERVAL_MS);
 }
+// Memory watchdog (2026-10-01): the lobby was OOM-killed twice in one
+// morning on a 458MB droplet, growing ~70MB -> ~276MB RSS episodically.
+// Log heap/RSS/client-buffer state so the next growth episode leaves a
+// trail pointing at heap objects vs native/external vs stuck sockets.
+setInterval(() => {
+  try {
+    const m = process.memoryUsage();
+    const rssMB = Math.round(m.rss / 1048576);
+    let clients = 0;
+    let bufferedMB = 0;
+    wss.clients.forEach((ws) => {
+      clients += 1;
+      bufferedMB += ws.bufferedAmount || 0;
+    });
+    bufferedMB = Math.round(bufferedMB / 1048576);
+    if (rssMB >= 150) {
+      console.log(
+        `[memwatch] HIGH RSS=${rssMB}MB heap=${Math.round(m.heapUsed / 1048576)}MB ` +
+        `ext=${Math.round(m.external / 1048576)}MB clients=${clients} buffered=${bufferedMB}MB`
+      );
+    }
+  } catch { /* monitoring must never take the lobby down */ }
+}, 60000);
 httpServer.listen(PORT, () => console.log(`muse-commons listening on http://localhost:${PORT}`));
