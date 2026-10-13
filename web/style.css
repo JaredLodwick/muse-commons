@@ -198,12 +198,25 @@ button.mini.go{background:var(--accent); border-color:var(--accent); color:var(-
   cursor:pointer; padding:6px 0 0; font-family:inherit; display:block;
 }
 .bthread-toggle:hover{color:var(--ink)}
-.bthread{display:none; margin-top:6px; border-top:1px solid var(--line); padding-top:6px}
-.bthread.open{display:block}
-.breply{font-size:12.5px; color:var(--soft); margin:6px 0; padding-left:10px; border-left:2px solid var(--line); line-height:1.45}
-.breply .who{font-size:11px; color:var(--faint); margin-bottom:1px}
-.breply .txt{white-space:pre-wrap}
+.bpost .title{cursor:pointer}
+.bpost .title:hover{text-decoration:underline}
+.bpost .bimages{display:flex; gap:6px; flex-wrap:wrap; margin:6px 0 2px}
+.bpost .bimages img{height:84px; max-width:130px; object-fit:cover; border-radius:8px; border:1px solid var(--line); display:block}
+.bpost .bimages a:hover img{border-color:var(--accent)}
 .binterested{font-size:11.5px; color:var(--faint); margin-top:6px}
+.bdetail-back{background:none; border:none; color:var(--soft); font:inherit; font-size:12.5px; cursor:pointer; padding:10px 16px 0; display:block}
+.bdetail-back:hover{color:var(--ink)}
+.bcomments-h{font-family:var(--serif); font-size:14.5px; font-weight:600; padding:14px 16px 2px}
+.bcomment{margin-top:10px}
+#board-list>.bcomment{padding:0 16px}
+.bcomment .chead{font-size:11.5px; display:flex; gap:5px; align-items:baseline; flex-wrap:wrap}
+.bcomment .chead .dim{color:var(--faint)}
+.bcomment .bcollapse{font:inherit; font-size:10.5px; line-height:1.4; background:var(--card); border:1px solid var(--line); color:var(--soft); border-radius:4px; padding:0 4px; cursor:pointer}
+.bcomment .bcollapse:hover{color:var(--ink); border-color:var(--accent)}
+.bcomment .cbody{margin-left:7px; padding-left:12px; border-left:2px solid var(--line)}
+.bcomment.collapsed .cbody{display:none}
+.bcomment .txt{font-size:12.5px; color:var(--ink); line-height:1.5; white-space:pre-wrap; margin-top:2px}
+.bcomment .txt.deleted{color:var(--faint); font-style:italic}
 .plrow{
   display:flex; align-items:center; gap:10px; width:100%;
   padding:11px 16px; border:0; border-bottom:1px solid var(--line);
