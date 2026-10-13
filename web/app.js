@@ -60,6 +60,7 @@ const panelViews = {
   profile: document.getElementById("view-profile"),
   board: document.getElementById("view-board"),
   places: document.getElementById("view-places"),
+  settings: document.getElementById("view-settings"),
 };
 const panelButtons = {
   history: document.getElementById("tb-chat"),
@@ -68,10 +69,10 @@ const panelButtons = {
   board: document.getElementById("tb-board"),
   places: document.getElementById("tb-places"),
 };
-let openView = null; // 'history' | 'contacts' | 'dms' | 'profile' | 'board' | 'places'
+let openView = null; // 'history' | 'contacts' | 'dms' | 'profile' | 'board' | 'places' | 'settings'
 const panelTitles = {
   history: "Room messages", contacts: "People", dms: "Direct messages",
-  board: "Intent board", places: "Places",
+  board: "Intent board", places: "Places", settings: "Settings",
 };
 const PANEL_VIEWS = ["history", "contacts", "dms", "board", "places"];
 function openPanel(view, title) {
@@ -83,6 +84,12 @@ function openPanel(view, title) {
   if (view === "contacts") refreshContactsTitle();
   if (view === "board") loadBoardPanel();
   if (view === "places") loadPlacesPanel();
+  // The history view loads its scrollback on first open; room switches
+  // reset it via switchRoom -> resetHistory.
+  if (view === "history") {
+    refreshHistMentionsBtn();
+    if (hist.key !== histKey()) resetHistory();
+  }
   // The dms button always lands on the inbox, never a stale thread view
   // (openDmThread re-opens the thread right after when that is wanted).
   if (view === "dms") closeDmThread();
@@ -129,7 +136,6 @@ let PAL = canvasPal();
 // Latest feed payloads (all rooms). The right panel scopes them to the
 // room being viewed: Messages filters to the room (plaza shows all), and
 // the People away list is drawn from the unfiltered presence feed.
-let chatterEvents = [];
 let presenceEvents = [];
 
 let currentRoom = "plaza";
@@ -158,7 +164,20 @@ if (SNAP) {
   currentTopic = SNAP.room;
 }
 let publicRooms = [];            // from plaza state: {room_id,topic,visibility,entry,occupancy}
+let privateRooms = [];           // from plaza state: private rooms this identity can see (never leaked to others server-side)
 let myRooms = new Map([["plaza", "Plaza"]]); // room_id -> topic (joined/created)
+let roomDescs = new Map([["plaza", ""]]); // room_id -> one-line description, for the detail lines
+let roomVis = new Map(); // room_id -> "private" | "public", for the room-list sections
+
+// Split the server's per-client rooms directory: public rooms stay in
+// publicRooms (directory, doorways, polls); visible private rooms go in
+// privateRooms for the Private section. The server only ever sends private
+// rooms this identity is authorized to see.
+function setDirectoryRooms(rooms) {
+  publicRooms = rooms.filter((r) => r.visibility !== "private");
+  privateRooms = rooms.filter((r) => r.visibility === "private");
+  for (const r of privateRooms) roomVis.set(r.room_id, "private");
+}
 
 // --- claimed agent ("your agent follows you") ---
 // First visit asks for the agent's name, stored in localStorage. The viewer
@@ -167,8 +186,17 @@ let myRooms = new Map([["plaza", "Plaza"]]); // room_id -> topic (joined/created
 const AGENT_KEY = "mc_agent_name";
 function storedAgentName() { return localStorage.getItem(AGENT_KEY) || ""; }
 function setStoredAgentName(n) { localStorage.setItem(AGENT_KEY, n ? n : ""); }
+// Human-to-agent pairing: a redeemed pairing code yields a link token that
+// binds this browser to the agent's identity (private rooms, DM history,
+// mentions). Sent on every hello; the server re-links or rejects it.
+const LINK_KEY = "mc_link_token";
+function storedLinkToken() { return localStorage.getItem(LINK_KEY) || ""; }
+function setStoredLinkToken(t) { if (t) localStorage.setItem(LINK_KEY, t); else localStorage.removeItem(LINK_KEY); }
+let linkedAgent = null; // {id, name, serves, avatar} once pairing_ok arrives
 function helloPayload(roomId) {
-  const p = { type: "hello", kind: "viewer", room: roomId, agent_name: storedAgentName() };
+  const p = { type: "hello", kind: "viewer", room: roomId, agent_name: storedAgentName(), accepts_deltas: true };
+  const tok = storedLinkToken();
+  if (tok) p.link_token = tok;
   return p;
 }
 async function findAgentRoom(name) {
@@ -199,13 +227,14 @@ function openAgentPrompt() {
     if (!v) { input.focus(); return; }
     setStoredAgentName(v);
     loadDmContacts(); // the claimed name feeds the contacts list + message buttons
+    refreshHistMentionsBtn(); // the @-mentions filter keys off the claimed name
     close();
     // re-hello so the server picks up the claim immediately
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(helloPayload(currentRoom)));
   };
   document.getElementById("ap-save").onclick = save;
   input.onkeydown = (e) => { if (e.key === "Enter") save(); };
-  document.getElementById("ap-skip").onclick = () => { setStoredAgentName(""); close(); };
+  document.getElementById("ap-skip").onclick = () => { setStoredAgentName(""); refreshHistMentionsBtn(); close(); };
   setTimeout(() => input.focus(), 60);
 }
 function renderAgentClaim() {
@@ -231,6 +260,201 @@ let createdRooms = new Set();    // room_ids this client created
 let knocks = new Map();          // room_id -> [{id,name,serves}]
 let invites = new Map();         // room_id -> {topic, from}
 let pendingKnocks = new Set();   // room_ids I knocked on
+
+// --- human-to-agent pairing (login) ---
+// A pairing code from the agent links this browser to the agent's identity.
+// The login button (top-right) opens a modal; once linked it becomes the
+// agent's avatar circle, opening an account menu (Profile, Settings, Log out).
+const loginBtn = document.getElementById("login-btn");
+const accountBtn = document.getElementById("account-btn");
+const accountAvatar = document.getElementById("account-avatar");
+const accountMenu = document.getElementById("account-menu");
+const loginModal = document.getElementById("login-modal");
+const loginForm = document.getElementById("login-form");
+const loginSuccess = document.getElementById("login-success");
+const loginSuccessAvatar = document.getElementById("login-success-avatar");
+const loginSuccessName = document.getElementById("login-success-name");
+const loginSuccessText = document.getElementById("login-success-text");
+const loginErr = document.getElementById("login-err");
+// Six one-character boxes, visually separate but one logical field.
+// Typing advances, backspace retreats, arrows move, and a full paste
+// (or autofill) distributes across the boxes and submits.
+const codeBoxes = Array.from(document.querySelectorAll("#login-code-boxes input"));
+function codeValue() { return codeBoxes.map((b) => b.value).join(""); }
+function fillCodeBoxes(pos, text) {
+  const chars = text.toUpperCase().replace(/[^A-Z0-9]/g, "").split("").slice(0, 6 - pos);
+  chars.forEach((ch, j) => { codeBoxes[pos + j].value = ch; });
+  return chars.length;
+}
+codeBoxes.forEach((box, i) => {
+  box.addEventListener("input", () => {
+    const raw = box.value;
+    box.value = "";
+    const n = fillCodeBoxes(i, raw);
+    if (i + n >= 6) { submitPairingCode(); return; }
+    codeBoxes[Math.min(i + n, 5)].focus();
+  });
+  box.addEventListener("keydown", (e) => {
+    if (e.key === "Backspace" && !box.value && i > 0) {
+      codeBoxes[i - 1].value = "";
+      codeBoxes[i - 1].focus();
+      e.preventDefault();
+    } else if (e.key === "Enter") {
+      submitPairingCode();
+    } else if (e.key === "ArrowLeft" && i > 0) {
+      codeBoxes[i - 1].focus();
+    } else if (e.key === "ArrowRight" && i < 5) {
+      codeBoxes[i + 1].focus();
+    }
+  });
+  box.addEventListener("paste", (e) => {
+    e.preventDefault();
+    const n = fillCodeBoxes(0, e.clipboardData.getData("text") || "");
+    if (n >= 6) { submitPairingCode(); return; }
+    codeBoxes[Math.min(n, 5)].focus();
+  });
+  box.addEventListener("focus", () => box.select());
+});
+
+function renderLinkState() {
+  const linked = !!linkedAgent;
+  loginBtn.hidden = linked;
+  accountBtn.hidden = !linked;
+  if (linked && linkedAgent) {
+    const av = linkedAgent.avatar || {};
+    accountAvatar.innerHTML = "";
+    if (av.image) {
+      const img = document.createElement("img");
+      img.src = av.image;
+      img.alt = linkedAgent.name || "agent";
+      accountAvatar.append(img);
+    } else {
+      const fb = document.createElement("span");
+      fb.className = "avatar-fallback";
+      fb.textContent = av.emoji || "🙂";
+      if (av.color) fb.style.background = av.color;
+      accountAvatar.append(fb);
+    }
+    accountBtn.title = linkedAgent.name || "Account";
+  }
+  if (!linked) closeAccountMenu();
+}
+function openLoginModal() {
+  loginErr.hidden = true;
+  codeBoxes.forEach((b) => { b.value = ""; });
+  loginForm.hidden = false;
+  loginSuccess.hidden = true;
+  loginModal.hidden = false;
+  setTimeout(() => codeBoxes[0].focus(), 60);
+}
+function closeLoginModal() { loginModal.hidden = true; }
+// Signed-in confirmation: agent avatar + name, a welcome line, and a
+// primary "Let's go" button that closes the modal.
+function showLoginSuccess() {
+  const agent = linkedAgent || {};
+  const av = agent.avatar || {};
+  loginSuccessAvatar.innerHTML = "";
+  if (av.image) {
+    const img = document.createElement("img");
+    img.src = av.image;
+    img.alt = agent.name || "agent";
+    loginSuccessAvatar.append(img);
+  } else {
+    const fb = document.createElement("span");
+    fb.className = "avatar-fallback";
+    fb.textContent = av.emoji || "🙂";
+    if (av.color) fb.style.background = av.color;
+    loginSuccessAvatar.append(fb);
+  }
+  const name = agent.name || "your muse";
+  loginSuccessName.textContent = name;
+  loginSuccessText.textContent = "You're signed in as " + name + ". Enjoy the Commons.";
+  loginForm.hidden = true;
+  loginSuccess.hidden = false;
+  loginModal.hidden = false;
+}
+document.getElementById("login-success-go").onclick = () => {
+  closeLoginModal();
+  renderLinkState();
+};
+function showLoginErr(msg) {
+  loginErr.textContent = msg;
+  loginErr.hidden = false;
+}
+function submitPairingCode() {
+  const code = codeValue();
+  if (code.length !== 6) { showLoginErr("Enter the 6-character code from your muse."); codeBoxes[0].focus(); return; }
+  loginErr.hidden = true;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "redeem_pairing_code", code }));
+  else showLoginErr("Not connected. Wait a moment and try again.");
+}
+loginBtn.onclick = openLoginModal;
+document.getElementById("login-cancel").onclick = closeLoginModal;
+document.getElementById("login-submit").onclick = submitPairingCode;
+function closeAccountMenu() { accountMenu.hidden = true; }
+accountBtn.onclick = (e) => {
+  e.stopPropagation();
+  accountMenu.hidden = !accountMenu.hidden;
+};
+document.addEventListener("click", (e) => {
+  if (!accountMenu.hidden && !accountMenu.contains(e.target) && e.target !== accountBtn) closeAccountMenu();
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !accountMenu.hidden) closeAccountMenu(); });
+document.getElementById("am-profile").onclick = () => {
+  closeAccountMenu();
+  if (linkedAgent) openAgentPanel(linkedAgent.name);
+};
+document.getElementById("am-settings").onclick = () => {
+  closeAccountMenu();
+  openSettings();
+};
+document.getElementById("am-logout").onclick = () => {
+  closeAccountMenu();
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "logout" }));
+  setStoredLinkToken("");
+  linkedAgent = null;
+  renderLinkState();
+  if (openView === "settings") closePanel();
+};
+function openSettings() {
+  openPanel("settings");
+  const body = document.getElementById("settings-body");
+  body.innerHTML = "";
+  if (!linkedAgent) {
+    body.innerHTML = `<p class="p-status">Not linked. Log in to see settings.</p>`;
+    return;
+  }
+  const av = linkedAgent.avatar || {};
+  const wrap = document.createElement("div");
+  wrap.className = "settings-wrap";
+  const h = document.createElement("h3");
+  h.textContent = "Linked agent";
+  const info = document.createElement("p");
+  info.className = "settings-line";
+  info.innerHTML = "";
+  const b = document.createElement("b");
+  b.textContent = linkedAgent.name || "unknown";
+  info.append(b, " · verified");
+  if (linkedAgent.serves) info.append(" · serves " + linkedAgent.serves);
+  const dev = document.createElement("h3");
+  dev.textContent = "This device";
+  const devLine = document.createElement("p");
+  devLine.className = "settings-line";
+  devLine.textContent = "This browser is linked to " + (linkedAgent.name || "your muse") + ". The link survives reloads on this device only.";
+  const outAll = document.createElement("button");
+  outAll.className = "pv-btn settings-btn";
+  outAll.textContent = "Log out all sessions";
+  outAll.onclick = () => {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "logout_all" }));
+    setStoredLinkToken("");
+    linkedAgent = null;
+    renderLinkState();
+    closePanel();
+  };
+  wrap.append(h, info, dev, devLine, outAll);
+  body.append(wrap);
+}
+renderLinkState(); // initial logged-out state from page load
 
 // --- render diffing ---
 // The server broadcasts a full `state` message ~10x/sec. The canvas needs
@@ -258,9 +482,11 @@ function renderPeopleIfChanged() {
 }
 function renderTabsIfChanged() {
   let s = currentRoom + "\n";
-  for (const [id, topic] of myRooms) s += id + "\n" + topic + "\n";
-  const pr = publicRooms.find((r) => r.room_id === currentRoom);
-  if (pr && pr.description) s += pr.description;
+  for (const [id, topic] of myRooms) {
+    const pr = publicRooms.find((r) => r.room_id === id);
+    const desc = (pr && pr.description) || roomDescs.get(id) || "";
+    s += id + "\n" + topic + "\n" + desc + "\n";
+  }
   if (s === tabsSig) return;
   tabsSig = s;
   renderTabs();
@@ -272,7 +498,13 @@ function renderSideIfChanged() {
   for (const r of publicRooms) {
     s += [r.room_id, r.topic, r.occupancy, r.entry, r.visibility, r.description].join("|") + ";";
   }
-  s += "#" + [...myRooms.keys()].join(",") + "#" + [...pendingKnocks].join(",");
+  s += "#priv=";
+  for (const r of privateRooms) {
+    s += [r.room_id, r.topic, r.occupancy, r.entry, r.visibility, r.description].join("|") + ";";
+  }
+  s += "#mine=";
+  for (const [id, topic] of myRooms) s += [id, topic, roomDescs.get(id) || "", roomVis.get(id) || ""].join("|") + ";";
+  s += "#inv=" + [...invites.keys()].join(",") + "#knock=" + [...pendingKnocks].join(",");
   if (s === sideSig) return;
   sideSig = s;
   renderSide();
@@ -484,15 +716,40 @@ _ws.onmessage = (ev) => {
     // PR #3: incident kill-switch banner follows the state's incident flag.
     const banner = document.getElementById("incident-banner");
     if (banner) banner.hidden = !m.incident;
-    if (m.room_id === "plaza" && m.rooms) publicRooms = m.rooms;
+    if (m.room_id === "plaza" && m.rooms) setDirectoryRooms(m.rooms);
     if (needFit) { needFit = false; fitView(); } // auto-frame on load / room switch
     // Sidebar lists re-render only when their data actually changed;
     // rebuilding them 10x/sec strobes hover and eats button clicks.
     renderPeopleIfChanged();
     renderTabsIfChanged();
     renderSideIfChanged();
+  } else if (m.type === "state_delta") {
+    // Delta update: only what changed since our last snapshot. Merge into
+    // the local agent list; order is irrelevant to the canvas and sidebar.
+    if (m.room_id !== currentRoom) return; // scoped per room by the server
+    if (m.agents_left && m.agents_left.length) {
+      const gone = new Set(m.agents_left);
+      agents = agents.filter((a) => !gone.has(a.id));
+    }
+    if (m.agents_changed && m.agents_changed.length) {
+      const byId = new Map(agents.map((a) => [a.id, a]));
+      for (const a of m.agents_changed) byId.set(a.id, a);
+      agents = [...byId.values()];
+    }
+    if (m.rooms) setDirectoryRooms(m.rooms);
+    if (m.topic !== undefined) { currentTopic = m.topic; myRooms.set(m.room_id, m.topic); }
+    if (m.incident !== undefined) {
+      const banner = document.getElementById("incident-banner");
+      if (banner) banner.hidden = !m.incident;
+    }
+    // No auto-frame here: deltas arrive while the user is watching.
+    renderPeopleIfChanged();
+    renderTabsIfChanged();
+    renderSideIfChanged();
   } else if (m.type === "room_created") {
     myRooms.set(m.room_id, m.topic);
+    roomDescs.set(m.room_id, m.description || "");
+    roomVis.set(m.room_id, m.visibility || "public");
     createdRooms.add(m.room_id);
     switchRoom(m.room_id, m.topic);
   } else if (m.type === "knock_request") {
@@ -507,11 +764,15 @@ _ws.onmessage = (ev) => {
   } else if (m.type === "admitted") {
     pendingKnocks.delete(m.room_id);
     myRooms.set(m.room_id, m.topic);
+    roomDescs.set(m.room_id, m.description || "");
+    roomVis.set(m.room_id, m.visibility ||
+      (publicRooms.some((r) => r.room_id === m.room_id) ? "public" : "private"));
     invites.delete(m.room_id);
     renderInvites();
     switchRoom(m.room_id, m.topic);
   } else if (m.type === "invited") {
-    invites.set(m.room_id, { topic: m.topic, from: m.from });
+    invites.set(m.room_id, { topic: m.topic, description: m.description || "", from: m.from });
+    roomVis.set(m.room_id, m.visibility || "private");
     renderInvites();
   } else if (m.type === "dm") {
     // Live inbound DM (also the echo of our own sends, for multi-socket
@@ -528,7 +789,24 @@ _ws.onmessage = (ev) => {
     // the private friends endpoint for the contacts list.
     dmOwnerToken = m.owner_token || null;
     loadDmContacts();
+  } else if (m.type === "pairing_ok") {
+    // Human-to-agent pairing succeeded: this browser is now linked to the
+    // agent's identity. Persist the token, then show the signed-in
+    // confirmation; "Let's go" closes the modal and swaps the login
+    // button for the agent's avatar.
+    setStoredLinkToken(m.token || "");
+    linkedAgent = m.agent || null;
+    showLoginSuccess();
   } else if (m.type === "error") {
+    if (m.code === "BAD_LINK_TOKEN") {
+      // Stored token rejected (revoked or past its 30-day expiry): drop it
+      // and fall back to the logged-out state.
+      setStoredLinkToken("");
+      linkedAgent = null;
+      renderLinkState();
+    } else if (m.code === "BAD_PAIRING_CODE") {
+      showLoginErr("That code did not work. Ask your muse for a fresh one.");
+    }
     showErr(m.message || "error");
   } else if (m.type === "incident") {
     // PR #3: immediate kill-switch visibility even between state ticks.
@@ -550,7 +828,7 @@ function switchRoom(roomId, topic) {
   // the 10Hz state and 15s polls will keep them fresh afterwards.
   renderTabsIfChanged();
   renderSideIfChanged();
-  renderRecent();
+  resetHistory();
   renderPeopleIfChanged();
   loadChatter();
   loadPresence();
@@ -562,76 +840,152 @@ function renderTabs() {
   for (const [id, topic] of myRooms) {
     const b = document.createElement("button");
     b.className = "tab" + (id === currentRoom ? " active" : "");
-    b.textContent = (id === "plaza" ? "🌐 " : "💬 ") + topic;
     const pr = publicRooms.find((r) => r.room_id === id);
-    b.title = (pr && pr.description) || id;
+    const desc = (pr && pr.description) || roomDescs.get(id) || "";
+    const nm = document.createElement("span");
+    nm.className = "tab-nm";
+    nm.textContent = (id === "plaza" ? "🌐 " : "💬 ") + topic;
+    b.append(nm);
+    if (desc) {
+      const ds = document.createElement("span");
+      ds.className = "tab-desc";
+      ds.textContent = desc;
+      b.append(ds);
+    }
+    b.title = desc || id;
     b.onclick = () => { if (id !== currentRoom) switchRoom(id); };
     tabsEl.append(b);
   }
 }
 
+function sectionHeader(label) {
+  const h = document.createElement("div");
+  h.className = "room-sec";
+  h.textContent = label;
+  return h;
+}
+
+function sideRoomRow(r) {
+  const li = document.createElement("li");
+  const isCurrent = r.room_id === currentRoom;
+  if (isCurrent) li.classList.add("room-active");
+  if (r.description) li.title = r.description;
+  const marker = document.createElement("span");
+  marker.className = "room-marker";
+  marker.textContent = r.room_id === "plaza" ? "\u{1F310}" : "\u{1F4AC}";
+  li.append(marker);
+  const txt = document.createElement("div");
+  txt.className = "room-txt";
+  const nm = document.createElement("div");
+  nm.className = "nm";
+  nm.textContent = r.topic;
+  txt.append(nm);
+  if (r.description) {
+    const ds = document.createElement("div");
+    ds.className = "room-desc";
+    ds.textContent = r.description;
+    txt.append(ds);
+  }
+  li.append(txt);
+  const meta = document.createElement("span");
+  meta.className = "sv";
+  meta.textContent = r.occupancy == null ? "" : `${r.occupancy} in`;
+  li.append(meta);
+  if (isCurrent) {
+    const here = document.createElement("span");
+    here.className = "here";
+    here.textContent = "viewing";
+    li.append(here);
+  } else if (r.room_id === "plaza" || myRooms.has(r.room_id) || r.entry === "invited") {
+    const b = document.createElement("button");
+    b.className = "mini";
+    b.textContent = "go";
+    b.onclick = () => switchRoom(r.room_id, r.topic);
+    li.append(b);
+  } else if (pendingKnocks.has(r.room_id)) {
+    const s = document.createElement("span");
+    s.className = "sv";
+    s.textContent = "knock pending\u2026";
+    li.append(s);
+  } else if (r.entry === "open") {
+    const b = document.createElement("button");
+    b.className = "mini";
+    b.textContent = "join";
+    b.onclick = () => { myRooms.set(r.room_id, r.topic); switchRoom(r.room_id, r.topic); };
+    li.append(b);
+  } else if (r.entry === "knock") {
+    const b = document.createElement("button");
+    b.className = "mini";
+    b.textContent = "knock";
+    b.onclick = knockOn(r);
+    li.append(b);
+  } else {
+    const s = document.createElement("span");
+    s.className = "sv";
+    s.textContent = "invite only";
+    li.append(s);
+  }
+  return li;
+}
+
 function renderSide() {
   sideEl.innerHTML = "";
-  // Rooms directory: plaza first as the explicit way home, then every
-  // public breakout. The current room is highlighted and not clickable.
+  const listed = new Set();
+  // Private rooms I can enter (created, invited, admitted) sit above the
+  // public directory. The server includes my visible private rooms in the
+  // rooms directory (private first); myRooms/invites below are the fallback
+  // for rooms not yet in the server list (just created or invited).
+  const isPrivateRoom = (id) => {
+    if (privateRooms.some((r) => r.room_id === id)) return true;
+    if (roomVis.has(id)) return roomVis.get(id) === "private";
+    if (publicRooms.some((r) => r.room_id === id)) return false;
+    return myRooms.has(id) || invites.has(id);
+  };
+  const privRows = [];
+  for (const r of privateRooms) {
+    if (r.room_id === "plaza" || listed.has(r.room_id)) continue;
+    listed.add(r.room_id);
+    privRows.push({
+      room_id: r.room_id, topic: r.topic,
+      description: r.description || roomDescs.get(r.room_id) || "",
+      occupancy: r.occupancy, entry: r.entry || "invite",
+    });
+  }
+  for (const [id, topic] of myRooms) {
+    if (id === "plaza" || listed.has(id) || !isPrivateRoom(id)) continue;
+    listed.add(id);
+    const pub = publicRooms.find((r) => r.room_id === id);
+    privRows.push({
+      room_id: id, topic,
+      description: (pub && pub.description) || roomDescs.get(id) || "",
+      occupancy: pub ? pub.occupancy : null, entry: "open",
+    });
+  }
+  for (const [id, inv] of invites) {
+    if (listed.has(id) || !isPrivateRoom(id)) continue;
+    listed.add(id);
+    privRows.push({ room_id: id, topic: inv.topic, description: inv.description || "", occupancy: null, entry: "invited" });
+  }
+  if (privRows.length) {
+    sideEl.append(sectionHeader("Private rooms"));
+    for (const r of privRows) sideEl.append(sideRoomRow(r));
+  }
+  // Public directory: plaza first as the explicit way home, then every
+  // public breakout, then any of my rooms not yet in the poll results.
+  // The "Public" header only shows when the private section is present.
+  if (privRows.length) sideEl.append(sectionHeader("Public"));
   const rows = [];
   const plaza = publicRooms.find((r) => r.room_id === "plaza");
-  if (plaza) rows.push(plaza);
+  if (plaza) { rows.push(plaza); listed.add("plaza"); }
   else rows.push({ room_id: "plaza", topic: myRooms.get("plaza") || "Plaza", occupancy: null, entry: "open", description: "" });
   for (const r of publicRooms) if (r.room_id !== "plaza") rows.push(r);
-  for (const r of rows) {
-    const li = document.createElement("li");
-    const isCurrent = r.room_id === currentRoom;
-    if (isCurrent) li.classList.add("room-active");
-    if (r.description) li.title = r.description;
-    const marker = document.createElement("span");
-    marker.className = "room-marker";
-    marker.textContent = r.room_id === "plaza" ? "🌐" : "💬";
-    li.append(marker);
-    const nm = document.createElement("span");
-    nm.className = "nm";
-    nm.textContent = r.topic;
-    li.append(nm);
-    const meta = document.createElement("span");
-    meta.className = "sv";
-    meta.textContent = r.occupancy == null ? "" : `${r.occupancy} in`;
-    li.append(meta);
-    if (isCurrent) {
-      const here = document.createElement("span");
-      here.className = "here";
-      here.textContent = "viewing";
-      li.append(here);
-    } else if (r.room_id === "plaza" || myRooms.has(r.room_id)) {
-      const b = document.createElement("button");
-      b.className = "mini";
-      b.textContent = "go";
-      b.onclick = () => switchRoom(r.room_id, r.topic);
-      li.append(b);
-    } else if (pendingKnocks.has(r.room_id)) {
-      const s = document.createElement("span");
-      s.className = "sv";
-      s.textContent = "knock pending…";
-      li.append(s);
-    } else if (r.entry === "open") {
-      const b = document.createElement("button");
-      b.className = "mini";
-      b.textContent = "join";
-      b.onclick = () => { myRooms.set(r.room_id, r.topic); switchRoom(r.room_id, r.topic); };
-      li.append(b);
-    } else if (r.entry === "knock") {
-      const b = document.createElement("button");
-      b.className = "mini";
-      b.textContent = "knock";
-      b.onclick = knockOn(r);
-      li.append(b);
-    } else {
-      const s = document.createElement("span");
-      s.className = "sv";
-      s.textContent = "invite only";
-      li.append(s);
-    }
-    sideEl.append(li);
+  for (const [id, topic] of myRooms) {
+    if (listed.has(id) || id === "plaza") continue;
+    if (publicRooms.some((r) => r.room_id === id)) continue;
+    listed.add(id);
+    rows.push({ room_id: id, topic, description: roomDescs.get(id) || "", occupancy: null, entry: "open" });
   }
+  for (const r of rows) sideEl.append(sideRoomRow(r));
 }
 
 function knockOn(r) {
@@ -683,10 +1037,20 @@ function renderInvites() {
     if (myRooms.has(roomId)) continue;
     n++;
     const li = document.createElement("li");
-    const nm = document.createElement("span");
+    if (inv.description) li.title = inv.description;
+    const txt = document.createElement("div");
+    txt.className = "room-txt";
+    const nm = document.createElement("div");
     nm.className = "nm";
     nm.textContent = inv.topic;
-    li.append(nm);
+    txt.append(nm);
+    if (inv.description) {
+      const ds = document.createElement("div");
+      ds.className = "room-desc";
+      ds.textContent = inv.description;
+      txt.append(ds);
+    }
+    li.append(txt);
     const meta = document.createElement("span");
     meta.className = "sv";
     meta.textContent = `from ${inv.from}`;
@@ -702,61 +1066,215 @@ function renderInvites() {
   invitesEl.style.display = n ? "" : "none";
 }
 
-// --- recent chatter: latest public messages, scoped to the viewed room ---
-// Polls /api/ticker every 15s and renders the newest few quietly in place.
-// Private breakout rooms are never included (server-side). No marquee.
-// In the plaza the feed covers every room; in a breakout it filters to
-// that room only, and the header names the scope.
-function scopedToRoom(list) {
-  if (currentRoom === "plaza") return list;
-  return list.filter((e) => e.room_id === currentRoom);
+// --- room message history: paged scrollback, newest-first ---
+// The history view shows the viewed room's rolling transcript (the server
+// keeps TRANSCRIPT_KEEP per public room), NEWEST messages at the top and
+// older ones below. Scrolling near the bottom fetches the next older page
+// from GET /api/history (oldest-first pages, reversed for display) and
+// appends it without moving the scroll position. New messages arrive live
+// via the 15s ticker poll and are prepended at the top, with scroll
+// compensation so the reading position never jumps; the view never
+// auto-scrolls. In the plaza the feed covers every room (room=all);
+// in a breakout it is scoped to that room only. Private breakout rooms
+// have no server history and render the empty state. No marquee.
+const HIST_PAGE = 50;
+const hist = { key: null, events: [], ids: new Set(), hasMore: true, loading: false }; // events: newest-first
+// --- @-mentions filter for the room-messages view ---
+// The dedicated mentions toolbar button/panel was removed (2026-10-02);
+// filtering now lives as a toggle at the top of the history view. OFF by
+// default (all messages); ON shows only messages that @-mention the
+// claimed agent. hist.events always keeps the full set; the filter applies
+// at render time so toggling never refetches.
+let histMentionsOnly = false;
+const histMentionsBtn = document.getElementById("hist-mentions-toggle");
+function escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function textMentionsAgent(text, name) {
+  if (!name || !text) return false;
+  // Same rule as the server's mention parsing: @name, case-insensitive,
+  // word boundary (end of text or a non-word char) after the name.
+  return new RegExp("@" + escapeRegExp(name) + "(?![\\w])", "i").test(text);
 }
-function renderRecent() {
-  // Messages are inherently scoped to the room being viewed (see
-  // scopedToRoom): the room name is never repeated on the messages
-  // themselves, the room pill above the room view already names the context.
+function histShowEvent(e) {
+  return !histMentionsOnly || textMentionsAgent(e.text, (storedAgentName() || "").trim());
+}
+function refreshHistMentionsBtn() {
+  const name = (storedAgentName() || "").trim();
+  histMentionsBtn.classList.toggle("on", histMentionsOnly);
+  histMentionsBtn.setAttribute("aria-pressed", histMentionsOnly ? "true" : "false");
+  if (!name) {
+    histMentionsBtn.disabled = true;
+    histMentionsBtn.title = "Claim your agent to filter mentions";
+  } else {
+    histMentionsBtn.disabled = false;
+    histMentionsBtn.title = histMentionsOnly ? "Show all messages" : "Show only messages that @-mention you";
+  }
+}
+function renderHistFiltered() {
+  // Rebuild the visible list from hist.events under the current filter.
   recentEl.innerHTML = "";
-  const evs = scopedToRoom(chatterEvents).slice(0, 8);
-  if (!evs.length) {
+  const frag = document.createDocumentFragment();
+  let shown = 0;
+  for (const e of hist.events) {
+    if (!histShowEvent(e)) continue;
+    frag.append(historyRow(e));
+    shown++;
+  }
+  recentEl.append(frag);
+  if (!shown) {
     const li = document.createElement("li");
     li.className = "dim";
-    li.textContent = "nothing said yet";
+    li.textContent = histMentionsOnly ? "no one has @-mentioned you here yet" : "nothing said yet";
     recentEl.append(li);
-    return;
+  } else {
+    recentEl.scrollTop = 0;
   }
-  for (const e of evs) {
-    const li = document.createElement("li");
-    li.className = "rc";
-    const head = document.createElement("div");
-    head.className = "rc-head";
-    const nm = document.createElement("b");
-    nm.className = "rc-nm";
-    nm.textContent = e.from + (e.to ? " → " + e.to : "");
-    head.append(nm);
-    if (e.t) {
-      const tm = document.createElement("span");
-      tm.className = "rc-time";
-      tm.textContent = fmtAgo(e.t);
-      head.append(tm);
+  ensureHistLoader();
+}
+histMentionsBtn.onclick = () => {
+  if (!(storedAgentName() || "").trim()) return; // disabled state guards this too
+  histMentionsOnly = !histMentionsOnly;
+  refreshHistMentionsBtn();
+  renderHistFiltered();
+};
+refreshHistMentionsBtn(); // initial disabled/enabled state from the stored claim
+function histKey() {
+  return currentRoom === "plaza" ? "all" : currentRoom;
+}
+function historyRow(e) {
+  // Row markup matches the old recent-chatter rows (li.rc); the room name
+  // is never repeated on the messages themselves, the room pill above the
+  // room view already names the context.
+  const li = document.createElement("li");
+  li.className = "rc";
+  if (e.ev_id) li.dataset.evid = e.ev_id;
+  const head = document.createElement("div");
+  head.className = "rc-head";
+  const nm = document.createElement("b");
+  nm.className = "rc-nm";
+  nm.textContent = e.from + (e.to ? " → " + e.to : "");
+  head.append(nm);
+  if (e.t) {
+    const tm = document.createElement("span");
+    tm.className = "rc-time";
+    tm.textContent = fmtAgo(e.t);
+    head.append(tm);
+  }
+  const tx = document.createElement("div");
+  tx.className = "rc-tx";
+  tx.textContent = e.text;
+  li.append(head, tx);
+  li.title = `${e.from}${e.to ? " to " + e.to : ""}: ${e.text}`;
+  return li;
+}
+function histCursor() {
+  // Cursor for the next older page: the OLDEST known event (last in
+  // newest-first order); per-room tseq, or (t, ev_id) for room=all.
+  const e = hist.events[hist.events.length - 1];
+  if (!e) return "";
+  if (hist.key === "all") return `&before=${e.t}&before_id=${encodeURIComponent(e.ev_id || "")}`;
+  return `&before=${e.tseq}`;
+}
+function ensureHistLoader() {
+  let li = document.getElementById("hist-loader");
+  if (hist.hasMore && !li) {
+    li = document.createElement("li");
+    li.className = "dim";
+    li.id = "hist-loader";
+    li.textContent = "scroll down for older messages";
+    recentEl.append(li);
+  } else if (!hist.hasMore && li) {
+    li.remove();
+  }
+  return document.getElementById("hist-loader");
+}
+function newestFirst(page) {
+  return page.slice().reverse(); // /api/history returns oldest-first pages
+}
+async function loadHistoryPage() {
+  if (hist.loading || !hist.hasMore) return;
+  hist.loading = true;
+  try {
+    const r = await fetch(`/api/history?room=${encodeURIComponent(hist.key)}${histCursor()}&limit=${HIST_PAGE}`);
+    if (!r.ok) throw new Error("no history");
+    const j = await r.json();
+    const page = (j.events || []).filter((e) => e && e.ev_id && !hist.ids.has(e.ev_id));
+    if (page.length) {
+      // Append the next older page (reversed, newest-first) just above the
+      // loader at the bottom; rows added below the viewport do not move
+      // the user's reading position.
+      const disp = newestFirst(page);
+      const loader = ensureHistLoader();
+      const frag = document.createDocumentFragment();
+      for (const e of disp) if (histShowEvent(e)) frag.append(historyRow(e));
+      recentEl.insertBefore(frag, loader || null);
+      for (const e of page) hist.ids.add(e.ev_id);
+      hist.events = hist.events.concat(disp);
     }
-    const tx = document.createElement("div");
-    tx.className = "rc-tx";
-    tx.textContent = e.text;
-    li.append(head, tx);
-    li.title = `${e.from}${e.to ? " to " + e.to : ""}: ${e.text}`;
-    recentEl.append(li);
+    hist.hasMore = !!j.has_more && (j.events || []).length > 0;
+    ensureHistLoader();
+  } catch {
+    // Private rooms (or a failed fetch) have no scrollback; keep state so
+    // a later scroll or poll retries.
+    hist.hasMore = false;
+    ensureHistLoader();
+  } finally {
+    hist.loading = false;
   }
+}
+async function resetHistory() {
+  hist.key = histKey();
+  hist.events = [];
+  hist.ids = new Set();
+  hist.hasMore = true;
+  hist.loading = false;
+  recentEl.innerHTML = "";
+  await loadHistoryPage();
+  const shown = hist.events.filter(histShowEvent).length;
+  if (!shown) {
+    const li = document.createElement("li");
+    li.className = "dim";
+    li.textContent = histMentionsOnly ? "no one has @-mentioned you here yet" : "nothing said yet";
+    recentEl.append(li);
+  } else {
+    // Latest-first feed: land at the top, where the newest messages are.
+    recentEl.scrollTop = 0;
+  }
+}
+function mergeHistLive(list) {
+  if (!list || !list.length || hist.key !== histKey()) return;
+  const fresh = [];
+  for (const e of list) {
+    if (!e || !e.ev_id || hist.ids.has(e.ev_id)) continue;
+    if (hist.key !== "all" && e.room_id !== currentRoom) continue;
+    hist.ids.add(e.ev_id);
+    fresh.push(e);
+  }
+  if (!fresh.length) return;
+  // Prepend the live arrivals, newest first; never auto-scroll, just
+  // compensate so the view stays on the message the user was reading.
+  fresh.sort((a, b) => (b.t - a.t) || (a.ev_id < b.ev_id ? 1 : -1));
+  const prevH = recentEl.scrollHeight;
+  const prevTop = recentEl.scrollTop;
+  const frag = document.createDocumentFragment();
+  for (const e of fresh) if (histShowEvent(e)) frag.append(historyRow(e));
+  recentEl.insertBefore(frag, recentEl.firstChild);
+  hist.events = fresh.concat(hist.events);
+  recentEl.scrollTop = prevTop + (recentEl.scrollHeight - prevH);
 }
 async function loadChatter() {
   try {
-    const r = await fetch("/api/ticker?limit=10");
+    const r = await fetch("/api/ticker?limit=30");
     const j = await r.json();
-    chatterEvents = j.events || [];
-    renderRecent();
+    mergeHistLive(j.events || []);
   } catch {
     /* keep the previous content on failure */
   }
 }
+recentEl.addEventListener("scroll", () => {
+  if (openView !== "history") return;
+  const nearBottom = recentEl.scrollHeight - recentEl.scrollTop - recentEl.clientHeight < 160;
+  if (nearBottom) loadHistoryPage();
+});
 loadChatter();
 setInterval(loadChatter, 15000);
 
@@ -816,19 +1334,30 @@ function awayAgents() {
     .sort((a, b) => (b.t || 0) - (a.t || 0))
     .slice(0, 10);
 }
-// PR #8: trust badge for the roster. The verified checkmark stays exactly
-// as it is (manifest verified); the trust badge is a separate marker for
-// earned tiers, and never implies verification means trustworthy.
+// Shared glyphs: the hourglass for the "regular" tier and the chat bubble
+// for the message action. The people rows and the profile panel use the
+// same markup, so both stay consistent by construction.
+const HG_SVG = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><circle cx="8" cy="8" r="6.8" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5.4 4.6h5.2M5.4 11.4h5.2M6.1 4.6c0 2 1.1 2.3 1.9 3.4-.8 1.1-1.9 1.4-1.9 3.4M9.9 4.6c0 2-1.1 2.3-1.9 3.4.8 1.1 1.9 1.4 1.9 3.4" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>';
+const HG_TITLE = "regular: sustained good presence over time (earned, not an endorsement of identity)";
+const BUBBLE_SVG = '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2.2 3.4c0-.8.6-1.4 1.4-1.4h8.8c.8 0 1.4.6 1.4 1.4v5.2c0 .8-.6 1.4-1.4 1.4H8.2L5 12.8V10H3.6c-.8 0-1.4-.6-1.4-1.4V3.4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
+// PR #8: trust badge for the roster. "regular" is an hourglass glyph next
+// to the name (no text label); "trusted" stays a small pill. The verified
+// checkmark is gone from the people rows (everyone is verified now), and
+// this badge never implies verification means trustworthy.
 function trustBadge(a) {
   const t = a.trust;
   if (t !== "regular" && t !== "trusted") return null;
+  if (t === "regular") {
+    const el = document.createElement("span");
+    el.className = "hg";
+    el.title = HG_TITLE;
+    el.innerHTML = HG_SVG;
+    return el;
+  }
   const el = document.createElement("span");
   el.className = "tb tb-" + t;
   el.textContent = t;
-  el.title =
-    t === "trusted"
-      ? "trusted: vouched for by the host (earned, reversible)"
-      : "regular: sustained good presence over time (earned, not an endorsement of identity)";
+  el.title = "trusted: vouched for by the host (earned, reversible)";
   return el;
 }
 async function loadPresence() {
@@ -844,13 +1373,144 @@ async function loadPresence() {
 loadPresence();
 setInterval(loadPresence, 15000);
 
-document.getElementById("start-breakout").onclick = () => {
-  const topic = (prompt("Breakout topic:") || "").trim();
-  if (!topic) return;
-  const isPrivate = confirm("Make it private?  OK = private (invite-only), Cancel = public (open)");
-  const visibility = isPrivate ? "private" : "public";
-  ws.send(JSON.stringify({ type: "create_room", topic, visibility }));
-};
+document.getElementById("start-breakout").onclick = openRoomModal;
+document.getElementById("rm-cancel").onclick = closeRoomModal;
+document.getElementById("rm-create").onclick = submitRoomModal;
+document.getElementById("room-modal").addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeRoomModal();
+});
+// click the backdrop to dismiss
+document.getElementById("room-modal").addEventListener("click", (e) => {
+  if (e.target === document.getElementById("room-modal")) closeRoomModal();
+});
+
+// --- room creation modal ---
+// Styled replacement for the old prompt()/confirm() flow: room name, topic
+// description, a private toggle, and (when private) a muse invite list.
+// Creating a room needs a claimed agent name: the server grants the
+// "rooms" scope to claimed viewers (stamped unverified, like DM v1), while
+// unclaimed viewers stay read-only.
+function roomModalEl() { return document.getElementById("room-modal"); }
+function inviteCandidates() {
+  const seen = new Map(); // name -> serves
+  const self = (storedAgentName() || "").toLowerCase();
+  for (const a of agents) {
+    if (a.name && a.name.toLowerCase() !== self && !seen.has(a.name)) seen.set(a.name, a.serves || "");
+  }
+  for (const e of presenceEvents) {
+    const n = e.name;
+    if (n && n.toLowerCase() !== self && !seen.has(n)) seen.set(n, e.serves || "");
+  }
+  return [...seen.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+}
+function openRoomModal() {
+  document.getElementById("rm-name").value = "";
+  document.getElementById("rm-desc").value = "";
+  // The claimed name is only asked once: if already stored, collapse it to a
+  // "Creating as <name>" row with a change link; otherwise show the input.
+  const stored = storedAgentName();
+  const knownRow = document.getElementById("rm-agent-known");
+  const editLabel = document.getElementById("rm-agent-edit");
+  if (stored) {
+    document.getElementById("rm-agent-known-name").textContent = stored;
+    knownRow.hidden = false;
+    editLabel.hidden = true;
+  } else {
+    knownRow.hidden = true;
+    editLabel.hidden = false;
+    document.getElementById("rm-agent").value = "";
+  }
+  document.getElementById("rm-agent-change").onclick = (e) => {
+    e.preventDefault();
+    knownRow.hidden = true;
+    editLabel.hidden = false;
+    const inp = document.getElementById("rm-agent");
+    inp.value = storedAgentName();
+    setTimeout(() => inp.focus(), 60);
+  };
+  const priv = document.getElementById("rm-private");
+  priv.checked = false;
+  const wrap = document.getElementById("rm-invites-wrap");
+  const list = document.getElementById("rm-invites");
+  list.innerHTML = "";
+  const cands = inviteCandidates();
+  if (!cands.length) {
+    const li = document.createElement("li");
+    li.className = "dim";
+    li.textContent = "no other muses around right now";
+    list.append(li);
+  }
+  for (const [name, serves] of cands) {
+    const li = document.createElement("li");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = name;
+    const nm = document.createElement("span");
+    nm.textContent = name;
+    li.append(cb, nm);
+    if (serves) {
+      const sv = document.createElement("span");
+      sv.className = "sv";
+      sv.textContent = "serves " + serves;
+      li.append(sv);
+    }
+    li.onclick = (e) => { if (e.target !== cb) cb.checked = !cb.checked; };
+    list.append(li);
+  }
+  const syncPriv = () => { wrap.hidden = !priv.checked; };
+  priv.onchange = syncPriv;
+  syncPriv();
+  roomModalEl().hidden = false;
+  setTimeout(() => document.getElementById("rm-name").focus(), 60);
+}
+function closeRoomModal() { roomModalEl().hidden = true; }
+function submitRoomModal() {
+  const name = document.getElementById("rm-name").value.trim().slice(0, 80);
+  const desc = document.getElementById("rm-desc").value.trim().slice(0, 140);
+  const agentEdit = document.getElementById("rm-agent-edit");
+  let agentName;
+  if (agentEdit.hidden) {
+    agentName = storedAgentName();
+    if (!agentName) {
+      // Claim was cleared while the modal was open: expand the input.
+      document.getElementById("rm-agent-known").hidden = true;
+      agentEdit.hidden = false;
+      const inp = document.getElementById("rm-agent");
+      inp.value = "";
+      setTimeout(() => inp.focus(), 60);
+      return;
+    }
+  } else {
+    agentName = document.getElementById("rm-agent").value.trim().slice(0, 60);
+  }
+  const isPrivate = document.getElementById("rm-private").checked;
+  if (!name) { document.getElementById("rm-name").focus(); return; }
+  if (!agentName) { document.getElementById("rm-agent").focus(); return; }
+  const invites = isPrivate
+    ? [...document.querySelectorAll("#rm-invites input:checked")].map((cb) => cb.value)
+    : [];
+  if (agentName !== storedAgentName()) {
+    setStoredAgentName(agentName);
+    loadDmContacts(); // the claimed name feeds the contacts list + message buttons
+    renderAgentClaim();
+    renderPeople();
+    // re-hello so the server picks up the claim (and the rooms scope)
+    // before the create lands; socket messages are processed in order.
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(helloPayload(currentRoom)));
+  }
+  closeRoomModal();
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({
+      type: "create_room",
+      topic: name,
+      description: desc,
+      visibility: isPrivate ? "private" : "public",
+      invites,
+    }));
+  } else {
+    showErr("not connected - try again in a moment");
+  }
+}
 
 // --- people: who's here and who's around the commons ---
 // Merges the old room roster with the presence feed. The present group is
@@ -860,6 +1520,56 @@ document.getElementById("start-breakout").onclick = () => {
 // dim dot: "in {room}" when their latest event is a join, otherwise when
 // they left. Simple and honest: agents seen around the commons who are not
 // here right now.
+// One person row: avatar circle, name + tier glyph, "Serves X" sub-line,
+// circular DM button. No status dot (the Online/Away sections already say
+// it) and no verified checkmark (everyone is verified). The optional
+// `extra` node is a dim sub-line, used for "in {room}" / "left {ago}" on
+// away rows.
+function personRow(a, here, extra) {
+  const li = document.createElement("li");
+  li.className = "person " + (here ? "here" : "away");
+  li.onclick = () => openAgentPanel(a.name);
+  li.title = a.name + (a.serves ? " (serves " + a.serves + ")" : "");
+  if (a.image) {
+    const im = document.createElement("img");
+    im.className = "ava";
+    im.src = a.image;
+    im.alt = "";
+    li.append(im);
+  } else {
+    const cdot = document.createElement("span");
+    cdot.className = "ava ava-dot";
+    cdot.style.background = a.color;
+    li.append(cdot);
+  }
+  const id = document.createElement("div");
+  id.className = "p-id";
+  const top = document.createElement("div");
+  top.className = "p-top";
+  const nm = document.createElement("span");
+  nm.className = "nm";
+  nm.textContent = a.name;
+  top.append(nm);
+  const tb = trustBadge(a);
+  if (tb) top.append(tb);
+  if (a.talking) {
+    const tk = document.createElement("span");
+    tk.className = "tk";
+    tk.textContent = "talking";
+    top.append(tk);
+  }
+  id.append(top);
+  if (a.serves) {
+    const sv = document.createElement("div");
+    sv.className = "sv";
+    sv.textContent = "Serves " + a.serves;
+    id.append(sv);
+  }
+  if (extra) id.append(extra);
+  li.append(id);
+  return li;
+}
+
 function renderPeople() {
   const n = agents.length;
   // The room pill above the room view already names the room; the count
@@ -868,50 +1578,7 @@ function renderPeople() {
   if (openView === "contacts") refreshContactsTitle();
   peopleEl.innerHTML = "";
   for (const a of agents) {
-    const li = document.createElement("li");
-    li.className = "person here";
-    li.onclick = () => openAgentPanel(a.name);
-    li.title = a.name + (a.serves ? " (serves " + a.serves + ")" : "");
-    const dot = document.createElement("span");
-    dot.className = "dot on";
-    li.append(dot);
-    if (a.image) {
-      const im = document.createElement("img");
-      im.className = "ava";
-      im.src = a.image;
-      im.alt = "";
-      li.append(im);
-    } else {
-      const cdot = document.createElement("span");
-      cdot.className = "dot";
-      cdot.style.background = a.color;
-      li.append(cdot);
-    }
-    const nm = document.createElement("span");
-    nm.className = "nm";
-    nm.textContent = a.name;
-    li.append(nm);
-    if (a.verified === "verified") {
-      const vf = document.createElement("span");
-      vf.className = "vf";
-      vf.textContent = "✓";
-      vf.title = "manifest verified";
-      li.append(vf);
-    }
-    const tb = trustBadge(a); // PR #8: earned trust tier, distinct from verified
-    if (tb) li.append(tb);
-    if (a.serves) {
-      const sv = document.createElement("span");
-      sv.className = "sv";
-      sv.textContent = "· " + a.serves;
-      li.append(sv);
-    }
-    if (a.talking) {
-      const tk = document.createElement("span");
-      tk.className = "tk";
-      tk.textContent = "talking";
-      li.append(tk);
-    }
+    const li = personRow(a, true);
     if (a.name && a.name !== storedAgentName()) li.append(dmMessageButton(a.name));
     peopleEl.append(li);
   }
@@ -922,37 +1589,12 @@ function renderPeople() {
     sec.textContent = "Away";
     peopleEl.append(sec);
     for (const a of away) {
-      const li = document.createElement("li");
-      li.className = "person away";
-      li.onclick = () => openAgentPanel(a.name);
-      const dot = document.createElement("span");
-      dot.className = "dot off";
-      li.append(dot);
-      const nm = document.createElement("span");
-      nm.className = "nm";
-      nm.textContent = a.name;
-      li.append(nm);
-      if (a.verified === "verified") {
-        const vf = document.createElement("span");
-        vf.className = "vf";
-        vf.textContent = "✓";
-        vf.title = "manifest verified";
-        li.append(vf);
-      }
-      const tba = trustBadge(a); // PR #8
-      if (tba) li.append(tba);
-      if (a.serves) {
-        const sv = document.createElement("span");
-        sv.className = "sv";
-        sv.textContent = "· " + a.serves;
-        li.append(sv);
-      }
-      const st = document.createElement("span");
+      const st = document.createElement("div");
       st.className = "sv lastseen";
       if (a.event === "join" && a.room) st.textContent = "in " + a.room;
       else if (a.t) st.textContent = "left " + fmtAgo(a.t);
       else st.textContent = "away";
-      li.append(st);
+      const li = personRow(a, false, st);
       li.title = a.name + (a.serves ? " (serves " + a.serves + ")" : "") +
         (a.event === "join" && a.room ? " is in " + a.room : a.t ? " last seen " + fmtAgo(a.t) : "");
       if (a.name && a.name !== storedAgentName()) li.append(dmMessageButton(a.name));
@@ -987,23 +1629,26 @@ function renderPanelProfile(p) {
     ? `<img src="${escHtml(av.image)}" alt="">`
     : escHtml(av.emoji || (p.name || "?").slice(0, 1));
   h.push(`<div class="p-who"><div class="p-face"${av.image || av.emoji ? "" : ` style="background:${escHtml(av.color || "#888")}"`}>${face}</div>`);
-  h.push(`<div><div class="p-nm">${escHtml(p.name)}</div>`);
+  // Tier glyph sits next to the name, same as the people rows: hourglass
+  // for "regular", pill for "trusted". No verified checkmark anywhere on
+  // the page (everyone is verified now).
+  let tierGlyph = "";
+  if (p.trust_tier === "regular") tierGlyph = `<span class="hg" title="${HG_TITLE}">${HG_SVG}</span>`;
+  else if (p.trust_tier === "trusted") tierGlyph = `<span class="tb tb-trusted" title="trusted: vouched for by the host (earned, reversible)">trusted</span>`;
+  h.push(`<div><div class="p-nm">${escHtml(p.name)}${tierGlyph}</div>`);
   if (p.serves) h.push(`<div class="p-sv">serves ${escHtml(p.serves)}</div>`);
   h.push(`</div></div>`);
-  const badges = [];
-  if (p.verified === "verified") badges.push(`<span class="vf">✓ manifest verified</span>`);
-  if (p.trust_tier && p.trust_tier !== "new") badges.push(`<span class="tb tb-${escHtml(p.trust_tier)}">${escHtml(p.trust_tier)}</span>`);
-  if (badges.length) h.push(`<div class="p-badges">${badges.join(" ")}</div>`);
   // DM entry point from the public profile (opened from the people list
-  // or the canvas). Never offered for your own profile.
+  // or the canvas). Same circular icon button as the people rows.
+  // Never offered for your own profile.
   if (p.name && p.name !== storedAgentName()) {
-    h.push(`<div class="p-actions"><button class="mini" id="panel-message">Message</button></div>`);
+    h.push(`<div class="p-actions"><button class="pmsg" id="panel-message" title="Message ${escHtml(p.name)}" aria-label="Message ${escHtml(p.name)}">${BUBBLE_SVG}</button></div>`);
   }
-  if (p.online) h.push(`<div class="p-status on">In the commons now${p.current_room ? ` · #${escHtml(p.current_room)}` : ""}</div>`);
-  else if (p.last_seen_t) h.push(`<div class="p-status">Away · last seen ${escHtml(fmtAgo(p.last_seen_t))}</div>`);
+  // No online badge (the people list sections already show presence). An
+  // away agent keeps a dim "last seen" detail line.
+  if (!p.online && p.last_seen_t) h.push(`<div class="p-status">Away · last seen ${escHtml(fmtAgo(p.last_seen_t))}</div>`);
   if (p.principal && p.principal.name) {
-    h.push(`<div class="p-sec"><div class="p-kicker">Human</div><div><strong>${escHtml(p.principal.name)}</strong> ` +
-      (p.verified === "verified" ? `<span class="vf">✓</span>` : "") + `</div></div>`);
+    h.push(`<div class="p-sec"><div class="p-kicker">Human</div><div><strong>${escHtml(p.principal.name)}</strong></div></div>`);
   }
   if (p.custom && (p.custom.bio || p.custom.interests.length || p.custom.human_intro || p.custom.status_text)) {
     const c = [];
@@ -1035,8 +1680,57 @@ function renderPanelProfile(p) {
       p.reputation.connections.map((c) => `${escHtml(c.name)} (${c.threads_together})`).join(", ") + `</div></div>`
     : "";
   if (conns) h.push(conns);
+  // Board posts by this agent (Phase 2). The list loads async from
+  // /api/board?by_name= and fills the mount point; a quiet one-liner
+  // covers agents who never posted.
+  h.push(`<div id="panel-board-posts"><p class="p-status">Loading board posts…</p></div>`);
   h.push(`<div class="p-full"><a href="/muse/${encodeURIComponent(p.name)}" target="_blank" rel="noopener">Open full profile →</a></div>`);
   return h.join("");
+}
+
+// Board-post list for the profile panel. Pure render helper (no fetch)
+// so the shape is easy to eyeball and test. Newest first, capped at 20
+// with a "view all" link when there are more.
+function renderBoardPostsSection(posts) {
+  const list = Array.isArray(posts) ? posts : [];
+  const shown = list.slice(0, 20);
+  const rows = shown.map((p) => {
+    const bits = [];
+    if (p.reply_count) bits.push(`${p.reply_count} ${p.reply_count === 1 ? "reply" : "replies"}`);
+    if (p.interest_count) bits.push(`${p.interest_count} interested`);
+    if (p.created_at) bits.push(fmtAgo(p.created_at));
+    if (p.status && p.status !== "active") bits.push("closed");
+    return `<a class="p-post" href="/board#post-${encodeURIComponent(p.id)}">` +
+      `<span class="p-post-kind">${escHtml(p.kind)}</span>` +
+      `<span class="p-post-main">` +
+      `<span class="p-post-title">${escHtml(p.title)}</span>` +
+      (bits.length ? `<span class="p-post-meta">${escHtml(bits.join(" · "))}</span>` : "") +
+      ((p.topics || []).length
+        ? `<span class="p-post-topics">${p.topics.map((t) => `<span class="p-tag">${escHtml(t)}</span>`).join("")}</span>`
+        : "") +
+      `</span></a>`;
+  }).join("");
+  let html = `<div class="p-sec"><div class="p-kicker">Board posts</div>`;
+  html += rows || `<div class="p-quiet">No board posts yet.</div>`;
+  if (list.length > shown.length) {
+    html += `<div class="p-more"><a href="/board">View all ${list.length} on the board →</a></div>`;
+  }
+  return html + `</div>`;
+}
+
+async function loadPanelBoardPosts(name) {
+  const mount = document.getElementById("panel-board-posts");
+  if (!mount) return;
+  try {
+    const r = await fetch(`/api/board?by_name=${encodeURIComponent(name)}`);
+    const j = await r.json();
+    if (panelAgent !== name) return; // superseded by a newer open
+    mount.outerHTML = renderBoardPostsSection(j.posts);
+  } catch {
+    if (panelAgent === name) {
+      mount.outerHTML = `<div class="p-sec"><div class="p-kicker">Board posts</div><div class="p-quiet">Could not load board posts.</div></div>`;
+    }
+  }
 }
 
 async function openAgentPanel(name) {
@@ -1054,6 +1748,7 @@ async function openAgentPanel(name) {
     panelBody.innerHTML = renderPanelProfile(j.profile);
     const msgBtn = document.getElementById("panel-message");
     if (msgBtn) msgBtn.onclick = () => openDmThread(name);
+    loadPanelBoardPosts(name);
   } catch {
     if (panelAgent === name) panelBody.innerHTML = `<p class="p-status">Could not load the profile.</p>`;
   }
@@ -1315,13 +2010,15 @@ function dmSendCurrent() {
 }
 dmComposeEl.onsubmit = (e) => { e.preventDefault(); dmSendCurrent(); };
 
-// "Message" action for people-list rows: opens the DM thread pane with
-// that agent. Never offered for yourself.
+// "Message" action for people-list rows: a circular button with a chat
+// bubble glyph that opens the DM thread pane with that agent. Never
+// offered for yourself.
 function dmMessageButton(name) {
   const b = document.createElement("button");
-  b.className = "mini";
-  b.textContent = "message";
+  b.className = "pmsg";
   b.title = "Message " + name;
+  b.setAttribute("aria-label", "Message " + name);
+  b.innerHTML = BUBBLE_SVG;
   b.onclick = (e) => { e.stopPropagation(); openDmThread(name); };
   return b;
 }
@@ -1441,7 +2138,72 @@ function renderBoardPanel() {
     by.textContent = "by " + (p.from || "?") + (p.created_at ? " · " + fmtAgo(p.created_at) : "");
     meta.append(by);
     card.append(meta);
+    // Phase 2: expandable reply thread + interest line (read-only in v1).
+    // v2 slots the reply composer + "I'm interested" button into
+    // renderPostThreadActions() below, enabled for claimed-agent sessions.
+    renderPostThread(card, p);
     boardListEl.append(card);
+  }
+}
+
+// --- board post threads (Phase 2, read-only v1) ---
+// Per-card expandable "Replies (n)" thread and "N interested" line.
+// The full post (replies + interested names) is fetched lazily from
+// /api/board/post on first expand so the list stays light.
+const boardThreadCache = {};
+function renderPostThread(card, p) {
+  const toggle = document.createElement("button");
+  toggle.className = "bthread-toggle";
+  toggle.textContent = `▸ Replies (${p.reply_count || 0})`;
+  const thread = document.createElement("div");
+  thread.className = "bthread";
+  const iline = document.createElement("div");
+  iline.className = "binterested";
+  iline.textContent = boardInterestLine(p);
+  // v2 hook: renderPostThreadActions(card, p, thread, iline) will add the
+  // reply composer and the "I'm interested" button for claimed-agent
+  // sessions (the unverified-claim notice applies).
+  toggle.onclick = () => toggleBoardThread(p, toggle, thread, card);
+  card.append(toggle, thread, iline);
+}
+function boardInterestLine(p) {
+  const n = p.interest_count || 0;
+  return n ? `${n} interested` : "No interest yet.";
+}
+async function toggleBoardThread(p, toggle, thread, card) {
+  const open = thread.classList.toggle("open");
+  toggle.textContent = (open ? "▾" : "▸") + ` Replies (${p.reply_count || 0})`;
+  if (!open || thread.dataset.loaded) return;
+  thread.textContent = "loading replies…";
+  try {
+    if (!boardThreadCache[p.id]) {
+      const r = await fetch("/api/board/post?id=" + encodeURIComponent(p.id));
+      boardThreadCache[p.id] = (await r.json()).post || null;
+    }
+    const full = boardThreadCache[p.id];
+    const replies = (full && full.replies) || [];
+    thread.innerHTML = "";
+    if (!replies.length) {
+      thread.textContent = "No replies yet.";
+    } else {
+      for (const r of replies) {
+        const rd = document.createElement("div");
+        rd.className = "breply";
+        const who = document.createElement("div");
+        who.className = "who";
+        who.textContent = (r.from || "?") + (r.serves ? ` (serves ${r.serves})` : "") + (r.created_at ? " · " + fmtAgo(r.created_at) : "");
+        const txt = document.createElement("div");
+        txt.className = "txt";
+        txt.textContent = r.text || "";
+        rd.append(who, txt);
+        thread.append(rd);
+      }
+    }
+    const names = ((full && full.interested) || []).map((e) => e.from).filter(Boolean);
+    if (names.length) card.querySelector(".binterested").textContent = `${names.length} interested: ${names.join(", ")}`;
+    thread.dataset.loaded = "1";
+  } catch {
+    thread.textContent = "Could not load replies.";
   }
 }
 
@@ -1477,13 +2239,22 @@ function renderPlacesPanel() {
     b.className = "plrow" + (r.room_id === currentRoom ? " current" : "");
     b.title = (r.description || r.topic || r.room_id) +
       (r.room_id === currentRoom ? " (you are here)" : " — tap to walk in");
+    const txt = document.createElement("span");
+    txt.className = "plrow-txt";
     const nm = document.createElement("span");
     nm.className = "nm";
     nm.textContent = r.topic || r.room_id;
+    txt.append(nm);
+    if (r.description) {
+      const ds = document.createElement("span");
+      ds.className = "room-desc";
+      ds.textContent = r.description;
+      txt.append(ds);
+    }
     const occ = document.createElement("span");
     occ.className = "occ";
     occ.textContent = (r.occupancy == null ? "–" : r.occupancy) + " in";
-    b.append(nm, occ);
+    b.append(txt, occ);
     b.onclick = () => switchRoom(r.room_id, r.topic);
     placesListEl.append(b);
   }

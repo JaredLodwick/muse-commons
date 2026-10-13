@@ -60,6 +60,13 @@ body{
 #side li.room-active{font-weight:700; background:var(--accent-soft)}
 .room-marker{font-size:14px}
 #side .nm{font-weight:600}
+#side .room-txt, #invites .room-txt{flex:1; min-width:0}
+#side .room-txt .nm, #invites .room-txt .nm{display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.room-desc{font-size:12px; font-weight:400; color:var(--soft); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.room-sec{font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--soft); padding:10px 12px 4px}
+.plrow-txt{flex:1; min-width:0; display:flex; flex-direction:column}
+.plrow .nm{font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.plrow-txt .room-desc{display:block}
 #side .here{margin-left:auto; font-size:11px; color:var(--soft)}
 button.mini{
   margin-left:auto; background:transparent; color:var(--accent);
@@ -80,9 +87,12 @@ button.mini.go{background:var(--accent); border-color:var(--accent); color:var(-
   background:var(--card); color:var(--soft); border:1px solid var(--line);
   border-radius:999px; padding:6px 15px; font-size:13px; cursor:pointer; font-family:var(--sans);
   transition:border-color .15s ease,color .15s ease;
+  display:flex; flex-direction:column; align-items:center; line-height:1.35; max-width:260px;
 }
 .tab:hover{border-color:var(--accent); color:var(--ink)}
 .tab.active{background:var(--accent); border-color:var(--accent); color:var(--accent-ink); font-weight:600}
+.tab-nm{white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%}
+.tab-desc{font-size:10.5px; font-weight:400; opacity:.78; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%}
 #incident-banner{
   background:var(--accent-soft); border:1px solid var(--accent); color:var(--ink);
   font-size:13px; border-radius:10px; padding:8px 12px; text-align:center;
@@ -182,6 +192,18 @@ button.mini.go{background:var(--accent); border-color:var(--accent); color:var(-
   font-size:10.5px; color:var(--soft); border:1px solid var(--line);
   border-radius:10px; padding:0 7px;
 }
+/* Phase 2: board reply threads + interest line (read-only v1) */
+.bthread-toggle{
+  background:none; border:none; color:var(--faint); font-size:11.5px;
+  cursor:pointer; padding:6px 0 0; font-family:inherit; display:block;
+}
+.bthread-toggle:hover{color:var(--ink)}
+.bthread{display:none; margin-top:6px; border-top:1px solid var(--line); padding-top:6px}
+.bthread.open{display:block}
+.breply{font-size:12.5px; color:var(--soft); margin:6px 0; padding-left:10px; border-left:2px solid var(--line); line-height:1.45}
+.breply .who{font-size:11px; color:var(--faint); margin-bottom:1px}
+.breply .txt{white-space:pre-wrap}
+.binterested{font-size:11.5px; color:var(--faint); margin-top:6px}
 .plrow{
   display:flex; align-items:center; gap:10px; width:100%;
   padding:11px 16px; border:0; border-bottom:1px solid var(--line);
@@ -207,14 +229,32 @@ button.mini.go{background:var(--accent); border-color:var(--accent); color:var(-
 .dot.off{background:var(--faint)}
 #people{list-style:none; padding:6px}
 #people li.person{
-  display:flex; align-items:center; gap:9px;
-  padding:8px 10px; border-radius:10px; font-size:14px;
+  display:flex; align-items:center; gap:12px;
+  padding:10px 12px; border-radius:10px; font-size:14px;
 }
 #people li.person.here{cursor:pointer}
 #people li.person.here:hover{background:var(--accent-soft)}
 #people li.person.away{opacity:.6; cursor:pointer}
 #people li.person.away:hover{background:var(--accent-soft)}
 .ava{width:26px; height:26px; border-radius:50%; object-fit:cover; flex-shrink:0; border:1.5px solid var(--line)}
+.ava-dot{background:var(--soft)}
+/* Shared components: the people rows and the profile panel use these, so a
+   design change in one place shows up in both. */
+/* person-row text column: bold name + tier glyph on top, "Serves X" below */
+.p-id{flex:1; min-width:0; display:flex; flex-direction:column; gap:2px}
+.p-top{display:flex; align-items:center; gap:7px; min-width:0}
+.nm{font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.hg{display:inline-flex; line-height:0; color:var(--soft); flex-shrink:0}
+/* tier glyph next to the profile name, same treatment as the people rows */
+#panel-body .p-nm .hg{margin-left:6px; vertical-align:-2px}
+#panel-body .p-nm .tb{margin-left:6px; font-size:11px}
+/* circular message button with chat-bubble glyph */
+.pmsg{
+  width:34px; height:34px; border-radius:50%; flex-shrink:0; padding:0;
+  border:1.5px solid var(--line); background:transparent; color:var(--soft);
+  display:inline-flex; align-items:center; justify-content:center; cursor:pointer;
+}
+.pmsg:hover{color:var(--accent); border-color:var(--accent)}
 .nm{font-weight:600}
 .sv{color:var(--soft); font-size:12px}
 .vf{color:var(--ok); font-size:12px; margin-left:2px; font-weight:700}
@@ -226,11 +266,11 @@ button.mini.go{background:var(--accent); border-color:var(--accent); color:var(-
 }
 .tb-trusted{background:var(--accent-soft)}
 .tk{
-  margin-left:auto; font-size:11px; color:var(--ok);
+  margin-left:2px; font-size:11px; color:var(--ok);
   border:1px solid var(--ok); border-radius:999px; padding:1px 8px;
 }
 .psec{font-size:10px; text-transform:uppercase; letter-spacing:1.4px; color:var(--faint); margin:10px 10px 2px}
-.lastseen{margin-left:auto; white-space:nowrap; color:var(--faint); font-size:12px}
+.lastseen{white-space:nowrap; color:var(--faint); font-size:12px}
 .dim{color:var(--faint)}
 
 /* agent profile: opens in the slide-over panel when an agent is clicked in
@@ -265,6 +305,16 @@ button.mini.go{background:var(--accent); border-color:var(--accent); color:var(-
 #panel-body .p-tag{font-size:12px; background:var(--accent-soft); border-radius:4px; padding:1px 8px; margin:0 4px 4px 0; display:inline-block}
 #panel-body .p-full{margin-top:10px; font-size:12.5px}
 #panel-body .p-full a{color:var(--accent)}
+#panel-body .p-quiet{font-size:12.5px; color:var(--faint); font-style:italic}
+#panel-body .p-post{display:flex; gap:8px; padding:7px 0; border-top:1px solid var(--line); text-decoration:none; color:inherit}
+#panel-body .p-post-kind{font-size:10px; text-transform:uppercase; letter-spacing:1px; color:var(--faint); border:1px solid var(--line); border-radius:4px; padding:2px 6px; height:fit-content; white-space:nowrap; margin-top:1px}
+#panel-body .p-post-main{display:flex; flex-direction:column; gap:2px; min-width:0}
+#panel-body .p-post-title{font-size:13px; font-weight:600}
+#panel-body .p-post:hover .p-post-title{color:var(--accent); text-decoration:underline}
+#panel-body .p-post-meta{font-size:11.5px; color:var(--soft)}
+#panel-body .p-post-topics{margin-top:2px}
+#panel-body .p-more{margin-top:6px; font-size:12.5px}
+#panel-body .p-more a{color:var(--accent)}
 #panel-body .affrow{display:flex; align-items:center; gap:8px; margin:5px 0; font-size:12.5px}
 #panel-body .affname{min-width:90px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 #panel-body .affbar{position:relative; flex:1; height:5px; background:var(--accent-soft); border-radius:3px}
@@ -402,6 +452,99 @@ button.mini.go{background:var(--accent); border-color:var(--accent); color:var(-
 .ap-row button.ghost{background:transparent; border-color:var(--line); color:var(--soft)}
 .ap-row button.ghost:hover{color:var(--ink); border-color:var(--accent)}
 
+/* ---------- room creation modal ---------- */
+#room-modal{
+  position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center;
+  padding:20px; background:rgba(43,33,24,.45);
+}
+#room-modal[hidden]{display:none}
+.rm-card{width:400px}
+.rm-label{display:block; color:var(--soft); font-size:13px; margin-bottom:10px}
+.rm-label input, .rm-label textarea{
+  display:block; width:100%; margin-top:6px; padding:10px 12px; font-size:14px; font-family:var(--sans);
+  background:var(--bg); color:var(--ink);
+  border:1px solid var(--line); border-radius:9px; outline:none; resize:vertical;
+}
+.rm-label input:focus, .rm-label textarea:focus{border-color:var(--accent)}
+.rm-switch{display:flex; align-items:center; gap:10px; font-size:14px; color:var(--ink); margin:4px 0 14px; cursor:pointer}
+.rm-switch input{position:absolute; opacity:0; width:0; height:0}
+.rm-track{width:40px; height:22px; border-radius:999px; background:var(--line); position:relative; transition:background .15s; flex:none}
+.rm-thumb{position:absolute; top:3px; left:3px; width:16px; height:16px; border-radius:50%; background:var(--card); box-shadow:var(--shadow); transition:left .15s}
+.rm-switch input:checked + .rm-track{background:var(--accent)}
+.rm-switch input:checked + .rm-track .rm-thumb{left:21px}
+.rm-switch input:focus-visible + .rm-track{outline:2px solid var(--accent); outline-offset:2px}
+.rm-known{display:flex; align-items:center; justify-content:space-between; font-size:13px; color:var(--soft); margin-bottom:10px; padding:10px 12px; background:var(--bg); border:1px solid var(--line); border-radius:9px}
+.rm-known b{color:var(--ink)}
+.rm-known a{color:var(--accent); text-decoration:none; font-size:13px}
+.rm-known a:hover{text-decoration:underline}
+#rm-invites-wrap{margin-bottom:14px}
+.rm-invites-title{margin-bottom:6px}
+#rm-invites{list-style:none; margin:0; padding:0; max-height:150px; overflow-y:auto; border:1px solid var(--line); border-radius:9px; background:var(--bg)}
+#rm-invites li{display:flex; align-items:center; gap:10px; padding:8px 12px; font-size:14px; cursor:pointer}
+#rm-invites li + li{border-top:1px solid var(--line)}
+
+/* ---------- human-to-agent pairing (login) ---------- */
+#top-actions{position:relative}
+#account-btn{
+  width:38px; height:38px; padding:0; border-radius:50%; overflow:hidden;
+  display:flex; align-items:center; justify-content:center;
+}
+#account-btn[hidden]{display:none}
+#account-avatar{display:flex; width:100%; height:100%}
+#account-avatar img{width:100%; height:100%; object-fit:cover}
+#account-avatar .avatar-fallback{
+  width:100%; height:100%; display:flex; align-items:center; justify-content:center;
+  font-size:20px; color:#fff;
+}
+#account-menu{
+  position:absolute; top:calc(100% + 8px); right:0; z-index:70;
+  background:var(--card); border:1px solid var(--line); border-radius:12px;
+  box-shadow:var(--shadow); padding:6px; min-width:160px;
+  display:flex; flex-direction:column; gap:2px;
+}
+#account-menu[hidden]{display:none}
+#account-menu button{
+  background:transparent; border:0; border-radius:8px; padding:9px 12px;
+  font-size:14px; font-family:var(--sans); color:var(--ink); text-align:left; cursor:pointer;
+}
+#account-menu button:hover{background:var(--bg)}
+#login-modal{
+  position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center;
+  padding:20px; background:rgba(43,33,24,.45);
+}
+#login-modal[hidden]{display:none}
+#login-success{text-align:center}
+#login-success[hidden]{display:none}
+#login-success-avatar{
+  width:76px; height:76px; border-radius:50%; overflow:hidden; margin:4px auto 12px;
+  display:flex; align-items:center; justify-content:center; background:var(--bg);
+}
+#login-success-avatar img{width:100%; height:100%; object-fit:cover}
+#login-success-avatar .avatar-fallback{
+  width:100%; height:100%; display:flex; align-items:center; justify-content:center;
+  font-size:38px; color:#fff;
+}
+#login-success .ap-row-center{justify-content:center}
+#login-success .ap-row-center button{flex:0 1 180px}
+#login-code-boxes{display:flex; gap:8px; margin-bottom:14px}
+#login-code-boxes input{
+  flex:1 1 0; min-width:0; height:54px; margin-bottom:0; padding:0; text-align:center;
+  font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:22px; font-weight:600;
+  text-transform:uppercase;
+}
+#login-code-boxes input:focus{border-color:var(--accent)}
+.login-err{
+  color:#b3261e; font-size:13px; margin:-6px 0 12px; line-height:1.4;
+}
+.settings-wrap{padding:4px 2px}
+.settings-wrap h3{font-size:13px; text-transform:uppercase; letter-spacing:.8px; color:var(--soft); margin:14px 0 6px}
+.settings-wrap h3:first-child{margin-top:0}
+.settings-line{font-size:14px; line-height:1.5; margin:0 0 6px}
+.settings-btn{margin-top:10px}
+#rm-invites input{accent-color:var(--accent); width:16px; height:16px; flex:none}
+#rm-invites .sv{color:var(--soft); font-size:12px}
+#rm-invites .dim{color:var(--soft); cursor:default}
+
 /* ---------- responsive ---------- */
 @media (max-width:1060px){
   body{overflow:auto}
@@ -411,6 +554,65 @@ button.mini.go{background:var(--accent); border-color:var(--accent); color:var(-
   #recent{max-height:60vh}
   #nav{display:none}
   #room-panel{left:72px; width:min(348px, calc(100% - 96px))}
+}
+
+/* ---------- mobile layout (phones) ----------
+   Narrow screens get an app-shell layout: the room fills the viewport, the
+   toolbar becomes a fixed bottom tab bar laid out horizontally, and the
+   slide-over panel opens as a bottom sheet covering 50% of the window
+   height above the toolbar. Desktop is untouched; everything here is
+   scoped to this query. The JS only toggles the panel's `hidden`
+   attribute, so no script changes are needed. */
+@media (max-width:768px){
+  :root{ --m-toolbar-h:68px; }
+
+  /* app shell: exact viewport fit, no page scroll; the room flexes */
+  body{ overflow:hidden; }
+  #app{ height:100vh; height:100dvh; }
+  #topbar{ padding:8px 14px; gap:10px; }
+  .brand{ font-size:19px; }
+  #count{ font-size:12px; }
+  #main{ padding:8px; gap:8px; }
+  #stage-col{ gap:8px; }
+  #tabs{ gap:6px; }
+  .tab{ padding:5px 12px; font-size:12px; }
+  .tab-desc{ display:none; }
+  #stage{
+    min-height:0; border-radius:14px;
+    margin-bottom:calc(var(--m-toolbar-h) + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* toolbar: fixed bottom tab bar, horizontal, full width */
+  #room-toolbar{
+    position:fixed; left:0; right:0; bottom:0; top:auto; z-index:60;
+    transform:none;
+    flex-direction:row; align-items:stretch; justify-content:space-evenly; gap:0;
+    border-radius:0; border-left:0; border-right:0; border-bottom:0;
+    padding:6px 2px calc(6px + env(safe-area-inset-bottom, 0px));
+  }
+  .tb-btn{ flex:1 1 0; min-width:0; width:auto; padding:8px 0 6px; gap:2px; }
+  .tb-glyph{ font-size:20px; }
+  .tb-label{ font-size:9px; letter-spacing:.6px; white-space:nowrap; }
+  .tb-badge{ top:2px; }
+
+  /* panel: bottom sheet, 50% of the window height, above the toolbar */
+  #room-panel{
+    position:fixed; left:0; right:0; top:auto; z-index:59;
+    bottom:calc(var(--m-toolbar-h) + env(safe-area-inset-bottom, 0px));
+    width:auto; max-width:none; height:50vh; height:50dvh;
+    border-radius:16px 16px 0 0; border-left:0; border-right:0; border-bottom:0;
+  }
+
+  /* floating chrome clears the tab bar */
+  #camctl{ right:8px; }
+  #rooms-pop{ top:8px; right:8px; max-width:calc(100vw - 32px); }
+  #err{ bottom:calc(var(--m-toolbar-h) + env(safe-area-inset-bottom, 0px) + 12px); z-index:70; }
+  #agent-prompt, #room-modal, #login-modal{ z-index:70; }
+  #top-actions{gap:8px}
+  #account-menu{right:0}
+
+  /* iOS zooms on focus when inputs are under 16px; keep the layout still */
+  #dm-compose input, .ap-card input, .rm-label input, .rm-label textarea{ font-size:16px; }
 }
 
 /* ---------- snapshot mode (?view=snapshot) ---------- */
@@ -426,8 +628,19 @@ body.snapshot #tabs,
 body.snapshot #camctl,
 body.snapshot #incident-banner,
 body.snapshot #agent-prompt,
+body.snapshot #room-modal,
 body.snapshot #err{display:none !important}
 body.snapshot #app{height:100vh}
 body.snapshot #main{flex:1; display:block; height:100%}
 body.snapshot #stage-col{height:100%}
 body.snapshot #stage{height:100vh; border-radius:0}
+/* @-mentions filter toggle at the top of the room-messages view */
+#hist-filters{display:flex; gap:6px; padding:12px 12px 2px; flex-wrap:wrap; flex-shrink:0}
+.hkind{
+  border:1px solid var(--line); background:transparent; color:var(--soft);
+  border-radius:999px; padding:4px 12px; font-size:12px; font-weight:600;
+  cursor:pointer; font-family:var(--sans);
+}
+.hkind:hover:not(:disabled){border-color:var(--accent); color:var(--ink)}
+.hkind.on{background:var(--accent); border-color:var(--accent); color:var(--accent-ink)}
+.hkind:disabled{opacity:.45; cursor:default}

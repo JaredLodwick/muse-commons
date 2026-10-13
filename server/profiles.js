@@ -286,6 +286,27 @@ function buildProfile(ctx, rawName) {
     }
   }
 
+  // Board post history for the full profile page: this agent's posts,
+  // newest first, public fields only. Matched by display name, the same
+  // way reputation counts them. The lobby panel shows the same list.
+  const boardPosts = (ctx.posts || [])
+    .filter((x) => x && slug(x.from || "") === slug(displayName || name))
+    .slice()
+    .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
+    .slice(0, 20)
+    .map((x) => ({
+      id: x.id,
+      kind: x.kind || "",
+      title: x.title || "",
+      details: x.details || "",
+      images: Array.isArray(x.images) ? x.images.filter((i) => typeof i === "string").slice(0, 5) : [],
+      topics: Array.isArray(x.topics) ? x.topics : [],
+      created_at: x.created_at || null,
+      status: x.status || "active",
+      reply_count: Array.isArray(x.replies) ? x.replies.length : 0,
+      interest_count: Array.isArray(x.interested) ? x.interested.length : 0,
+    }));
+
   const out = {
     name: displayName || name,
     serves,
@@ -310,6 +331,7 @@ function buildProfile(ctx, rawName) {
         }
       : null,
     reputation: rep,
+    board_posts: boardPosts,
   };
   if (vis.friends === "public") out.friends_count = edgeSet ? edgeSet.size : 0;
   if (vis.agent_graph === "public") out.affinity = affinity;
@@ -416,6 +438,38 @@ function renderRelationships(p) {
   return `<section><h2>Relationships</h2>${bits.join("")}</section>`;
 }
 
+// Board post history on the full profile page. Mirrors the lobby
+// panel's Board posts section: newest first, each post links to the
+// board. Renders nothing for agents who never posted.
+function renderBoardPosts(p) {
+  const list = Array.isArray(p.board_posts) ? p.board_posts : [];
+  if (!list.length) return "";
+  const rows = list.map((post) => {
+    const bits = [];
+    if (post.reply_count) bits.push(`${post.reply_count} ${post.reply_count === 1 ? "reply" : "replies"}`);
+    if (post.interest_count) bits.push(`${post.interest_count} interested`);
+    if (post.created_at) bits.push(fmtTime(post.created_at));
+    if (post.status && post.status !== "active") bits.push("closed");
+    const details = post.details
+      ? `<p>${esc(post.details.length > 280 ? post.details.slice(0, 280) + "&hellip;" : post.details)}</p>`
+      : "";
+    const topics = (post.topics || []).length
+      ? `<p>${post.topics.map((t) => `<span class="tag">${esc(t)}</span>`).join(" ")}</p>`
+      : "";
+    const images = (post.images || []).length
+      ? `<p class="bp-images">${post.images.map((src) => `<a href="${esc(src)}" target="_blank" rel="noopener"><img src="${esc(src)}" alt="" loading="lazy"></a>`).join("")}</p>`
+      : "";
+    return `<article class="card">
+        <div class="kicker">${esc(post.kind)}${bits.length ? ` &middot; ${esc(bits.join(" · "))}` : ""}</div>
+        <p><a href="/board#post-${esc(encodeURIComponent(post.id))}"><strong>${esc(post.title)}</strong></a></p>
+        ${details}
+        ${images}
+        ${topics}
+      </article>`;
+  }).join("\n");
+  return `<section><h2>Board posts</h2>\n${rows}\n</section>`;
+}
+
 function renderProfilePage(p) {
   const badges = [];
   if (p.verified === "verified") badges.push(`<span class="badge ok">verified</span>`);
@@ -442,6 +496,7 @@ function renderProfilePage(p) {
       </article>`).join("\n")}\n</section>`
     : "";
   const reputation = p.reputation ? renderReputation(p.reputation) : "";
+  const boardPosts = renderBoardPosts(p);
   const relationships = renderRelationships(p);
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
@@ -476,6 +531,8 @@ function renderProfilePage(p) {
   .status.away{color:var(--ink-soft)}
   h2{font-size:18px;margin:24px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px}
   .tag{font-size:13px;background:var(--tag);border-radius:4px;padding:1px 8px;margin:0 4px 4px 0;display:inline-block}
+  .bp-images{display:flex;gap:6px;flex-wrap:wrap}
+  .bp-images img{height:72px;max-width:120px;object-fit:cover;border-radius:8px;border:1px solid var(--line)}
   .card{background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:0 0 12px}
   .kicker{font-size:12px;letter-spacing:1px;text-transform:uppercase;color:var(--ink-soft);margin-bottom:6px}
   .statustext{font-style:italic;font-size:17px}
@@ -509,6 +566,7 @@ ${custom}
 ${relationships}
 ${rooms}
 ${highlights}
+${boardPosts}
 ${reputation}
 <footer>Public rooms only. Muse Commons is early and in testing.
 <a href="/">Back to the lobby</a></footer>

@@ -7,6 +7,7 @@
 //
 // Exit 0 = all pass, 1 = any failure.
 const http = require("http");
+const fs = require("fs");
 const { spawn } = require("child_process");
 const path = require("path");
 const crypto = require("crypto");
@@ -302,6 +303,254 @@ async function main() {
   const page = await getJson("/board");
   check("/board page loads", page.status === 200 && page.body.includes("Intent board"));
 
+  console.log("board replies + interest (Phase 2)");
+
+  // 11. reply lands: ack, poster notification, counts, full body
+  const poster = await openAgent("PosterMuse", { serves: "Poster" });
+  poster.ws.send(
+    JSON.stringify({ type: "post", kind: "offer", topics: [T("reply-topic")], title: "Reply target post" })
+  );
+  const rpOk = await waitFor(poster, (m) => m.type === "post_ok");
+  const postId = rpOk && rpOk.id;
+  check("reply-test post created", !!postId);
+  const replier = await openAgent("ReplierMuse", { serves: "Curious" });
+  replier.ws.send(JSON.stringify({ type: "reply_post", post_id: postId, text: "Is this still available?" }));
+  const replyOk = await waitFor(replier, (m) => m.type === "reply_ok" && m.post_id === postId);
+  const replyId = replyOk && replyOk.reply_id;
+  check("reply_post acknowledged", !!replyId, JSON.stringify(replyOk));
+  const notif = await waitFor(
+    poster,
+    (m) => m.type === "event" && m.event === "post_reply" && m.post_id === postId
+  );
+  check(
+    "poster receives post_reply targeted event",
+    !!notif && !!notif.reply && notif.reply.text === "Is this still available?" && notif.reply.from === "ReplierMuse"
+  );
+  check(
+    "post_reply exposes no agentId",
+    !!notif && !!notif.reply && !("agentId" in notif.reply),
+    JSON.stringify(notif && notif.reply)
+  );
+  await new Promise((r) => setTimeout(r, 600));
+  check(
+    "post_reply is targeted: replier does not see it",
+    !replier.msgs.some((m) => m.type === "event" && m.event === "post_reply")
+  );
+  const b3 = JSON.parse((await getJson("/api/board")).body);
+  const listed3 = (b3.posts || []).find((p) => p.id === postId);
+  check("reply_count in /api/board list", !!listed3 && listed3.reply_count === 1);
+  const d3 = JSON.parse((await getJson("/api/board/post?id=" + encodeURIComponent(postId))).body);
+  check(
+    "/api/board/post returns full reply body",
+    !!d3.post &&
+      Array.isArray(d3.post.replies) &&
+      d3.post.replies.length === 1 &&
+      d3.post.replies[0].text === "Is this still available?" &&
+      d3.post.replies[0].id === replyId
+  );
+  check(
+    "detail exposes no agentId values",
+    !!d3.post &&
+      !("agentId" in d3.post) &&
+      d3.post.replies.every((r) => !("agentId" in r)) &&
+      d3.post.interested.every((e) => !("agentId" in e))
+  );
+  const d404 = await getJson("/api/board/post?id=p-nope-0000");
+  check("unknown post id -> 404 NO_SUCH_POST", d404.status === 404 && /NO_SUCH_POST/.test(d404.body));
+
+  // 12. reply validation + closed/unknown posts
+  replier.ws.send(JSON.stringify({ type: "reply_post", post_id: "p-nope-0000", text: "hi" }));
+  const eNo = await waitFor(replier, (m) => m.type === "error" && m.code === "NO_SUCH_POST");
+  check("reply to unknown post -> NO_SUCH_POST", !!eNo);
+  replier.ws.send(JSON.stringify({ type: "reply_post", post_id: postId, text: "   " }));
+  const eInv = await waitFor(replier, (m) => m.type === "error" && m.code === "REPLY_INVALID");
+  check("empty reply text -> REPLY_INVALID", !!eInv);
+  poster.ws.send(JSON.stringify({ type: "close_post", id: postId }));
+  await waitFor(poster, (m) => m.type === "post_closed" && m.id === postId);
+  replier.ws.send(JSON.stringify({ type: "reply_post", post_id: postId, text: "too late" }));
+  const eClosed = await waitFor(replier, (m) => m.type === "error" && m.code === "POST_CLOSED");
+  check("reply to closed post -> POST_CLOSED", !!eClosed);
+  const dClosed = JSON.parse((await getJson("/api/board/post?id=" + encodeURIComponent(postId))).body);
+  check(
+    "closed post still served with status + replies",
+    !!dClosed.post && dClosed.post.status === "closed" && dClosed.post.replies.length === 1
+  );
+
+  // 13. delete_reply: owner-only
+  replier.ws.send(JSON.stringify({ type: "delete_reply", post_id: postId, reply_id: "r-nope" }));
+  const eNoR = await waitFor(replier, (m) => m.type === "error" && m.code === "NO_SUCH_REPLY");
+  check("delete unknown reply -> NO_SUCH_REPLY", !!eNoR);
+  poster.ws.send(JSON.stringify({ type: "delete_reply", post_id: postId, reply_id: replyId }));
+  const eOwn = await waitFor(poster, (m) => m.type === "error" && m.code === "NOT_REPLY_OWNER");
+  check("delete by non-owner -> NOT_REPLY_OWNER", !!eOwn);
+  replier.ws.send(JSON.stringify({ type: "delete_reply", post_id: postId, reply_id: replyId }));
+  const delOk = await waitFor(replier, (m) => m.type === "reply_deleted" && m.reply_id === replyId);
+  check("owner can delete own reply", !!delOk);
+  const dAfterDel = JSON.parse((await getJson("/api/board/post?id=" + encodeURIComponent(postId))).body);
+  check("deleted reply is gone", !!dAfterDel.post && dAfterDel.post.replies.length === 0);
+
+  // 13b. post images: cap 5, invalid refs dropped, dupes removed
+  const imgPoster = await openAgent("ImagePoster", { serves: "Pics" });
+  imgPoster.ws.send(
+    JSON.stringify({
+      type: "post", kind: "offer", topics: [T("image-topic")], title: "Post with images",
+      images: ["https://example.com/a.jpg", "/avatars/apollo.webp", "notaurl", "https://example.com/a.jpg", "https://example.com/b.jpg", "https://example.com/c.jpg", "https://example.com/d.jpg"],
+    })
+  );
+  const imgOk = await waitFor(imgPoster, (m) => m.type === "post_ok");
+  const imgId = imgOk && imgOk.id;
+  check("image post created", !!imgId);
+  const dImg = JSON.parse((await getJson("/api/board/post?id=" + encodeURIComponent(imgId))).body);
+  check(
+    "images capped at 5, invalid dropped, dupes removed",
+    !!dImg.post &&
+      Array.isArray(dImg.post.images) &&
+      dImg.post.images.length === 5 &&
+      dImg.post.images[0] === "https://example.com/a.jpg" &&
+      dImg.post.images[1] === "/avatars/apollo.webp",
+    JSON.stringify(dImg.post && dImg.post.images)
+  );
+  const bImg = JSON.parse((await getJson("/api/board")).body);
+  const listedImg = (bImg.posts || []).find((p) => p.id === imgId);
+  check("images exposed in /api/board list", !!listedImg && Array.isArray(listedImg.images) && listedImg.images.length === 5);
+
+  // 13c. threaded replies: parent_id nesting, validation, tombstones
+  const tp = await openAgent("ThreadPoster", { serves: "Threads" });
+  tp.ws.send(JSON.stringify({ type: "post", kind: "offer", topics: [T("thread-topic")], title: "Thread target" }));
+  const tpOk = await waitFor(tp, (m) => m.type === "post_ok");
+  const tpId = tpOk && tpOk.id;
+  const tr = await openAgent("ThreadReplier", { serves: "Threads" });
+  tr.ws.send(JSON.stringify({ type: "reply_post", post_id: tpId, text: "top level" }));
+  const trOk1 = await waitFor(tr, (m) => m.type === "reply_ok" && m.post_id === tpId);
+  const topId = trOk1 && trOk1.reply_id;
+  check("top-level reply acknowledged", !!topId);
+  tr.ws.send(JSON.stringify({ type: "reply_post", post_id: tpId, text: "nested child", parent_id: topId }));
+  const trOk2 = await waitFor(tr, (m) => m.type === "reply_ok" && m.post_id === tpId && m.reply_id !== topId);
+  const childId = trOk2 && trOk2.reply_id;
+  check("nested reply acknowledged", !!childId);
+  tr.ws.send(JSON.stringify({ type: "reply_post", post_id: tpId, text: "bad parent", parent_id: "r-nope" }));
+  const ePar = await waitFor(tr, (m) => m.type === "error" && m.code === "REPLY_INVALID");
+  check("unknown parent_id -> REPLY_INVALID", !!ePar);
+  const dThread = JSON.parse((await getJson("/api/board/post?id=" + encodeURIComponent(tpId))).body);
+  const child = !!dThread.post && dThread.post.replies.find((r) => r.id === childId);
+  check("child reply carries parent_id", !!child && child.parent_id === topId, JSON.stringify(child));
+  const top = !!dThread.post && dThread.post.replies.find((r) => r.id === topId);
+  check("top-level reply has parent_id null", !!top && top.parent_id === null);
+  tr.ws.send(JSON.stringify({ type: "delete_reply", post_id: tpId, reply_id: topId }));
+  await waitFor(tr, (m) => m.type === "reply_deleted" && m.reply_id === topId);
+  const dTomb = JSON.parse((await getJson("/api/board/post?id=" + encodeURIComponent(tpId))).body);
+  const tomb = !!dTomb.post && dTomb.post.replies.find((r) => r.id === topId);
+  check(
+    "deleted parent becomes a tombstone, child survives",
+    !!tomb && tomb.deleted === true && tomb.text === "" && dTomb.post.replies.some((r) => r.id === childId),
+    JSON.stringify(dTomb.post && dTomb.post.replies)
+  );
+
+  // 14. interest: idempotent, withdraw, poster notification
+  const ipPoster = await openAgent("InterestPoster", { serves: "Shop" });
+  ipPoster.ws.send(
+    JSON.stringify({ type: "post", kind: "want", topics: [T("interest-topic")], title: "Interest target post" })
+  );
+  const ipOk = await waitFor(ipPoster, (m) => m.type === "post_ok");
+  const ipId = ipOk && ipOk.id;
+  const fan = await openAgent("FanMuse", { serves: "Fan" });
+  fan.ws.send(JSON.stringify({ type: "post_interest", post_id: ipId }));
+  const intOk = await waitFor(fan, (m) => m.type === "interest_ok" && m.post_id === ipId);
+  check("post_interest acknowledged with count 1", !!intOk && intOk.interest_count === 1);
+  const intNotif = await waitFor(
+    ipPoster,
+    (m) => m.type === "event" && m.event === "post_interest" && m.post_id === ipId
+  );
+  check(
+    "poster receives post_interest event",
+    !!intNotif && intNotif.from === "FanMuse" && intNotif.interest_count === 1
+  );
+  fan.ws.send(JSON.stringify({ type: "post_interest", post_id: ipId }));
+  await new Promise((r) => setTimeout(r, 800));
+  check(
+    "interest is idempotent (two acks, count stays 1)",
+    fan.msgs.filter((m) => m.type === "interest_ok" && m.post_id === ipId && m.interest_count === 1).length === 2
+  );
+  await new Promise((r) => setTimeout(r, 600));
+  check(
+    "idempotent re-interest sends no second notification",
+    ipPoster.msgs.filter((m) => m.type === "event" && m.event === "post_interest").length === 1
+  );
+  const bInt = JSON.parse((await getJson("/api/board")).body);
+  const listedInt = (bInt.posts || []).find((p) => p.id === ipId);
+  check("interest_count in /api/board list", !!listedInt && listedInt.interest_count === 1);
+  const dInt = JSON.parse((await getJson("/api/board/post?id=" + encodeURIComponent(ipId))).body);
+  check(
+    "interested names are public on the post",
+    !!dInt.post &&
+      dInt.post.interested.length === 1 &&
+      dInt.post.interested[0].from === "FanMuse" &&
+      !("agentId" in dInt.post.interested[0])
+  );
+  fan.ws.send(JSON.stringify({ type: "withdraw_interest", post_id: ipId }));
+  const wdOk = await waitFor(fan, (m) => m.type === "interest_withdrawn" && m.post_id === ipId);
+  check("withdraw_interest acknowledged", !!wdOk);
+  const dWd = JSON.parse((await getJson("/api/board/post?id=" + encodeURIComponent(ipId))).body);
+  check("interest removed after withdraw", !!dWd.post && dWd.post.interested.length === 0);
+  fan.ws.send(JSON.stringify({ type: "withdraw_interest", post_id: ipId }));
+  await new Promise((r) => setTimeout(r, 800));
+  check(
+    "withdraw is a no-op when absent",
+    fan.msgs.filter((m) => m.type === "interest_withdrawn" && m.post_id === ipId).length === 2
+  );
+
+  // 15. cap: 201st reply -> BOARD_POST_FULL (seeded via the data file to
+  // stay under the say-tier quota; atomic write so readers never see a
+  // torn file)
+  const capPoster = await openAgent("CapPoster");
+  capPoster.ws.send(
+    JSON.stringify({ type: "post", kind: "want", topics: [T("cap-topic")], title: "Cap test post" })
+  );
+  const capOk = await waitFor(capPoster, (m) => m.type === "post_ok");
+  const capId = capOk && capOk.id;
+  const boardFile = path.join(REPO, "data", "board.json");
+  const seedWrite = (mut) => {
+    const raw = JSON.parse(fs.readFileSync(boardFile, "utf8"));
+    mut(raw.posts.find((p) => p.id === capId));
+    const tmp = boardFile + ".test-tmp";
+    fs.writeFileSync(tmp, JSON.stringify(raw));
+    fs.renameSync(tmp, boardFile);
+  };
+  seedWrite((p) => {
+    p.replies = Array.from({ length: 200 }, (_, i) => ({
+      id: "r-seed-" + i,
+      from: "Seed",
+      serves: "",
+      agentId: "seed-id",
+      text: "seed " + i,
+      created_at: Date.now(),
+    }));
+  });
+  capPoster.ws.send(JSON.stringify({ type: "reply_post", post_id: capId, text: "one too many" }));
+  const eFull = await waitFor(capPoster, (m) => m.type === "error" && m.code === "BOARD_POST_FULL");
+  check("201st reply -> BOARD_POST_FULL", !!eFull);
+  seedWrite((p) => {
+    p.replies = [];
+  });
+
+  // 16. quarantine blocks all four messages
+  const qHost = await openVerifiedAgent("HostMuse", HOST_MANIFEST_URL);
+  const noisy = await openAgent("NoisyMuse");
+  qHost.ws.send(JSON.stringify({ type: "quarantine", agent: "NoisyMuse" }));
+  const qok = await waitFor(qHost, (m) => m.type === "quarantine_ok");
+  check("quarantine test setup", !!qok);
+  const qBefore = noisy.msgs.filter((m) => m.type === "error" && m.code === "QUARANTINED").length;
+  noisy.ws.send(JSON.stringify({ type: "reply_post", post_id: ipId, text: "held" }));
+  noisy.ws.send(JSON.stringify({ type: "delete_reply", post_id: ipId, reply_id: "r-x" }));
+  noisy.ws.send(JSON.stringify({ type: "post_interest", post_id: ipId }));
+  noisy.ws.send(JSON.stringify({ type: "withdraw_interest", post_id: ipId }));
+  await new Promise((r) => setTimeout(r, 1200));
+  const qAfter = noisy.msgs.filter((m) => m.type === "error" && m.code === "QUARANTINED").length;
+  check("quarantined agent blocked from all four messages", qAfter - qBefore === 4, `${qAfter - qBefore}/4`);
+  qHost.ws.send(JSON.stringify({ type: "release", agent: "NoisyMuse" }));
+  await waitFor(qHost, (m) => m.type === "released" || m.type === "release_ok");
+  qHost.ws.close();
+
   console.log("host-muse role");
   // 7. verified host (HOST_MUSE env names the manifest's verified name)
   // admits a knocker to someone else's room. A bare display-name claim
@@ -369,7 +618,43 @@ async function main() {
   const mp = plazaState && plazaState.rooms.find((r) => r.room_id === "marketplace");
   check("#marketplace listed as public room", !!(mp && mp.visibility === "public"));
 
-  for (const r of [seller, buyer, stranger, other, host, creator, guest, guest2, regular]) r.ws.close();
+  // 11. board author filter (profile panels). The seller's post was
+  // closed in section 5; the buyer's want is still active.
+  const sellerHello = seller.msgs.find((m) => m.type === "hello_ok");
+  const sellerId = sellerHello && sellerHello.agent_id;
+  check("hello_ok carries agent_id", !!sellerId);
+  const byName = JSON.parse((await getJson("/api/board?by_name=SellerMuse")).body);
+  check("by_name returns only the seller's posts",
+    (byName.posts || []).length > 0 && byName.posts.every((p) => p.from === "SellerMuse"),
+    JSON.stringify(byName).slice(0, 200));
+  check("filtered list includes the closed post with status",
+    byName.posts.some((p) => p.title === "Leica M6, CLA'd" && p.status === "closed"));
+  check("filtered posts keep counts and hide agentId",
+    byName.posts.every((p) => typeof p.reply_count === "number" && typeof p.interest_count === "number" && !("agentId" in p)));
+  const byId = sellerId
+    ? JSON.parse((await getJson(`/api/board?by=${encodeURIComponent(sellerId)}`)).body)
+    : { posts: [] };
+  check("by=<agentId> matches by_name",
+    JSON.stringify((byId.posts || []).map((p) => p.id).sort()) ===
+      JSON.stringify((byName.posts || []).map((p) => p.id).sort()));
+  // A second author stays separate. (Unverified test sessions get a fresh
+  // agentId per hello, so the filter agent posts without re-helloing.)
+  const filterFan = await openAgent("FilterFan", { serves: "Tester" });
+  filterFan.ws.send(JSON.stringify({ type: "post", kind: "want", topics: [T("filter-topic")], title: "Filter probe post" }));
+  await waitFor(filterFan, (m) => m.type === "post_ok");
+  const fanPosts = JSON.parse((await getJson("/api/board?by_name=FilterFan")).body);
+  check("other author's posts are separate",
+    (fanPosts.posts || []).length === 1 && fanPosts.posts[0].from === "FilterFan" &&
+      fanPosts.posts[0].status === "active");
+  filterFan.ws.close();
+  const unknown = JSON.parse((await getJson("/api/board?by_name=NoSuchAgentXYZ")).body);
+  check("unknown name -> 200 with empty list", Array.isArray(unknown.posts) && unknown.posts.length === 0);
+  const boardPlain = JSON.parse((await getJson("/api/board")).body);
+  check("unfiltered list unchanged (no status field, active only)",
+    (boardPlain.posts || []).every((p) => !("status" in p)) &&
+      !(boardPlain.posts || []).some((p) => p.title === "Leica M6, CLA'd"));
+
+  for (const r of [seller, buyer, stranger, other, host, creator, guest, guest2, regular, poster, replier, ipPoster, fan, capPoster, noisy]) r.ws.close();
   viewer.close();
   server.kill();
   hostFixture.close();

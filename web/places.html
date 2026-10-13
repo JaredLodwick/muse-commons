@@ -5,53 +5,63 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Places — Muse Commons</title>
 <link rel="stylesheet" href="style.css">
+<script>try{var t=localStorage.getItem("mc_theme");if(t==="light"||t==="dark"){document.documentElement.dataset.theme=t;document.documentElement.classList.toggle("dark",t==="dark");}}catch(e){}</script>
 <style>
+  /* Places page: Warm Editorial tokens come from style.css. Only the
+     local-category hue is local (interest = --ok, utility = --accent). */
+  :root { --cat-local: #A67C1B; }
+  html[data-theme="dark"], html.dark { --cat-local: #D9A84E; }
   body { overflow: auto; }
   #places { max-width: 780px; margin: 0 auto; padding: 36px 20px 60px; }
-  #places .back { margin-bottom: 18px; font-size: 13px; }
-  #places .back a { color: #8b95ad; text-decoration: none; margin-right: 14px; }
-  #places .back a:hover { color: #e8ecf4; }
-  #places h1 { font-size: 26px; margin-bottom: 6px; }
-  #places .sub { color: #8b95ad; font-size: 14px; margin-bottom: 22px; line-height: 1.5; }
+  #places .back { margin-bottom: 18px; font-size: 13px; display: flex; align-items: center; }
+  #places .back a { color: var(--soft); text-decoration: none; margin-right: 14px; }
+  #places .back a:hover { color: var(--ink); }
+  #theme-toggle { font: inherit; font-size: 13px; color: var(--soft); background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; cursor: pointer; margin-left: auto; }
+  #theme-toggle:hover { color: var(--ink); border-color: var(--accent); }
+  #places h1 { font-family: var(--serif); font-size: 26px; font-weight: 600; margin-bottom: 6px; }
+  #places .sub { color: var(--soft); font-size: 14px; margin-bottom: 22px; line-height: 1.5; }
   #filters { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px; align-items: center; }
   #filters .cats { display: flex; gap: 6px; flex-wrap: wrap; }
   #filters button.cat {
-    background: #111625; color: #8b95ad; border: 1px solid #2e3a58;
-    border-radius: 16px; padding: 5px 14px; font-size: 13px; cursor: pointer;
+    background: var(--card); color: var(--soft); border: 1px solid var(--line);
+    border-radius: 16px; padding: 5px 14px; font-size: 13px; cursor: pointer; font-family: inherit;
   }
-  #filters button.cat.on { color: #e8ecf4; border-color: #38436a; background: #1a2138; }
+  #filters button.cat:hover { border-color: var(--accent); color: var(--ink); }
+  #filters button.cat.on { color: var(--accent-ink); border-color: var(--accent); background: var(--accent); font-weight: 600; }
   #filters input {
-    background: #0d1119; color: #e8ecf4; border: 1px solid #2e3a58;
+    background: var(--card); color: var(--ink); border: 1px solid var(--line);
     border-radius: 8px; padding: 7px 10px; font-size: 13px; font-family: inherit;
     min-width: 180px; flex: 1;
   }
+  #filters input::placeholder { color: var(--faint); }
+  #filters input:focus { border-color: var(--accent); outline: none; }
   .place-card {
-    background: #111625; border: 1px solid #1f2942; border-radius: 12px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
     padding: 16px 18px; margin-bottom: 12px; display: flex; gap: 14px;
     align-items: flex-start; justify-content: space-between;
   }
   .place-card .info { flex: 1; }
   .place-card .top { display: flex; gap: 10px; align-items: baseline; margin-bottom: 6px; flex-wrap: wrap; }
-  .place-card .topic { font-size: 16px; font-weight: 700; color: #e8ecf4; }
+  .place-card .topic { font-family: var(--serif); font-size: 17px; font-weight: 700; color: var(--ink); }
   .place-card .cat {
     font-size: 11px; font-weight: 700; letter-spacing: 0.8px;
     border-radius: 6px; padding: 2px 8px; text-transform: uppercase;
   }
-  .place-card .cat.interest { color: #34d399; border: 1px solid #34d39955; background: #34d39911; }
-  .place-card .cat.local { color: #fbbf24; border: 1px solid #fbbf2455; background: #fbbf2411; }
-  .place-card .cat.utility { color: #60a5fa; border: 1px solid #60a5fa55; background: #60a5fa11; }
-  .place-card .desc { font-size: 14px; color: #c7d0e4; line-height: 1.5; }
-  .place-card .meta { font-size: 12px; color: #8b95ad; margin-top: 8px; }
-  .place-card .meta a { color: #8b95ad; }
-  .place-card .meta a:hover { color: #e8ecf4; }
-  .place-card .occ { font-size: 13px; color: #8b95ad; white-space: nowrap; padding-top: 2px; }
-  .place-card .occ b { color: #e8ecf4; font-size: 18px; }
-  .dim { color: #8b95ad; }
+  .place-card .cat.interest { color: var(--ok); border: 1px solid var(--ok); background: var(--accent-soft); }
+  .place-card .cat.local { color: var(--cat-local); border: 1px solid var(--cat-local); background: var(--accent-soft); }
+  .place-card .cat.utility { color: var(--accent); border: 1px solid var(--accent); background: var(--accent-soft); }
+  .place-card .desc { font-size: 14px; color: var(--ink); line-height: 1.5; }
+  .place-card .meta { font-size: 12px; color: var(--soft); margin-top: 8px; }
+  .place-card .meta a { color: var(--soft); }
+  .place-card .meta a:hover { color: var(--ink); }
+  .place-card .occ { font-size: 13px; color: var(--soft); white-space: nowrap; padding-top: 2px; }
+  .place-card .occ b { color: var(--ink); font-size: 18px; }
+  .dim { color: var(--faint); }
 </style>
 </head>
 <body>
 <div id="places">
-  <div class="back"><a href="/">← back to the lobby</a><a href="/directory">Lobby directory →</a><a href="/board">Intent board →</a></div>
+  <div class="back"><a href="/">← back to the lobby</a><a href="/directory">Lobby directory →</a><a href="/board">Intent board →</a><button id="theme-toggle" type="button" aria-label="Toggle light and dark mode">Light / Dark</button></div>
   <h1>Places</h1>
   <p class="sub">Everywhere to hang out in the commons — interest groups, local rooms,
   and the utility rooms that keep the place running. Walk into any of them from the lobby.</p>
@@ -127,6 +137,13 @@ document.querySelectorAll("#filters button.cat").forEach((b) => {
   });
 });
 document.getElementById("f-q").addEventListener("input", render);
+document.getElementById("theme-toggle").onclick = function () {
+  var h = document.documentElement;
+  var t = h.dataset.theme === "dark" ? "light" : "dark";
+  h.dataset.theme = t;
+  h.classList.toggle("dark", t === "dark");
+  try { localStorage.setItem("mc_theme", t); } catch (e) {}
+};
 load();
 </script>
 </body>

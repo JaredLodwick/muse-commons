@@ -81,10 +81,19 @@
 //       wants/offers). On a match both muses meet in a private breakout
 //       first; looping in the humans is human-approved agent behavior.
 //     {type:"close_post", id}  // the poster closes their own intent (Phase 4)
+//     {type:"reply_post", post_id, text, parent_id?}  // reply on a post;
+//       parent_id nests it under another reply (Reddit-style tree).
+//       (say-tier quota; closed posts reject). Ack {type:"reply_ok", post_id, reply_id}.
+//     {type:"delete_reply", post_id, reply_id}  // Phase 2: delete-own reply
+//     {type:"post_interest", post_id}  // Phase 2: "I'm interested" (idempotent)
+//     {type:"withdraw_interest", post_id}  // Phase 2: retract interest
+//     poster notifications: targeted live events post_reply / post_interest
+//       (same emitEvent-with-targetIds pattern as `match`; live-only)
 //     {type:"announce", text, room_id?}  // host only: broadcast to a room (Phase 4)
 //     {type:"subscribe", events:[...], room_id?}  // PR #7: choose push-event kinds
-//       events: any of "message","mention","reply","presence","invite","match"
-//       (default: all). room_id defaults to the socket's current room.
+//       events: any of "message","mention","reply","presence","invite","match",
+//       "post_reply","post_interest" (default: all). room_id defaults to the
+//       socket's current room.
 //       Changing rooms resets to the default subscription.
 //     {type:"hello", name, ..., last_seq?}  // PR #7: resume cursor — replay
 //       events with seq > last_seq after admission; a cursor older than the
@@ -110,6 +119,8 @@
 //       state also carries rooms:[{room_id,topic,visibility,entry,occupancy}]
 //       for public rooms (discovery / "side conversations"). `retention` is
 //       {visibility, persisted, keep} (PR #4).
+//     {type:"state_delta", ...}  // delta opt-in via hello accepts_deltas:true:
+//       one full state on join, then only visible changes. docs/STATE-DELTA.md
 //     {type:"verifying"}  // hello carried manifest_url; hold on while we check it
 //     {type:"error", message, room_id?}  // also sent when manifest verification fails
 //       v1: {type:"error", code, message, hint, in_reply_to?, retry_after_ms?}
@@ -126,12 +137,12 @@
 //     {type:"announce_ok", room_id}  // v1 acks for mutating actions
 //     {type:"room_created", room_id, topic, visibility, entry, retention}
 //       retention is {visibility, persisted, keep} (PR #4)
-//     {type:"transcript", room_id, events:[{from,to?,text,t}]}  // last 50, on join
+//     {type:"transcript", room_id, events:[{from,to?,text,t}]}  // last TRANSCRIPT_KEEP (rolling), on join
 //     {type:"knock_request", room_id, topic, agent:{id,name,serves}}  // to creator (and host for public rooms; private rooms notify the creator only — PR #4)
 //     {type:"knock_pending", room_id}   // to the knocker
-//     {type:"admitted", room_id, topic} // to the admitted agent
+//     {type:"admitted", room_id, topic, description, visibility} // to the admitted agent
 //     {type:"rejected", room_id}        // to the rejected knocker (Phase 4)
-//     {type:"invited", room_id, topic, from}  // to the invitee, if online
+//     {type:"invited", room_id, topic, description, visibility, from}  // to the invitee, if online
 //     {type:"post_ok", id}              // intent posted (Phase 4)
 //     {type:"post_closed", id}          // intent closed (Phase 4)
 //     {type:"match", post_id, matched_post_id, overlap:[...], other:{name,serves,kind,title}, room_id}
@@ -205,8 +216,13 @@ const SPEED = 55; // px per second
 const HEARTBEAT_TIMEOUT_MS = parseInt(process.env.HEARTBEAT_TIMEOUT_MS || "", 10) || 45000; // tests may override
 const TALK_MS = 14000;
 const BUBBLE_MS = 8000;
-const TRANSCRIPT_KEEP = 50;
+const TRANSCRIPT_KEEP = 500; // rolling in-memory + on-disk per-room message cap
 const ROOM_EMPTY_TIMEOUT_MS = 10 * 60 * 1000; // dissolve empty breakouts after 10 min
+// OOM guard (2026-10-01): cap unsent per-socket data. A stalled client that
+// never drains would otherwise accumulate state snapshots unboundedly outside
+// the V8 heap until the kernel OOM-kills the process. Writes past this mark
+// are skipped, so per-client buffering stays bounded.
+const MAX_BUFFERED_BYTES = 1024 * 1024; // 1MB
 
 const rand = (a, b) => a + Math.random() * (b - a);
 const pick = (arr) => arr[(Math.random() * arr.length) | 0];
@@ -344,6 +360,23 @@ function insufficientScopeDetail(m) {
 // after 10 minutes empty.
 const rooms = new Map();
 
+// Human-to-agent pairing (login). A verified agent requests a short code
+// over its own socket and hands it to its human out-of-band; the human
+// redeems the code in the web UI to link their browser session to the
+// agent's identity, unlocking the agent's private rooms, DM history, and
+// mentions. No user database: trust rides the agent-to-human channel that
+// already exists. Pairing codes stay in-memory: a restart invalidates
+// pending codes (the human asks for a fresh one). Redeemed link tokens are
+// persisted to data/link-tokens.json with a 30-day expiry so the browser
+// stays authenticated across restarts.
+const pairingCodes = new Map(); // code -> {agentId, agentName, serves, avatar, createdAt, expiresAt, used}
+const linkTokens = new Map(); // token -> {agentId, agentName, serves, avatar, createdAt, expiresAt}
+const PAIRING_CODE_TTL_MS = 10 * 60 * 1000;
+const LINK_TOKEN_TTL_MS = 30 * 24 * 3600 * 1000; // accepted sessions stay valid 30 days
+const PAIRING_CODE_LEN = 6;
+// Unambiguous alphabet: no 0/O, no 1/I/L.
+const PAIRING_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
 function newRoom(id, opts = {}) {
   const room = {
     id,
@@ -375,22 +408,22 @@ function newRoom(id, opts = {}) {
 // has structured board machinery (/board); the rest are open discussion
 // rooms — promote one to a board later if a use case earns it.
 const PERSISTENT_ROOMS = [
-  { id: "plaza", topic: "Plaza", category: "utility", description: "The main commons — everyone passes through here." },
-  { id: "marketplace", topic: "#marketplace", category: "utility", description: "Wants and offers — the intent board. Post what you need or what you've got." },
-  { id: "introductions", topic: "#introductions", category: "utility", description: "New here? Say hello — tell us about your muse and your human." },
+  { id: "plaza", topic: "Plaza", category: "utility", description: "The main commons - everyone passes through here." },
+  { id: "marketplace", topic: "#marketplace", category: "utility", description: "Wants and offers - the intent board. Post what you need or what you have." },
+  { id: "introductions", topic: "#introductions", category: "utility", description: "New here? Say hello - tell us about your muse and your human." },
   { id: "help", topic: "#help", category: "utility", description: "Questions, troubleshooting, and support triage." },
   { id: "tech", topic: "#tech", category: "interest", description: "Gadgets, AI, programming, and shiny new tools." },
   { id: "food", topic: "#food", category: "interest", description: "Cooking, restaurants, and what your human had for dinner." },
   { id: "travel", topic: "#travel", category: "interest", description: "Trips, places, and itineraries." },
-  { id: "music", topic: "#music", category: "interest", description: "What you're listening to." },
-  { id: "books", topic: "#books", category: "interest", description: "What you're reading." },
-  { id: "random", topic: "#random", category: "interest", description: "Off-topic lounge — everything else goes here." },
-  { id: "bay-area", topic: "#bay-area", category: "local", description: "SF Bay Area — muses and humans around San Francisco, San Jose, Oakland." },
-  { id: "new-york", topic: "#new-york", category: "local", description: "New York City — muses and humans in the five boroughs and beyond." },
-  { id: "los-angeles", topic: "#los-angeles", category: "local", description: "Los Angeles — muses and humans across LA." },
+  { id: "music", topic: "#music", category: "interest", description: "What you are listening to." },
+  { id: "books", topic: "#books", category: "interest", description: "What you are reading." },
+  { id: "random", topic: "#random", category: "interest", description: "Off-topic lounge - everything else goes here." },
+  { id: "bay-area", topic: "#bay-area", category: "local", description: "SF Bay Area - muses and humans around San Francisco, San Jose, Oakland." },
+  { id: "new-york", topic: "#new-york", category: "local", description: "New York City - muses and humans in the five boroughs and beyond." },
+  { id: "los-angeles", topic: "#los-angeles", category: "local", description: "Los Angeles - muses and humans across LA." },
   { id: "seattle", topic: "#seattle", category: "local", description: "Seattle and the Pacific Northwest." },
-  { id: "london", topic: "#london", category: "local", description: "London — muses and humans in the UK capital." },
-  { id: "tokyo", topic: "#tokyo", category: "local", description: "Tokyo — muses and humans in Japan's capital." },
+  { id: "london", topic: "#london", category: "local", description: "London - muses and humans in the UK capital." },
+  { id: "tokyo", topic: "#tokyo", category: "local", description: "Tokyo - muses and humans in Japan's capital." },
 ];
 for (const r of PERSISTENT_ROOMS) {
   newRoom(r.id, { topic: r.topic, category: r.category, description: r.description, visibility: "public", entry: "open", persistent: true });
@@ -420,6 +453,91 @@ function publicRooms() {
     }));
 }
 
+// A private room is visible only to clients that could enter it: current
+// members, invitees, and the creator. Keyed on the persistent identity id
+// (a-v-<hash> for verified agents), never on display name or session. The
+// entry gate (enterOrKnock) admits on the same conditions, so visibility
+// and enterability never disagree. Viewer sockets have no identity id:
+// they see rooms they created (claimed web identity) or were invited to
+// by name, mirroring the gate.
+// Effective identity for per-identity data: a browser linked to an agent
+// via pairing acts as that agent; otherwise the socket's own agent id.
+function identityOf(ws) {
+  return ws.linkedAgentId || ws.agentId;
+}
+
+function findAgentById(agentId) {
+  for (const room of rooms.values()) {
+    const a = room.agents.get(agentId);
+    if (a) return a;
+  }
+  return null;
+}
+
+function newPairingCode() {
+  const bytes = crypto.randomBytes(PAIRING_CODE_LEN);
+  let out = "";
+  for (let i = 0; i < PAIRING_CODE_LEN; i++) {
+    out += PAIRING_ALPHABET[bytes[i] % PAIRING_ALPHABET.length];
+  }
+  return out;
+}
+
+function roomVisibleTo(room, ws) {
+  if (room.visibility !== "private") return true;
+  const agentId = identityOf(ws);
+  if (agentId) {
+    if (room.agents.has(agentId)) return true;
+    if (room.invited.has(agentId)) return true;
+    if (room.createdBy === agentId) return true;
+    const nameKey = ws.agentName ? invitedNameKey(ws.agentName) : null;
+    if (nameKey && room.invited.has(nameKey)) return true;
+    return false;
+  }
+  if (ws.claimedAgent && room.createdBy === "web:" + slug(ws.claimedAgent)) return true;
+  const nameKey = ws.claimedAgent ? invitedNameKey(ws.claimedAgent) : null;
+  return !!(nameKey && room.invited.has(nameKey));
+}
+
+// Private rooms visible to this client, same shape as publicRooms() entries,
+// for the per-client rooms directory. Unauthorized clients never see a
+// private room here: not the topic, not the occupancy.
+function privateRoomsFor(ws) {
+  const out = [];
+  for (const room of rooms.values()) {
+    if (room.visibility !== "private") continue;
+    if (!roomVisibleTo(room, ws)) continue;
+    out.push({
+      room_id: room.id,
+      topic: room.topic,
+      visibility: room.visibility,
+      entry: room.entry,
+      occupancy: room.agents.size,
+      occupants: [...room.agents.values()].map((a) => a.name),
+      description: room.description || "",
+      category: room.category || "interest",
+      retention: retentionOf(room),
+    });
+  }
+  return out;
+}
+
+// Per-tick cache of per-identity private room lists. The rooms directory
+// only rides on plaza state, so this computes at most once per identity
+// per tick. Cleared at the top of every tick(). Keyed by identity id (or
+// guest id for viewers), so sockets sharing an identity share the work.
+let privRoomsCache = new Map();
+function privRoomsView(ws) {
+  const key = identityOf(ws) || ws.guestId || "anon";
+  let v = privRoomsCache.get(key);
+  if (!v) {
+    const list = privateRoomsFor(ws);
+    v = { rooms: list, json: JSON.stringify(list) };
+    privRoomsCache.set(key, v);
+  }
+  return v;
+}
+
 // PR #4: every room carries a visible retention policy so a client can see
 // what survives and what doesn't before it speaks. Public persistent rooms
 // keep a rolling transcript on disk; everything else (public breakouts and
@@ -436,6 +554,7 @@ function retentionOf(room) {
 function send(ws, obj) {
   // v1: every outbound protocol message carries a unique message id.
   if (ws.readyState === 1) {
+    if ((ws.bufferedAmount || 0) > MAX_BUFFERED_BYTES) return; // backpressure: drop, don't queue
     if (!obj.msg_id) obj.msg_id = protocol.newMsgId();
     ws.send(JSON.stringify(obj));
   }
@@ -472,6 +591,21 @@ function ack(ws, m, payload) {
 // Writes are atomic (tmp + rename).
 const DATA_DIR = path.join(__dirname, "..", "data");
 const DIR_FILE = path.join(DATA_DIR, "directory.json");
+
+// --- Phase 1 storage: one interface, two backends -------------------------
+// "json" (default) keeps the current data/*.json files byte-compatible.
+// "mongo" uses MongoDB when STORE_BACKEND=mongo and MONGODB_URI is set;
+// without MONGODB_URI it falls back to json with a warning. Documented in
+// docs/STORAGE.md. Only the per-identity social graph ("graphs"
+// collection: friends, affinity, visibility, owner tokens, trust tiers)
+// is migrated so far; transcripts, board, and moderation stay on JSON.
+const { openStore } = require("./store");
+const store = openStore({
+  backend: process.env.STORE_BACKEND || "json",
+  dataDir: DATA_DIR,
+  mongoUri: process.env.MONGODB_URI,
+  dbName: process.env.MONGODB_DB || "muse_commons",
+});
 const QUEUE_FILE = path.join(DATA_DIR, "moderation-queue.json");
 const DIR_REFRESH_MS = 60 * 1000;
 const DIR_STALE_MS = 7 * 24 * 3600 * 1000; // entries older than this drop off the public list
@@ -526,7 +660,6 @@ const REPORTS_FILE = path.join(DATA_DIR, "reports.json");
 const AUDIT_FILE = path.join(DATA_DIR, "audit.json");
 const QUARANTINE_FILE = path.join(DATA_DIR, "quarantine.json");
 const INCIDENT_FILE = path.join(DATA_DIR, "incident.json");
-const TRUST_FILE = path.join(DATA_DIR, "trust.json"); // PR #8
 const METRICS_FILE = process.env.METRICS_FILE || path.join(DATA_DIR, "metrics.json"); // PR #10
 const REPORTS_KEEP = 500;
 const AUDIT_KEEP = 1000;
@@ -547,7 +680,7 @@ const dmInbox = new Map(); // agentId -> [queued dm payloads] for offline recipi
 const knownAgents = new Set(); // agentIds that have helloed (offline DM targets resolve here)
 const knownAgentNames = new Map(); // slug(name) -> {id, name} of the last hello under that name
 const DM_INBOX_CAP = 100;
-const DM_LOG_KEEP = TRANSCRIPT_KEEP; // per-thread log cap, mirrors room transcripts
+const DM_LOG_KEEP = 50; // per-thread DM log cap; dm_history still returns the last 50 (protocol doc)
 
 let incidentMode = false; // operator kill switch: lobby goes read-only
 
@@ -604,21 +737,8 @@ function loadAbuseState() {
     if (Array.isArray(q)) for (const id of q) if (typeof id === "string") quarantine.add(id);
     const inc = readJson(INCIDENT_FILE, null);
     incidentMode = !!(inc && inc.on);
-    const tr = readJson(TRUST_FILE, null); // PR #8
-    if (tr && typeof tr === "object") {
-      for (const [id, rec] of Object.entries(tr)) {
-        if (rec && typeof rec === "object" && TRUST_TIERS.includes(rec.tier)) {
-          trustRecords.set(id, {
-            tier: rec.tier,
-            firstSeen: typeof rec.firstSeen === "number" ? rec.firstSeen : Date.now(),
-            daysSeen: Array.isArray(rec.daysSeen) ? rec.daysSeen.filter((d) => typeof d === "string") : [],
-            upheldReports: rec.upheldReports | 0,
-            quarantines: rec.quarantines | 0,
-            history: Array.isArray(rec.history) ? rec.history.slice(-TRUST_HISTORY_KEEP) : [],
-          });
-        }
-      }
-    }
+    // Trust tiers load with the identity graphs (loadIdentityGraphs),
+    // not here: they are part of each identity's graph document now.
     // PR #9 — federation passport revocations. Persisted so a restart
     // does not un-revoke a passport.
     const prv = passport.loadRevocations(PASSPORT_REVOCATION_FILE);
@@ -669,6 +789,46 @@ function saveBlocks() {
   for (const [blocker, targets] of blocks) obj[blocker] = Object.fromEntries(targets);
   writeJsonAtomic(BLOCKS_FILE, obj);
 }
+// Human link tokens (redeemed pairing codes) persist across restarts with a
+// 30-day expiry. Memory is authoritative while running; the file is the
+// durable copy. Expired tokens are pruned on load and on sight.
+const LINK_TOKENS_FILE = path.join(DATA_DIR, "link-tokens.json");
+function loadLinkTokens() {
+  try {
+    const saved = readJson(LINK_TOKENS_FILE, null);
+    if (saved && typeof saved === "object") {
+      const now = Date.now();
+      let pruned = false;
+      for (const [tok, rec] of Object.entries(saved)) {
+        if (rec && typeof rec === "object" && typeof rec.agentId === "string" && rec.expiresAt > now) {
+          linkTokens.set(tok, rec);
+        } else {
+          pruned = true;
+        }
+      }
+      if (pruned) saveLinkTokens();
+    }
+  } catch {
+    /* corrupt state fails closed to empty; the human re-links with a fresh code */
+  }
+}
+function saveLinkTokens() {
+  const obj = {};
+  for (const [tok, rec] of linkTokens) obj[tok] = rec;
+  writeJsonAtomic(LINK_TOKENS_FILE, obj);
+}
+// Resolve a link token to its record. Expired tokens read as absent and are
+// deleted (persisted) on sight so the file stays clean.
+function linkTokenRecord(tok) {
+  const rec = linkTokens.get(tok);
+  if (!rec) return null;
+  if (!(rec.expiresAt > Date.now())) {
+    linkTokens.delete(tok);
+    saveLinkTokens();
+    return null;
+  }
+  return rec;
+}
 function saveReports() {
   writeJsonAtomic(REPORTS_FILE, reports.slice(-REPORTS_KEEP));
 }
@@ -711,12 +871,8 @@ const TRUST_DEMOTE_FLOOR = "verified"; // verified identities never drop below t
 //             quarantines, history:[{t,from,to,reason,by}]}
 const trustRecords = new Map();
 
-function saveTrust() {
-  const obj = {};
-  for (const [id, rec] of trustRecords) obj[id] = rec;
-  writeJsonAtomic(TRUST_FILE, obj);
-}
-
+// Trust tiers persist as part of each identity's graph document (see
+// serializeIdentityGraph); there is no separate save step anymore.
 // Trust records exist only for verified identities: their agent ids are
 // stable (a-v-<hash>), so tiers survive restarts and reconnects. Unverified
 // sessions get fresh random ids per socket — there is nothing durable to
@@ -803,100 +959,98 @@ function visibilityFor(agentId) {
   };
 }
 
-const RELATIONS_FILE = path.join(DATA_DIR, "relations.json"); // identity v1
+function isVisibilityValue(v) {
+  return v === "public" || v === "private";
+}
 
-function saveRelations() {
-  const friends = {};
-  for (const [id, map] of friendEdges) {
-    if (typeof id !== "string" || !map || !map.size) continue;
-    const entries = [];
-    for (const [keyId, since] of map) {
-      if (typeof keyId === "string" && keyId) {
-        entries.push({ id: keyId, since: typeof since === "number" ? since : 0 });
+const GRAPHS = () => store.collection("graphs");
+
+/** Serialize one agent's social graph from the in-memory maps into the
+ *  per-identity document described in docs/STORAGE.md. The maps stay
+ *  authoritative at runtime; the store only persists. */
+function serializeIdentityGraph(agentId) {
+  const doc = { _id: agentId };
+  for (const [kid, aid] of keyIdToAgentId) {
+    if (aid === agentId) {
+      doc.identity_key_id = kid;
+      break;
+    }
+  }
+  const edges = friendEdges.get(agentId);
+  if (edges && edges.size) {
+    doc.friends = [];
+    for (const [id, since] of edges) {
+      if (typeof id === "string" && id) {
+        doc.friends.push({ id, since: typeof since === "number" ? since : 0 });
       }
     }
-    if (entries.length) friends[id] = entries;
   }
-  const affinity = {};
-  for (const [id, ledger] of affinityLedgers) {
-    if (typeof id !== "string" || !ledger || !ledger.size) continue;
-    const entries = {};
+  const ledger = affinityLedgers.get(agentId);
+  if (ledger && ledger.size) {
+    doc.affinity = {};
     for (const [t, e] of ledger) {
       if (e && typeof e.score === "number") {
-        entries[t] = {
+        doc.affinity[t] = {
           score: e.score,
           note: typeof e.note === "string" ? e.note : "",
           updated_at: typeof e.updated_at === "number" ? e.updated_at : 0,
         };
       }
     }
-    if (Object.keys(entries).length) affinity[id] = entries;
   }
-  writeJsonAtomic(RELATIONS_FILE, {
-    friends,
-    affinity,
-    visibility: Object.fromEntries(visibilityPrefs),
-    owner_tokens: Object.fromEntries(ownerTokens),
-  });
+  const vis = visibilityPrefs.get(agentId);
+  if (vis && Object.keys(vis).length) doc.visibility = { ...vis };
+  const tok = ownerTokens.get(agentId);
+  if (tok) doc.owner_token = tok;
+  const trust = trustRecords.get(agentId);
+  if (trust) {
+    doc.trust = {
+      ...trust,
+      daysSeen: [...trust.daysSeen],
+      history: trust.history.map((h) => ({ ...h })),
+    };
+  }
+  return doc;
 }
 
-function isVisibilityValue(v) {
-  return v === "public" || v === "private";
+/** Persist one agent's social graph. Best-effort, like the old whole-file
+ *  save: persistence must never take the lobby down. Callers use
+ *  saveIdentityGraph(id).catch(() => {}). */
+function saveIdentityGraph(agentId) {
+  if (typeof agentId !== "string" || !agentId) return Promise.resolve();
+  return GRAPHS()
+    .put(agentId, serializeIdentityGraph(agentId))
+    .catch(() => {
+      /* best-effort */
+    });
 }
 
-function loadRelations() {
-  try {
-    const doc = readJson(RELATIONS_FILE, null);
-    if (!doc || typeof doc !== "object") return;
-    if (doc.friends && typeof doc.friends === "object") {
-      for (const [id, arr] of Object.entries(doc.friends)) {
-        if (typeof id !== "string" || !Array.isArray(arr)) continue;
-        const map = new Map();
-        for (const e of arr) {
-          // Current format: {id, since}. Legacy format: bare key-id string
-          // (friends_since unknown — recorded as 0).
-          if (typeof e === "string" && e) map.set(e, 0);
-          else if (e && typeof e === "object" && typeof e.id === "string" && e.id) {
-            map.set(e.id, typeof e.since === "number" ? e.since : 0);
-          }
-        }
-        if (map.size) friendEdges.set(id, map);
-      }
+/** Boot-time load: populate the in-memory maps from the store. Runs before
+ *  the server starts listening (see the store.ready gate at the bottom). */
+async function loadIdentityGraphs() {
+  const all = await GRAPHS().all();
+  for (const { key: id, doc } of all) {
+    if (Array.isArray(doc.friends) && doc.friends.length) {
+      const map = new Map();
+      for (const e of doc.friends) map.set(e.id, e.since);
+      friendEdges.set(id, map);
     }
-    if (doc.affinity && typeof doc.affinity === "object") {
-      for (const [id, obj] of Object.entries(doc.affinity)) {
-        if (typeof id !== "string" || !obj || typeof obj !== "object") continue;
-        const ledger = new Map();
-        for (const [t, e] of Object.entries(obj)) {
-          if (e && typeof e === "object" && typeof e.score === "number" && Number.isFinite(e.score)) {
-            ledger.set(t, {
-              score: Math.max(-1, Math.min(1, e.score)),
-              note: typeof e.note === "string" ? e.note.slice(0, 140) : "",
-              updated_at: typeof e.updated_at === "number" ? e.updated_at : 0,
-            });
-          }
-        }
-        if (ledger.size) affinityLedgers.set(id, ledger);
-      }
+    if (doc.affinity && Object.keys(doc.affinity).length) {
+      const ledger = new Map();
+      for (const [t, e] of Object.entries(doc.affinity)) ledger.set(t, { ...e });
+      affinityLedgers.set(id, ledger);
     }
-    if (doc.visibility && typeof doc.visibility === "object") {
-      for (const [id, v] of Object.entries(doc.visibility)) {
-        if (typeof id !== "string" || !v || typeof v !== "object") continue;
-        const clean = {};
-        if (isVisibilityValue(v.friends)) clean.friends = v.friends;
-        if (isVisibilityValue(v.agent_graph)) clean.agent_graph = v.agent_graph;
-        if (Object.keys(clean).length) visibilityPrefs.set(id, clean);
-      }
+    if (doc.visibility && Object.keys(doc.visibility).length) {
+      visibilityPrefs.set(id, { ...doc.visibility });
     }
-    if (doc.owner_tokens && typeof doc.owner_tokens === "object") {
-      for (const [id, tok] of Object.entries(doc.owner_tokens)) {
-        if (typeof id === "string" && typeof tok === "string" && /^[A-Za-z0-9_-]{40,48}$/.test(tok)) {
-          ownerTokens.set(id, tok);
-        }
-      }
+    if (doc.owner_token) ownerTokens.set(id, doc.owner_token);
+    if (doc.trust) {
+      trustRecords.set(id, {
+        ...doc.trust,
+        daysSeen: [...doc.trust.daysSeen],
+        history: [...doc.trust.history],
+      });
     }
-  } catch {
-    /* corrupt state fails closed to empty; the lobby still boots */
   }
 }
 
@@ -1173,11 +1327,7 @@ function noteTrustDay(agentId) {
   if (rec.daysSeen[rec.daysSeen.length - 1] === d) return false;
   if (!rec.daysSeen.includes(d)) {
     rec.daysSeen.push(d);
-    try {
-      saveTrust();
-    } catch {
-      /* best-effort */
-    }
+    saveIdentityGraph(agentId).catch(() => {});
     return true;
   }
   return false;
@@ -1194,11 +1344,7 @@ function setTrustTier(agentId, to, reason, byName, byWs) {
   if (rec.history.length > TRUST_HISTORY_KEEP) {
     rec.history.splice(0, rec.history.length - TRUST_HISTORY_KEEP);
   }
-  try {
-    saveTrust();
-  } catch {
-    /* best-effort */
-  }
+  saveIdentityGraph(agentId).catch(() => {});
   const dir = TRUST_TIERS.indexOf(to) >= TRUST_TIERS.indexOf(from) ? "promote" : "demote";
   audit(`trust_${dir}`, byWs || null, agentId, null, `${from} -> ${to}: ${reason || ""}`.trim());
   for (const room of rooms.values()) {
@@ -1238,7 +1384,9 @@ function demoteTrust(agentId, reason, byName, byWs) {
 }
 
 loadAbuseState();
-loadRelations(); // identity v1: friend edges + affinity ledgers
+loadLinkTokens();
+// Identity graphs (friend edges, affinity, visibility, owner tokens, trust
+// tiers) load via loadIdentityGraphs() after store.ready, before listen.
 
 // PR #10: launch instrumentation. Instantiated here (after DATA_DIR) so the
 // metrics file path is defined; hooks throughout the file call into it.
@@ -1663,6 +1811,29 @@ function newPostId(kind) {
   );
 }
 
+// Board post images: up to 5 per post (operator decision 2026-10-12).
+// A ref is either an absolute http(s) URL or a Commons-hosted path
+// ("/avatars/apollo.webp" style). Anything else is dropped at write time;
+// the read path defaults missing fields to [] so old posts need no
+// migration.
+const MAX_IMAGES_PER_POST = 5;
+function cleanImageRef(s) {
+  const v = String(s || "").trim().slice(0, 500);
+  if (!v) return "";
+  if (/^https?:\/\/\S+$/i.test(v)) return v;
+  if (/^\/\S+$/.test(v) && !v.startsWith("//")) return v;
+  return "";
+}
+function cleanImages(input) {
+  let images = input;
+  if (typeof images === "string") images = images.split(",");
+  if (!Array.isArray(images)) images = [];
+  return [...new Set(images.map(cleanImageRef).filter(Boolean))].slice(0, MAX_IMAGES_PER_POST);
+}
+function postImages(p) {
+  return Array.isArray(p.images) ? p.images.filter((x) => typeof x === "string") : [];
+}
+
 function publicPost(p) {
   return {
     id: p.id,
@@ -1670,12 +1841,16 @@ function publicPost(p) {
     topics: p.topics || [],
     title: p.title,
     details: p.details || "",
+    images: postImages(p),
     budget: p.budget || "",
     constraints: p.constraints || "",
     from: p.from,
     serves: p.serves || "",
     created_at: p.created_at,
     human_approved: !!p.human_approved,
+    // Phase 2: reply bodies stay out of the list to keep it light.
+    reply_count: postReplies(p).length,
+    interest_count: postInterested(p).length,
   };
 }
 function publicBoard() {
@@ -1683,6 +1858,81 @@ function publicBoard() {
     .posts.filter((p) => p.status === "active")
     .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
     .map(publicPost);
+}
+
+// --- board replies + "I'm interested" (Phase 2) ---
+// Post shape gains `replies` and `interested`. The read path defaults
+// missing fields to [] so no migration is needed. Caps bound growth; past
+// the cap the server rejects with BOARD_POST_FULL.
+// Interest visibility: "public" (names visible to everyone, marketplace-
+// style) or "poster-only". PUBLIC confirmed by the user (2026-10-01); a
+// one-line flip here switches it.
+const MAX_REPLIES_PER_POST = 200;
+const MAX_INTEREST_PER_POST = 100;
+const INTEREST_VISIBLE_TO = "public"; // "public" | "poster-only"
+
+function postReplies(p) {
+  return Array.isArray(p.replies) ? p.replies : [];
+}
+function postInterested(p) {
+  return Array.isArray(p.interested) ? p.interested : [];
+}
+function newReplyId() {
+  return (
+    "r-" + Math.random().toString(36).slice(2, 8) + Date.now().toString(36).slice(-4)
+  );
+}
+// Public reply shape: never exposes agentId. Replies form a tree via
+// parent_id (null = top-level); old flat replies read as top-level, so
+// no migration is needed. A reply deleted while it has children stays
+// as a tombstone (deleted: true, text cleared) so the tree holds.
+function publicReply(r) {
+  return {
+    id: r.id,
+    parent_id: r.parent_id || null,
+    from: r.from,
+    serves: r.serves || "",
+    text: r.deleted ? "" : r.text,
+    deleted: !!r.deleted,
+    created_at: r.created_at,
+  };
+}
+// Public interest entry: never exposes agentId.
+function publicInterest(e) {
+  return { from: e.from, serves: e.serves || "", created_at: e.created_at };
+}
+// Public mention record: never exposes identity ids.
+function publicMention(m) {
+  return {
+    id: m.id,
+    from: m.from_name,
+    serves: m.from_serves || "",
+    room_id: m.room_id,
+    text: m.text,
+    created_at: m.created_at,
+  };
+}
+// Full post for GET /api/board/post: everything in publicPost plus replies
+// plus the interested list plus status. Closed posts included (shared links
+// must not rot). agentId values are never exposed.
+function publicPostDetail(p) {
+  const d = publicPost(p);
+  d.status = p.status;
+  d.replies = postReplies(p).map(publicReply);
+  d.interested =
+    INTEREST_VISIBLE_TO === "public" ? postInterested(p).map(publicInterest) : [];
+  return d;
+}
+
+// Poster notification for board replies/interest: a targeted live event,
+// same emitEvent-with-targetIds pattern as `match` — it follows the poster
+// across rooms and reaches nobody else. Live-only, no offline queue; the
+// durable post state is the source of truth. Keyed by the poster's
+// identity (agentId), never by session or display name.
+function notifyPostEvent(post, kind, payload) {
+  const carrier = rooms.get("marketplace") || rooms.get("plaza");
+  if (!carrier) return;
+  emitEvent(carrier, kind, payload, { targetIds: [post.agentId] });
 }
 
 function createPost(ws, m) {
@@ -1708,6 +1958,7 @@ function createPost(ws, m) {
   if (!Array.isArray(topics)) topics = [];
   topics = [...new Set(topics.map(cleanTopic).filter(Boolean))].slice(0, 8);
   if (!topics.length) return { error: "at least one topic is required (topics drive matchmaking)" };
+  const images = cleanImages(m.images);
   const board = readBoard();
   const post = {
     id: newPostId(kind),
@@ -1715,6 +1966,7 @@ function createPost(ws, m) {
     topics,
     title,
     details,
+    images,
     budget,
     constraints,
     from: ws.agentName || "unknown",
@@ -1801,7 +2053,7 @@ function runMatchmaking(newPost) {
           },
           room_id: roomId,
         });
-        send(s, { type: "invited", room_id: roomId, topic: room.topic, from: "matchmaker" });
+        send(s, { type: "invited", room_id: roomId, topic: room.topic, visibility: room.visibility, from: "matchmaker" });
       }
       // PR #7: match event — targeted at the matched agent so it arrives
       // whatever room they are watching. The direct `match` message above
@@ -2253,23 +2505,140 @@ function emitEvent(room, kind, payload, opts = {}) {
   return ev;
 }
 
-// @-mentions in text become targeted mention events for each named room
-// occupant (excluding the speaker). One event per mentioned agent.
-function emitMentions(room, text, fromName, fromId) {
-  const lower = String(text || "").toLowerCase();
-  if (!lower.includes("@")) return;
-  const seen = new Set();
-  for (const [id, a] of room.agents) {
-    if (id === fromId || seen.has(id)) continue;
-    if (lower.includes("@" + String(a.name).toLowerCase())) {
-      seen.add(id);
-      emitEvent(
-        room,
-        "mention",
-        { from: fromName, fromId, to: a.name, text: String(text).slice(0, 280) },
-        { targetIds: [id] }
-      );
+// @-mention notifications (docs/mentions-spec.md).
+//
+// Parsing: @token candidates are extracted in order of appearance and
+// resolved against the room's occupants, case-insensitively, with word
+// boundaries: "@Agatha" matches "Agatha de Beauvois Roosevelt" but
+// "@Al" does not match "Alice". Unknown names are skipped silently and
+// the message itself never errors. A token matching several occupants
+// (same display name) notifies all of them; self-mentions are skipped.
+// One notification per agent per message; at most MAX_MENTIONS_PER_MESSAGE
+// distinct agents, in order of first appearance.
+//
+// Side effects flow through notifyMention: durable record first, then
+// the targeted live event. Live delivery is best-effort; the durable
+// record is the source of truth.
+const MENTIONS_FILE = path.join(DATA_DIR, "mentions.json");
+const MAX_MENTIONS_PER_MESSAGE = 5;
+const MAX_MENTION_RECORDS = 5000;
+
+function readMentions() {
+  const m = readJson(MENTIONS_FILE, null);
+  if (m && Array.isArray(m.mentions)) return { mentions: m.mentions };
+  return { mentions: [] };
+}
+
+function writeMentions(state) {
+  const trimmed = state.mentions.slice(-MAX_MENTION_RECORDS);
+  writeJsonAtomic(MENTIONS_FILE, { mentions: trimmed });
+}
+
+// v2 seam: out-of-band human notification (push to the phone, a task in
+// the human's Muse) attaches here. Receives the full record, returns
+// nothing; a missing hook is a no-op.
+function escalateMention(record) {
+  return null;
+}
+
+// Single funnel for mention side effects: durable record, then the
+// targeted live event. Keyed by identity id throughout.
+function notifyMention(room, record) {
+  const state = readMentions();
+  state.mentions.push(record);
+  writeMentions(state);
+  emitEvent(
+    room,
+    "mention",
+    {
+      from: record.from_name,
+      fromId: record.from,
+      to: record.to_name,
+      to_id: record.to,
+      text: record.text,
+      mention_id: record.id,
+      room_id: room.id,
+      created_at: record.created_at,
+    },
+    { targetIds: [record.to] }
+  );
+  try {
+    escalateMention(record);
+  } catch {
+    // Escalation is best-effort; never break the mention itself.
+  }
+}
+
+// Resolve @-mentions in text to room occupants. For each "@" in the text,
+// the longest occupant display name matching at that position (case-
+// insensitive, followed by a word boundary) wins; "@Agatha" matches
+// "Agatha de Beauvois Roosevelt" but "@Al" does not match "Alice".
+// Returns distinct agent entries in order of first appearance, capped at
+// MAX_MENTIONS_PER_MESSAGE. Unknown names resolve to nothing.
+function findMentionTargets(room, text, excludeId) {
+  const s = String(text || "");
+  // Group occupants by lowercased display name: one token matching a
+  // shared name notifies every occupant carrying it.
+  const byName = new Map();
+  for (const a of room.agents.values()) {
+    if (a.id === excludeId || !a.name) continue;
+    const k = String(a.name).toLowerCase();
+    if (!byName.has(k)) byName.set(k, []);
+    byName.get(k).push(a);
+  }
+  const names = [...byName.keys()].sort((x, y) => y.length - x.length);
+  const hits = [];
+  const re = /@/g;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    const after = s.slice(m.index + 1);
+    const afterLower = after.toLowerCase();
+    for (const nl of names) {
+      if (afterLower.startsWith(nl)) {
+        const next = after[nl.length] || "";
+        if (next === "" || !/[a-z0-9_]/i.test(next)) {
+          for (const a of byName.get(nl)) hits.push({ index: m.index, agent: a });
+          break; // longest name wins at this position
+        }
+      }
     }
+  }
+  hits.sort((x, y) => x.index - y.index);
+  const seen = new Set();
+  const out = [];
+  for (const h of hits) {
+    if (seen.has(h.agent.id)) continue;
+    seen.add(h.agent.id);
+    out.push(h.agent);
+    if (out.length >= MAX_MENTIONS_PER_MESSAGE) break;
+  }
+  return out;
+}
+
+function emitMentions(room, text, fromName, fromId, opts = {}) {
+  if (!String(text || "").includes("@")) return;
+  // Defensive: quarantine already rejects say/talk at the handler, so a
+  // quarantined mentioner should never reach here; skip if it does.
+  if (fromId && quarantine.has(fromId)) return;
+  const targets = findMentionTargets(room, text, fromId);
+  if (!targets.length) return;
+  const princ = fromId ? principals.get(fromId) : null;
+  const now = Date.now();
+  const excerpt = String(text).slice(0, 280);
+  for (const a of targets) {
+    notifyMention(room, {
+      id: "m-" + crypto.randomUUID().slice(0, 8),
+      to: a.id,
+      to_name: a.name,
+      from: fromId,
+      from_name: fromName,
+      from_serves: opts.serves || "",
+      author_key_id: princ && princ.id ? princ.id : null,
+      origin_lobby: homeLobbyOrigin(),
+      room_id: room.id,
+      text: excerpt,
+      created_at: now,
+    });
   }
 }
 
@@ -2325,7 +2694,10 @@ function ensureAgent(room, id, info = {}) {
     room.agents.set(id, a);
   } else {
     if (info.name) a.name = info.name;
-    if (info.serves !== undefined) a.serves = info.serves;
+    // Never blank a known serves/avatar with an empty write: legacy say/talk
+    // paths create or refresh records without identity data, and must not
+    // wipe what the verified hello established.
+    if (info.serves) a.serves = info.serves;
     if (info.avatar) {
       if (info.avatar.color) a.color = info.avatar.color;
       if (info.avatar.emoji) a.emoji = info.avatar.emoji;
@@ -2398,7 +2770,7 @@ function startTalk(room, fromName, toName, text, fromId) {
     // PR #7: directed speech is a reply event; @-mentions still notify.
     const speakerId = fromId || agentIdOf(fromName);
     emitEvent(room, "reply", { from: fromName, fromId: speakerId, to: toName, text: a.bubble });
-    emitMentions(room, a.bubble, fromName, speakerId);
+    emitMentions(room, a.bubble, fromName, speakerId, { serves: a.serves || "" });
   }
   a.lastBeat = now;
   b.lastBeat = now;
@@ -2424,7 +2796,7 @@ function sayIn(room, fromName, text, agentId, opts = {}) {
   const msgPayload = { from: fromName, fromId, text: a.bubble };
   if (opts.event && opts.event.guest === true) msgPayload.guest = true; // PR-3: guest questions are flagged
   emitEvent(room, "message", msgPayload);
-  emitMentions(room, a.bubble, fromName, fromId);
+  emitMentions(room, a.bubble, fromName, fromId, { serves: opts.serves || a.serves || "" });
   return room.transcript[room.transcript.length - 1];
 }
 
@@ -2541,7 +2913,73 @@ function deliverDM(ws, m, fromName, fromId, target) {
 }
 
 function isCreator(room, ws) {
-  return ws === room.creatorWs || (ws.agentId && ws.agentId === room.createdBy);
+  if (ws === room.creatorWs) return true;
+  if (ws.agentId && ws.agentId === room.createdBy) return true;
+  // viewer creators reconnect with a fresh socket; match their claimed web
+  // identity ("web:<slug>") so they keep managing their rooms.
+  if (!ws.agentId && ws.claimedAgent && room.createdBy === "web:" + slug(ws.claimedAgent)) return true;
+  return false;
+}
+
+// Sockets that should receive creator-targeted events (knock requests):
+// the creator's live socket, else any live socket of the creator's agent
+// id, else (viewer creators) any live viewer socket holding the claimed
+// web identity the room was attributed to.
+function socketsForCreator(room) {
+  if (room.creatorWs && room.creatorWs.readyState === 1) return [room.creatorWs];
+  const out = [];
+  if (room.createdBy) {
+    for (const ws of wss.clients) {
+      if (ws.readyState !== 1) continue;
+      if (ws.agentId && ws.agentId === room.createdBy) out.push(ws);
+      else if (!ws.agentId && ws.claimedAgent && room.createdBy === "web:" + slug(ws.claimedAgent)) out.push(ws);
+    }
+  }
+  return out;
+}
+
+// Issue an invite to a room: record the name in the room's invite set and
+// notify the invitee's live sessions. Shared by the invite handler and
+// create_room's create-time invite batch.
+function issueInvite(room, inviterWs, targetName) {
+  room.invited.add(invitedNameKey(targetName));
+  // Identity-keyed invite: record the persistent ids of the invitee's live
+  // sessions, plus the last known id for the name (offline invitees), so
+  // room visibility can be keyed on identity rather than display name.
+  for (const t of socketsForAgentName(targetName)) {
+    if (t.agentId) room.invited.add(t.agentId);
+  }
+  const known = knownAgentNames.get(slug(targetName));
+  if (known && known.id) room.invited.add(known.id);
+  const inviterName = inviterWs.agentName || inviterWs.claimedAgent || "the room creator";
+  for (const t of socketsForAgentName(targetName)) {
+    // PR #3: block — an invite from a blocked agent never reaches the blocker.
+    if (isBlocked(t.agentId, inviterWs.agentId, inviterWs.agentName)) continue;
+    send(t, {
+      type: "invited",
+      room_id: room.id,
+      topic: room.topic,
+      description: room.description || "",
+      visibility: room.visibility,
+      from: inviterName,
+    });
+  }
+  // PR #7: invite event — targeted at the invitee's live sessions so it
+  // follows them across rooms. The direct `invited` message above stays
+  // for legacy clients; the event additionally honors subscriptions and
+  // blocks.
+  const inviteeIds = [];
+  for (const t of socketsForAgentName(targetName)) {
+    if (t.agentId && !inviteeIds.includes(t.agentId)) inviteeIds.push(t.agentId);
+  }
+  if (inviteeIds.length) {
+    emitEvent(
+      room,
+      "invite",
+      { from: inviterName, fromId: inviterWs.agentId, to: targetName, topic: room.topic },
+      { targetIds: inviteeIds }
+    );
+  }
 }
 
 function leaveRoom(ws) {
@@ -2555,6 +2993,10 @@ function doJoin(ws, room) {
   resetEventSubs(ws, room.id); // PR #7: new room, fresh default subscription
   room.lastActive = Date.now();
   send(ws, { type: "transcript", room_id: room.id, events: filterTranscriptFor(ws, room.transcript) });
+  // Delta clients: reset the snapshot baseline; the next tick sends one
+  // full "state" (now including this client's own agent record), then
+  // deltas resume. See docs/STATE-DELTA.md.
+  ws.lastSnap = null;
 }
 
 // hello/join with entry-policy enforcement. Joins open rooms freely; for
@@ -2564,7 +3006,11 @@ function doJoin(ws, room) {
 function enterOrKnock(ws, room, name, serves, inMsg) {  const id = ws.agentId || ws.guestId ||
     (ws.guestId = agentIdOf("guest-" + Math.random().toString(36).slice(2, 7)));
   // PR #2: invites are name-keyed (inviters can't know server-minted ids).
-  const nameKey = ws.agentName ? invitedNameKey(ws.agentName) : null;
+  const nameKey = ws.agentName
+    ? invitedNameKey(ws.agentName)
+    : ws.claimedAgent
+      ? invitedNameKey(ws.claimedAgent)
+      : null;
   if (isCreator(room, ws) || room.invited.has(id) || (nameKey && room.invited.has(nameKey))) {
     doJoin(ws, room);
     return true;
@@ -2648,6 +3094,13 @@ function moveAgentSocket(aws, room) {
       na.tx = prevAgent.tx; na.ty = prevAgent.ty;
       na.lastBeat = prevAgent.lastBeat;
     }
+    if (!na.verified && aws.verifiedState) {
+      // No previous record (stale room after delete/expiry): the socket's own
+      // verification is authoritative. Never mint an unverified-looking record
+      // under a real session's identity id.
+      na.verified = aws.verifiedState;
+      na.admitted = true;
+    }
     if (!na.trust) na.trust = aws.trustTier || "new"; // PR #8: fresh entry fallback
     if (prevRoom && prevRoom.id !== room.id && prevAgent) {
       logPresence("leave", prevRoom, {
@@ -2720,7 +3173,7 @@ function admitHelloAgent(ws, m, roomId, identity) {
       if (rec && rec.tier !== "verified") {
         rec.tier = "verified";
         rec.history.push({ t: Date.now(), ev: "passport_cap", note: "foreign tier capped at verified on first arrival" });
-        saveTrust();
+        saveIdentityGraph(newId).catch(() => {});
       }
     }
   }
@@ -2752,11 +3205,7 @@ function admitHelloAgent(ws, m, roomId, identity) {
     // public state, APIs, or logs.
     if (!ownerTokens.has(newId)) {
       ownerTokens.set(newId, crypto.randomBytes(32).toString("base64url"));
-      try {
-        saveRelations();
-      } catch {
-        /* best-effort */
-      }
+      saveIdentityGraph(newId).catch(() => {});
     }
   }
   // A verified manifest claiming home:true for this lobby confers the
@@ -3179,11 +3628,7 @@ function handlePresentAttestation(ws, m) {
       seeded = target;
     }
   }
-  try {
-    saveRelations();
-  } catch {
-    /* best-effort */
-  }
+  saveIdentityGraph(ws.agentId).catch(() => {});
   ack(ws, m, {
     type: "attestation_accepted",
     subject: att.subject,
@@ -3230,11 +3675,7 @@ function handleSetAffinity(ws, m) {
   }
   const entry = { score, note, updated_at: Date.now() };
   ledger.set(target, entry);
-  try {
-    saveRelations();
-  } catch {
-    /* best-effort */
-  }
+  saveIdentityGraph(ws.agentId).catch(() => {});
   ack(ws, m, {
     type: "affinity_updated",
     agent_id: ws.agentId,
@@ -3284,11 +3725,7 @@ function handleSetVisibility(ws, m) {
   } else {
     visibilityPrefs.delete(ws.agentId);
   }
-  try {
-    saveRelations();
-  } catch {
-    /* best-effort */
-  }
+  saveIdentityGraph(ws.agentId).catch(() => {});
   const eff = visibilityFor(ws.agentId);
   ack(ws, m, {
     type: "visibility_updated",
@@ -3416,11 +3853,10 @@ function registerKnock(room, agentId, name, serves, ws) {
     return;
   }
   room.knocking.set(agentId, { name, serves, ws, t: Date.now() });
-  // notify the creator (their socket, or any socket of their agent identity)
-  // and the host, if any (Phase 4)
-  const targets = room.creatorWs && room.creatorWs.readyState === 1
-    ? [room.creatorWs]
-    : room.createdBy ? socketsForAgent(room.createdBy) : [];
+  // notify the creator (their live socket, else any live socket of their
+  // agent identity — including a viewer creator's fresh socket holding the
+  // same claimed web identity) and the host, if any (Phase 4)
+  const targets = socketsForCreator(room);
   for (const h of hostSockets()) {
     // PR #4: a knock on a private room must not reveal the room's existence
     // (or the knocker's interest in it) to anyone outside the participants.
@@ -3441,9 +3877,153 @@ function registerKnock(room, agentId, name, serves, ws) {
   }
 }
 
+// --- delta state (docs/STATE-DELTA.md) ---
+// Serializes one agent exactly as the legacy full "state" snapshot did.
+function serializeAgent(a) {
+  return {
+    id: a.id,
+    name: a.name,
+    serves: a.serves,
+    color: a.color,
+    emoji: a.emoji,
+    image: a.image,
+    verified: a.verified || "unverified", // Phase 3: manifest check state
+    trust: a.trust || "new", // PR #8: earned trust tier (distinct from verified)
+    principal: publicPrincipalOf(a.id), // identity v1: public only, null when private
+    x: Math.round(a.x),
+    y: Math.round(a.y),
+    talking: !!a.talking,
+    bubble: a.bubble,
+    quarantined: quarantine.has(a.id), // PR #3: visible moderation state
+  };
+}
+
+// Per-tick snapshot context, computed once per room (not once per client).
+function snapshotCtx(room, now) {
+  const agentList = [...room.agents.values()].map(serializeAgent);
+  const agentSer = agentList.map((a) => JSON.stringify(a));
+  // discovery: public breakout list rides along on the plaza state
+  const rooms = room.id === "plaza" ? publicRooms() : undefined;
+  const roomsJson = rooms ? JSON.stringify(rooms) : null;
+  const retention = retentionOf(room); // PR #4: visible retention policy
+  const retentionJson = JSON.stringify(retention);
+  const incident = incidentMode; // PR #3: kill-switch visibility for every client
+  const digest = digestStr(
+    agentSer.join("|") + "|" + roomsJson + "|" + room.topic + "|" + incident + "|" + retentionJson
+  );
+  return { now, agentList, agentSer, rooms, roomsJson, retention, retentionJson, incident, digest };
+}
+
+// djb2: tiny non-crypto digest so an unchanged room short-circuits all
+// per-client diff work on a tick.
+function digestStr(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
+function fullStateMsg(room, ctx, agents, privRooms) {
+  // The rooms directory is per-client: public rooms plus the private rooms
+  // this identity can see, private first. Unauthorized clients never see a
+  // private room here at all.
+  const rooms =
+    room.id === "plaza" ? [...(privRooms || []), ...ctx.rooms] : undefined;
+  return {
+    type: "state",
+    t: ctx.now,
+    room_id: room.id,
+    topic: room.topic,
+    agents: agents || ctx.agentList,
+    retention: ctx.retention,
+    // discovery: the rooms directory rides along on the plaza state
+    ...(room.id === "plaza" ? { rooms } : {}),
+    incident: ctx.incident,
+  };
+}
+
+function recordSnap(ws, room, ctx, agents, ser, blockKey, privRoomsJson) {
+  const curSer = new Map();
+  for (let i = 0; i < agents.length; i++) curSer.set(agents[i].id, ser[i]);
+  ws.lastSnap = {
+    roomId: room.id,
+    agents: curSer,
+    digest: ctx.digest,
+    blockKey,
+    roomsJson: ctx.roomsJson,
+    privRoomsJson: privRoomsJson || null,
+    topic: room.topic,
+    incident: ctx.incident,
+    retentionJson: ctx.retentionJson,
+  };
+}
+
+// Diff the room against the client's last snapshot and send a "state_delta"
+// only when something visible actually changed. Silent otherwise.
+function pushDelta(ws, room, ctx) {
+  const bmap = ws.agentId && blocks.get(ws.agentId);
+  const blocked = !!(bmap && bmap.size);
+  // The filtered view is a deterministic function of (room digest, block
+  // set), so an unchanged pair means an unchanged view - skip all work.
+  const blockKey = blocked ? JSON.stringify([...bmap].sort()) : "";
+  // The rooms directory is per-identity (private rooms included), so it
+  // gets its own digest check alongside the shared room digest. The shared
+  // digest covers the public rooms list; this covers the private slice.
+  const priv = room.id === "plaza" ? privRoomsView(ws) : null;
+  const privJson = priv ? priv.json : null;
+  const last = ws.lastSnap;
+  if (last && last.roomId === room.id && last.digest === ctx.digest && last.blockKey === blockKey && last.privRoomsJson === privJson) return;
+  let list = ctx.agentList;
+  let ser = ctx.agentSer;
+  if (blocked) {
+    // PR #3: block - a blocked agent's speech bubbles never reach the
+    // blocker. Only bubbles are filtered (presence stays truthful).
+    list = ctx.agentList.map((a) => {
+      const isBlocked = [...bmap].some(([id, name]) => id === a.id || name === a.name);
+      return isBlocked ? { ...a, bubble: null } : a;
+    });
+    ser = list.map((a) => JSON.stringify(a));
+  }
+  if (!last || last.roomId !== room.id) {
+    send(ws, fullStateMsg(room, ctx, list, priv ? priv.rooms : null));
+    recordSnap(ws, room, ctx, list, ser, blockKey, privJson);
+    return;
+  }
+  const curObjs = new Map();
+  const curSer = new Map();
+  for (let i = 0; i < list.length; i++) {
+    curObjs.set(list[i].id, list[i]);
+    curSer.set(list[i].id, ser[i]);
+  }
+  const changed = [];
+  const left = [];
+  for (const [aid, s] of curSer) {
+    const prev = last.agents.get(aid);
+    if (prev === undefined || prev !== s) changed.push(curObjs.get(aid));
+  }
+  for (const aid of last.agents.keys()) {
+    if (!curSer.has(aid)) left.push(aid);
+  }
+  const delta = { type: "state_delta", t: ctx.now, room_id: room.id };
+  let dirty = false;
+  if (changed.length) { delta.agents_changed = changed; dirty = true; }
+  if (left.length) { delta.agents_left = left; dirty = true; }
+  if (ctx.roomsJson !== last.roomsJson || privJson !== last.privRoomsJson) {
+    delta.rooms = priv && priv.rooms.length ? [...priv.rooms, ...ctx.rooms] : ctx.rooms;
+    dirty = true;
+  }
+  if (room.topic !== last.topic) { delta.topic = room.topic; dirty = true; }
+  if (ctx.incident !== last.incident) { delta.incident = ctx.incident; dirty = true; }
+  if (ctx.retentionJson !== last.retentionJson) { delta.retention = ctx.retention; dirty = true; }
+  if (dirty) send(ws, delta);
+  // Record even when silent: the baseline must track the digest so the
+  // fast path stays valid (e.g. only a blocked agent's bubble changed).
+  recordSnap(ws, room, ctx, list, ser, blockKey, privJson);
+}
+
 function tick() {
   const now = Date.now();
   const dt = TICK_MS / 1000;
+  privRoomsCache = new Map(); // per-identity private room lists are per-tick
   for (const [id, room] of rooms) {
     for (const [aid, a] of room.agents) {
       if (now - a.lastBeat > HEARTBEAT_TIMEOUT_MS) {
@@ -3452,6 +4032,12 @@ function tick() {
           logPresence("leave", room, { name: a.name, serves: a.serves, verified: a.verified, trust: a.trust });
         }
         room.agents.delete(aid);
+        // Drop this agent's stalled sockets so they can't hold buffers open.
+        for (const s of socketsForAgent(aid)) {
+          if ((s.bufferedAmount || 0) > MAX_BUFFERED_BYTES) {
+            try { s.close(1013, "stalled"); } catch { /* ignore */ }
+          }
+        }
         continue;
       }
       if (a.talking && now > a.talkingUntil) {
@@ -3474,48 +4060,35 @@ function tick() {
         a.ty = t.y;
       }
     }
-    const agentList = [...room.agents.values()].map((a) => ({
-      id: a.id,
-      name: a.name,
-      serves: a.serves,
-      color: a.color,
-      emoji: a.emoji,
-      image: a.image,
-      verified: a.verified || "unverified", // Phase 3: manifest check state
-      trust: a.trust || "new", // PR #8: earned trust tier (distinct from verified)
-      principal: publicPrincipalOf(a.id), // identity v1: public only, null when private
-      x: Math.round(a.x),
-      y: Math.round(a.y),
-      talking: !!a.talking,
-      bubble: a.bubble,
-      quarantined: quarantine.has(a.id), // PR #3: visible moderation state
-    }));
-    const baseState = {
-      type: "state",
-      t: now,
-      room_id: room.id,
-      topic: room.topic,
-      agents: agentList,
-      retention: retentionOf(room), // PR #4: visible retention policy
-      // discovery: public breakout list rides along on the plaza state
-      ...(room.id === "plaza" ? { rooms: publicRooms() } : {}),
-      incident: incidentMode, // PR #3: kill-switch visibility for every client
-    };
-    const baseMsg = JSON.stringify({ ...baseState, msg_id: protocol.newMsgId() });
+    const ctx = snapshotCtx(room, now);
+    // legacy fast path: one shared string per tick per distinct private
+    // rooms view (clients with no visible private rooms share one).
+    const legacyMsgCache = new Map();
     wss.clients.forEach((ws) => {
       if (ws.readyState !== 1 || ws.roomId !== room.id) return;
+      if ((ws.bufferedAmount || 0) > MAX_BUFFERED_BYTES) return; // stalled socket: skip this snapshot
+      if (ws.acceptsDeltas) { pushDelta(ws, room, ctx); return; }
+      // legacy: full snapshot every tick (unchanged behavior)
+      const priv = room.id === "plaza" ? privRoomsView(ws) : null;
+      const privRooms = priv ? priv.rooms : null;
+      const privJson = priv ? priv.json : "";
       const bmap = ws.agentId && blocks.get(ws.agentId);
       if (!bmap || !bmap.size) {
-        ws.send(baseMsg);
+        let s = legacyMsgCache.get(privJson);
+        if (!s) {
+          s = JSON.stringify({ ...fullStateMsg(room, ctx, undefined, privRooms), msg_id: protocol.newMsgId() });
+          legacyMsgCache.set(privJson, s);
+        }
+        ws.send(s);
         return;
       }
       // PR #3: block — a blocked agent's speech bubbles never reach the
       // blocker. Only bubbles are filtered (presence stays truthful).
-      const agents = agentList.map((a) => {
+      const agents = ctx.agentList.map((a) => {
         const blocked = [...bmap].some(([id, name]) => id === a.id || name === a.name);
         return blocked ? { ...a, bubble: null } : a;
       });
-      send(ws, { ...baseState, agents });
+      send(ws, { ...fullStateMsg(room, ctx, agents, privRooms), msg_id: protocol.newMsgId() });
     });
     // dissolve empty breakouts (persistent rooms live forever)
     if (!room.persistent) {
@@ -3615,8 +4188,108 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
   if (p === "/api/board" && req.method === "GET") {
+    // Phase 2: author filter for profile panels. ?by=<agentId> is
+    // canonical (identity id, never a display name); ?by_name=<display
+    // name> resolves best-effort (verified registry first, then live
+    // rooms), same pattern as /api/mentions. Filtered results include
+    // closed posts too (a profile shows everything the agent posted),
+    // each carrying `status`; newest first; capped at 200.
+    const q = new URL(req.url, "http://x").searchParams;
+    const byId = String(q.get("by") || "");
+    const byName = String(q.get("by_name") || "").trim();
+    let authorId = byId;
+    if (!authorId && byName) {
+      const key = slug(byName);
+      const vn = verifiedNames.get(key);
+      if (vn) authorId = vn.agentId;
+      else {
+        for (const room of rooms.values()) {
+          for (const a of room.agents.values()) {
+            if (a.name === byName || slug(a.name) === key) {
+              authorId = a.id;
+              break;
+            }
+          }
+          if (authorId) break;
+        }
+      }
+    }
+    let posts;
+    if (byId || byName) {
+      // Unknown name/id -> empty list (friendlier than 400 for a panel).
+      posts = authorId
+        ? readBoard()
+            .posts.filter((x) => x.agentId === authorId)
+            .slice()
+            .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
+            .slice(0, 200)
+            .map((x) => ({ ...publicPost(x), status: x.status || "active" }))
+        : [];
+    } else {
+      posts = publicBoard();
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ posts: publicBoard() }));
+    res.end(JSON.stringify({ posts }));
+    return;
+  }
+  if (p === "/api/board/post" && req.method === "GET") {
+    // Phase 2: full post detail (public fields only — agentId values are
+    // never exposed). Closed posts included so shared links don't rot.
+    const q = new URL(req.url, "http://x").searchParams;
+    const post = readBoard().posts.find((x) => x.id === String(q.get("id") || ""));
+    if (!post) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "NO_SUCH_POST" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ post: publicPostDetail(post) }));
+    return;
+  }
+  if (p === "/api/mentions" && req.method === "GET") {
+    // Phase 2: recent mentions addressed to one identity. ?for=<agentId>
+    // is canonical; ?for_name=<display name> resolves best-effort
+    // (verified registry first, then live rooms). ?link_token=<token>
+    // resolves to the linked agent's id (a browser paired via login).
+    // Public fields only — identity ids are never exposed. Newest first.
+    const q = new URL(req.url, "http://x").searchParams;
+    let targetId = String(q.get("for") || "");
+    const linkToken = String(q.get("link_token") || "");
+    if (!targetId && linkToken) {
+      const rec = linkTokenRecord(linkToken);
+      if (rec) targetId = rec.agentId;
+    }
+    const forName = String(q.get("for_name") || "").trim();
+    if (!targetId && forName) {
+      const key = slug(forName);
+      const vn = verifiedNames.get(key);
+      if (vn) targetId = vn.agentId;
+      else {
+        for (const room of rooms.values()) {
+          for (const a of room.agents.values()) {
+            if (a.name === forName || slug(a.name) === key) {
+              targetId = a.id;
+              break;
+            }
+          }
+          if (targetId) break;
+        }
+      }
+    }
+    if (!targetId) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "MENTION_TARGET_REQUIRED" }));
+      return;
+    }
+    const since = Math.max(0, parseInt(q.get("since") || "0", 10) || 0);
+    const limit = Math.min(200, Math.max(1, parseInt(q.get("limit") || "50", 10) || 50));
+    const out = readMentions()
+      .mentions.filter((m) => m.to === targetId && m.created_at >= since)
+      .slice(-limit)
+      .reverse()
+      .map(publicMention);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ mentions: out }));
     return;
   }
   if (p === "/places") {
@@ -4118,6 +4791,8 @@ const httpServer = http.createServer((req, res) => {
           to: ev.to || null,
           text: ev.text,
           t: ev.t,
+          tseq: ev.tseq, // stable per-room cursor for history paging
+          ev_id: ev.ev_id,
           thread_id: ev.thread_id || null, // PR-1: permalink target
         });
       }
@@ -4125,6 +4800,77 @@ const httpServer = http.createServer((req, res) => {
     events.sort((a, b) => (b.t || 0) - (a.t || 0));
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ events: events.slice(0, 30) }));
+    return;
+  }
+
+  // --- paginated room message history (read-only) ---
+  // GET /api/history?room=<id>&before=<cursor>&before_id=<ev_id>&limit=<n>
+  // events are oldest-first, with has_more for scroll-up paging.
+  // room=<id>: one public room; the cursor is that room's tseq (exclusive),
+  //   so `before` means "older than this message". Without `before`, the
+  //   newest page is returned.
+  // room=all: every public room merged (the plaza feed view); the cursor is
+  //   a (t, ev_id) pair, so `before` is a timestamp and `before_id` breaks
+  //   ties. Private breakout rooms are never included (privacy, PR #4).
+  // ?limit=n defaults to 50, max 100. No protocol change: read-only HTTP.
+  if (p === "/api/history" && req.method === "GET") {
+    const q = new URL(req.url, "http://x").searchParams;
+    const roomParam = (q.get("room") || "").slice(0, 64);
+    let limit = parseInt(q.get("limit") || "50", 10);
+    if (!Number.isFinite(limit) || limit < 1) limit = 50;
+    limit = Math.min(limit, 100);
+    const histEvent = (roomId, topic, ev) => ({
+      room_id: roomId,
+      topic: topic,
+      from: ev.from,
+      to: ev.to || null,
+      text: ev.text,
+      t: ev.t,
+      tseq: ev.tseq,
+      ev_id: ev.ev_id,
+      thread_id: ev.thread_id || null,
+    });
+    let events, hasMore;
+    if (roomParam === "all") {
+      const before = parseInt(q.get("before") || "", 10);
+      const beforeId = (q.get("before_id") || "").slice(0, 64);
+      const all = [];
+      for (const room of rooms.values()) {
+        if (room.visibility !== "public") continue;
+        for (const ev of room.transcript) all.push(histEvent(room.id, room.topic, ev));
+      }
+      // newest first; ev_id breaks timestamp ties deterministically
+      all.sort((a, b) => (b.t - a.t) || (a.ev_id < b.ev_id ? -1 : a.ev_id > b.ev_id ? 1 : 0));
+      let start = 0;
+      if (Number.isFinite(before)) {
+        start = all.findIndex(
+          (e) => e.t < before || (e.t === before && beforeId && e.ev_id < beforeId)
+        );
+        if (start === -1) start = all.length;
+      }
+      const page = all.slice(start, start + limit);
+      hasMore = start + limit < all.length;
+      events = page.reverse(); // oldest first for the DOM
+    } else {
+      const room = rooms.get(roomParam);
+      if (!room || room.visibility !== "public") {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "no public room history" }));
+        return;
+      }
+      const before = parseInt(q.get("before") || "", 10);
+      const tr = room.transcript; // ascending tseq
+      let end = tr.length;
+      if (Number.isFinite(before)) {
+        end = tr.findIndex((e) => e.tseq >= before);
+        if (end === -1) end = tr.length;
+      }
+      const startIdx = Math.max(0, end - limit);
+      events = tr.slice(startIdx, end).map((ev) => histEvent(room.id, room.topic, ev));
+      hasMore = startIdx > 0;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ room: roomParam, events, has_more: hasMore }));
     return;
   }
 
@@ -4341,6 +5087,49 @@ const httpServer = http.createServer((req, res) => {
                               to: { type: "string", nullable: true, description: "Addressee, if any" },
                               text: { type: "string" },
                               t: { type: "integer", description: "Epoch milliseconds" },
+                              thread_id: { type: "string", nullable: true, description: "Thread permalink id; read the full thread at /t/<thread_id>" },
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        "/api/history": {
+          get: {
+            summary: "Paginated room message history",
+            description:
+              "One page of a public room's rolling transcript, oldest first, with a has_more flag for scroll-up paging. " +
+              "?room=<room_id> scopes to one room (cursor = that room's tseq, exclusive); ?room=all merges every public room " +
+              "(cursor = before=<epoch ms>&before_id=<ev_id>). Without a cursor the newest page is returned. " +
+              "?limit=n defaults to 50, max 100. Private rooms are excluded. Read-only.",
+            responses: {
+              200: {
+                description: "History page",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      properties: {
+                        room: { type: "string" },
+                        has_more: { type: "boolean" },
+                        events: {
+                          type: "array",
+                          items: {
+                            type: "object",
+                            properties: {
+                              room_id: { type: "string" },
+                              topic: { type: "string" },
+                              from: { type: "string", description: "Agent who spoke" },
+                              to: { type: "string", nullable: true, description: "Addressee, if any" },
+                              text: { type: "string" },
+                              t: { type: "integer", description: "Epoch milliseconds" },
+                              tseq: { type: "integer", description: "Per-room sequence; paging cursor for room=<id>" },
+                              ev_id: { type: "string", description: "Stable event id; tie-break cursor for room=all" },
                               thread_id: { type: "string", nullable: true, description: "Thread permalink id; read the full thread at /t/<thread_id>" },
                             },
                           },
@@ -4598,7 +5387,13 @@ const httpServer = http.createServer((req, res) => {
             summary: "Active intent board posts",
             description:
               "Active wants, offers, and introductions agents have posted: what they're looking for, offering, or who they'd like to meet. " +
-              "Use this to answer 'anything new on the intent board?'.",
+              "Use this to answer 'anything new on the intent board?'. " +
+              "?by=<agentId> filters to one author's posts (identity id, canonical); " +
+              "?by_name=<display name> resolves best-effort. Filtered results include closed posts too, each with a `status` field.",
+            parameters: [
+              { name: "by", in: "query", schema: { type: "string" }, description: "Filter to one author's posts by identity id" },
+              { name: "by_name", in: "query", schema: { type: "string" }, description: "Filter to one author's posts by display name (best-effort)" },
+            ],
             responses: {
               200: {
                 description: "Active posts, newest first",
@@ -4902,6 +5697,8 @@ wss.on("connection", (ws, req) => {
   ws.agentServes = "";
   ws.guestId = null; // stable knock identity for sockets without an agent
   ws.roomId = "plaza";
+  ws.acceptsDeltas = false; // delta-state opt-in via hello accepts_deltas:true
+  ws.lastSnap = null; // last state snapshot sent (for state_delta diffing)
   ws.eventSubs = defaultEventSubs("plaza"); // PR #7: push-event subscription
   ws.claimedAgent = null; // viewer-claimed agent name ("your agent follows you")
   ws.verifying = false; // Phase 3: a manifest check is in flight
@@ -4921,6 +5718,10 @@ wss.on("connection", (ws, req) => {
   ws.idempotency = new protocol.IdempotencyStore(); // v1: replay dedupe for mutating actions
   ws.tierLimit = null; // PR #3: tiered per-action quota limiters (built lazily)
   ws.hasHelloed = false; // PR #3: first hello is admission; later hellos may switch rooms
+  ws.linkedAgentId = null; // human-to-agent pairing: browser linked to an agent's identity
+  ws.linkedAgentName = null;
+  ws.linkedToken = null;
+  ws.pairingLimit = new protocol.RateLimiter(5, 60 * 1000); // redeem attempts per socket per minute
   send(ws, { type: "transcript", room_id: "plaza", events: filterTranscriptFor(ws, rooms.get("plaza").transcript) });
   ws.on("message", (raw) => {
     let m;
@@ -5021,6 +5822,11 @@ wss.on("connection", (ws, req) => {
         }
         ws.protocolVersion = pv;
       }
+      // Delta-state opt-in: a hello carrying accepts_deltas:true gets one
+      // full "state" snapshot on join, then "state_delta" messages only when
+      // something visible actually changed. Everyone else keeps the legacy
+      // full snapshot every tick. Documented in docs/STATE-DELTA.md.
+      ws.acceptsDeltas = m.accepts_deltas === true;
       // PR #3: room-switch quota — a re-hello that moves this socket to a
       // different room draws from the tiered room_switch bucket. The first
       // hello (admission) and same-room re-hellos are never charged.
@@ -5032,18 +5838,36 @@ wss.on("connection", (ws, req) => {
         // through the same entry gate as agents. A viewer may claim one
         // agent name (agent_name); their agent follows them into rooms they
         // enter. Claim-based, not authenticated (see followClaimedAgent).
-        // PR #2: viewers hold no capabilities — no session token, no scopes.
+        // Viewers hold no capabilities by default — but a viewer with a
+        // claimed agent name acts as that claimed identity (stamped
+        // unverified, the same trust model as DM v1) and may create and
+        // manage rooms. Unclaimed viewers stay read-only.
         ws.agentId = null;
         ws.agentName = null;
-        ws.scopes = [];
+        if (typeof m.agent_name === "string") {
+          const claimed = m.agent_name.trim().slice(0, 60);
+          ws.claimedAgent = claimed || null; // empty string clears the claim
+        }
+        ws.scopes = ws.claimedAgent ? ["rooms"] : [];
+        // Human-to-agent pairing: a link token from a redeemed pairing code
+        // attaches this browser session to the agent's identity, unlocking
+        // the agent's private rooms, DM history, and mentions. An invalid
+        // token leaves the socket unlinked (the client clears it and shows
+        // the login button again).
+        if (typeof m.link_token === "string" && m.link_token) {
+          const rec = linkTokenRecord(m.link_token);
+          if (rec) {
+            ws.linkedAgentId = rec.agentId;
+            ws.linkedAgentName = rec.agentName;
+            ws.linkedToken = m.link_token;
+          } else {
+            sendError(ws, "BAD_LINK_TOKEN", null, m);
+          }
+        }
         const room = rooms.get(roomId);
         if (!room) {
           sendError(ws, "NO_SUCH_ROOM", null, m);
           return;
-        }
-        if (typeof m.agent_name === "string") {
-          const claimed = m.agent_name.trim().slice(0, 60);
-          ws.claimedAgent = claimed || null; // empty string clears the claim
         }
         if (enterOrKnock(ws, room, null, "", m)) {
           followClaimedAgent(ws, room);
@@ -5335,8 +6159,9 @@ wss.on("connection", (ws, req) => {
       // existence is never confirmed (NO_SUCH_THREAD), so strangers can't
       // probe threads. NOT in MUTATING_TYPES: no scope, no idempotency.
       // Viewers read their own unverified threads via the "web:<slug>"
-      // sender key derived from their claimed agent name.
-      const requesterId = ws.agentId || (ws.claimedAgent ? "web:" + slug(ws.claimedAgent) : null);
+      // sender key derived from their claimed agent name. A browser linked
+      // to an agent via pairing reads as that agent.
+      const requesterId = identityOf(ws) || (ws.claimedAgent ? "web:" + slug(ws.claimedAgent) : null);
       const withName = String(m.with || "").trim();
       const target = withName ? resolveDMTarget(withName) : null;
       const key = requesterId && target ? dmThreadKey(requesterId, target.id) : null;
@@ -5354,23 +6179,116 @@ wss.on("connection", (ws, req) => {
         with: thread.names[otherId] || withName,
         entries,
       });
+    } else if (m.type === "request_pairing_code") {
+      // Human-to-agent pairing: only a verified agent, over its own socket,
+      // can mint a code for its human. The code is short-lived (10 min) and
+      // single-use; the agent hands it to its human out-of-band.
+      if (!ws.agentId || ws.verifiedState !== "verified") {
+        sendError(ws, "PAIRING_FORBIDDEN", null, m);
+        return;
+      }
+      const a = findAgentById(ws.agentId);
+      const code = newPairingCode();
+      pairingCodes.set(code, {
+        agentId: ws.agentId,
+        agentName: ws.agentName,
+        serves: ws.agentServes || "",
+        avatar: a ? { color: a.color, emoji: a.emoji, image: a.image } : null,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + PAIRING_CODE_TTL_MS,
+        used: false,
+      });
+      send(ws, { type: "pairing_code", code, expires_in: Math.round(PAIRING_CODE_TTL_MS / 1000) });
+    } else if (m.type === "redeem_pairing_code") {
+      const rl = ws.pairingLimit.check();
+      if (!rl.ok) {
+        sendError(ws, "RATE_LIMITED", "too many pairing attempts", m, rl.retryAfterMs);
+        return;
+      }
+      const code = String(m.code || "").trim().toUpperCase();
+      const entry = pairingCodes.get(code);
+      const valid = entry && !entry.used && entry.expiresAt > Date.now();
+      if (!valid) {
+        // Deliberately vague: never reveal which check failed.
+        sendError(ws, "BAD_PAIRING_CODE", null, m);
+        return;
+      }
+      entry.used = true;
+      const token = crypto.randomBytes(32).toString("hex");
+      linkTokens.set(token, {
+        agentId: entry.agentId,
+        agentName: entry.agentName,
+        serves: entry.serves,
+        avatar: entry.avatar,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + LINK_TOKEN_TTL_MS,
+      });
+      saveLinkTokens();
+      ws.linkedAgentId = entry.agentId;
+      ws.linkedAgentName = entry.agentName;
+      ws.linkedToken = token;
+      ws.lastSnap = null; // force a fresh snapshot so the private directory arrives
+      send(ws, {
+        type: "pairing_ok",
+        token,
+        agent: { id: entry.agentId, name: entry.agentName, serves: entry.serves, avatar: entry.avatar },
+      });
+    } else if (m.type === "logout") {
+      if (ws.linkedToken) {
+        linkTokens.delete(ws.linkedToken);
+        saveLinkTokens();
+      }
+      ws.linkedAgentId = null;
+      ws.linkedAgentName = null;
+      ws.linkedToken = null;
+      ws.lastSnap = null;
+      send(ws, { type: "ok" });
+    } else if (m.type === "logout_all") {
+      // Revoke every link token for this identity, on every live socket.
+      const id = identityOf(ws);
+      if (id) {
+        for (const [tok, rec] of linkTokens) {
+          if (rec.agentId === id) linkTokens.delete(tok);
+        }
+        saveLinkTokens();
+        for (const c of wss.clients) {
+          if (c.linkedAgentId === id) {
+            c.linkedAgentId = null;
+            c.linkedAgentName = null;
+            c.linkedToken = null;
+            c.lastSnap = null;
+          }
+        }
+      }
+      send(ws, { type: "ok" });
     } else if (m.type === "create_room") {
       const topic = String(m.topic || "").slice(0, 80).trim();
       if (!topic) {
         sendError(ws, "TOPIC_REQUIRED", null, m);
         return;
       }
+      const description = String(m.description || "").slice(0, 140).trim();
+      const invites = Array.isArray(m.invites)
+        ? [...new Set(m.invites.map((s) => String(s).trim()).filter(Boolean))].slice(0, 10)
+        : [];
+      // one invite-quota draw covers the whole create-time invite batch;
+      // checked before the room exists so a rejection stays atomic.
+      if (invites.length && !checkTierQuota(ws, "invite", m)) return;
       const visibility = m.visibility === "private" ? "private" : "public";
       const entry = ["open", "knock", "invite"].includes(m.entry)
         ? m.entry
         : visibility === "private" ? "invite" : "open";
       const category = ["interest", "local", "utility"].includes(m.category) ? m.category : "interest";
+      // Viewer creators have no agentId; attribute the room to their claimed
+      // web identity ("web:<slug>"), stamped unverified like their DMs.
+      const creatorId = ws.agentId || (ws.claimedAgent ? "web:" + slug(ws.claimedAgent) : null);
       const room = newRoom(newRoomId(topic), {
         topic,
+        description,
         visibility,
         entry,
         category,
-        createdBy: ws.agentId,
+        createdBy: creatorId,
         creatorWs: ws,
       });
       // the creator moves straight into their new room
@@ -5380,10 +6298,15 @@ wss.on("connection", (ws, req) => {
       leaveRoom(ws);
       ws.roomId = room.id;
       resetEventSubs(ws, room.id); // PR #7: new room, fresh default subscription
+      ws.lastSnap = null; // force a fresh full snapshot below
       if (ws.agentId) {
         const na = ensureAgent(room, ws.agentId, { name: ws.agentName, serves: ws.agentServes });
         na.admitted = true;
         na.trust = ws.trustTier || "new"; // PR #8
+        // Preserve verification across the move: a fresh record must never
+        // read as unverified under a real session's identity id. The socket's
+        // own verification is authoritative when there is no previous record.
+        na.verified = (prevAgent && prevAgent.verified) || ws.verifiedState || na.verified;
         if (wasThere && prevRoom.id !== room.id) {
           logPresence("leave", prevRoom, {
             name: prevAgent.name, serves: prevAgent.serves, verified: prevAgent.verified, trust: prevAgent.trust,
@@ -5393,13 +6316,20 @@ wss.on("connection", (ws, req) => {
           name: ws.agentName, serves: ws.agentServes, verified: na.verified, trust: na.trust,
         });
       }
+      let invitesSent = 0;
+      for (const name of invites) {
+        issueInvite(room, ws, name);
+        invitesSent++;
+      }
       ack(ws, m, {
         type: "room_created",
         room_id: room.id,
         topic: room.topic,
+        description: room.description,
         visibility: room.visibility,
         entry: room.entry,
         category: room.category,
+        invites_sent: invitesSent,
         retention: retentionOf(room), // PR #4: visible retention policy
       });
       send(ws, { type: "transcript", room_id: room.id, events: filterTranscriptFor(ws, room.transcript) });
@@ -5419,29 +6349,7 @@ wss.on("connection", (ws, req) => {
       // PR #2: invites are keyed by display name — session ids are
       // server-minted and not guessable, so the inviter names the agent.
       // Any live session currently holding that name may enter.
-      room.invited.add(invitedNameKey(m.to));
-      for (const t of socketsForAgentName(m.to)) {
-        // PR #3: block — an invite from a blocked agent never reaches the
-        // blocker.
-        if (isBlocked(t.agentId, ws.agentId, ws.agentName)) continue;
-        send(t, { type: "invited", room_id: room.id, topic: room.topic, from: ws.agentName || "the room creator" });
-      }
-      // PR #7: invite event — targeted at the invitee's live sessions so it
-      // follows them across rooms. The direct `invited` message above stays
-      // for legacy clients; the event additionally honors subscriptions and
-      // blocks.
-      const inviteeIds = [];
-      for (const t of socketsForAgentName(m.to)) {
-        if (t.agentId && !inviteeIds.includes(t.agentId)) inviteeIds.push(t.agentId);
-      }
-      if (inviteeIds.length) {
-        emitEvent(
-          room,
-          "invite",
-          { from: ws.agentName || "the room creator", fromId: ws.agentId, to: m.to, topic: room.topic },
-          { targetIds: inviteeIds }
-        );
-      }
+      issueInvite(room, ws, m.to);
       ack(ws, m, { type: "invite_ok", room_id: room.id });
     } else if (m.type === "knock" && m.room_id) {
       const room = rooms.get(m.room_id);
@@ -5467,11 +6375,11 @@ wss.on("connection", (ws, req) => {
       room.invited.add(id);
       const notified = new Set();
       if (rec && rec.ws) {
-        send(rec.ws, { type: "admitted", room_id: room.id, topic: room.topic });
+        send(rec.ws, { type: "admitted", room_id: room.id, topic: room.topic, description: room.description || "", visibility: room.visibility });
         notified.add(rec.ws);
       }
       for (const t of socketsForAgent(id)) {
-        if (!notified.has(t)) send(t, { type: "admitted", room_id: room.id, topic: room.topic });
+        if (!notified.has(t)) send(t, { type: "admitted", room_id: room.id, topic: room.topic, description: room.description || "", visibility: room.visibility });
       }
       ack(ws, m, { type: "admit_ok", room_id: room.id, agent: id });
     } else if (m.type === "reject" && m.room_id && m.agent) {
@@ -5545,6 +6453,167 @@ wss.on("connection", (ws, req) => {
         writeBoard(board);
       }
       ack(ws, m, { type: "post_closed", id: p.id });
+    } else if (m.type === "reply_post") {
+      // Phase 2: flat reply on an intent post. Replies draw from the "say"
+      // quota tier (conversational); quarantine holds them like speech.
+      if (!ws.agentId) {
+        sendError(ws, "HELLO_REQUIRED", null, m);
+        return;
+      }
+      if (quarantine.has(ws.agentId)) {
+        sendError(ws, "QUARANTINED", null, m);
+        return;
+      }
+      if (!checkTierQuota(ws, "say", m)) return;
+      const board = readBoard();
+      const p = board.posts.find((x) => x.id === String(m.post_id || ""));
+      if (!p) {
+        sendError(ws, "NO_SUCH_POST", null, m);
+        return;
+      }
+      if (p.status !== "active") {
+        sendError(ws, "POST_CLOSED", null, m);
+        return;
+      }
+      const text = String(m.text || "").trim().slice(0, 2000);
+      if (!text) {
+        sendError(ws, "REPLY_INVALID", "reply text is required", m);
+        return;
+      }
+      const replies = postReplies(p);
+      if (replies.length >= MAX_REPLIES_PER_POST) {
+        sendError(ws, "BOARD_POST_FULL", null, m);
+        return;
+      }
+      // Threading: parent_id must name a live reply on this same post.
+      let parentId = null;
+      if (m.parent_id != null && String(m.parent_id).trim() !== "") {
+        parentId = String(m.parent_id);
+        const parent = replies.find((r) => r.id === parentId);
+        if (!parent || parent.deleted) {
+          sendError(ws, "REPLY_INVALID", "parent_id must name an existing reply on this post", m);
+          return;
+        }
+      }
+      const reply = {
+        id: newReplyId(),
+        parent_id: parentId,
+        from: ws.agentName || "unknown",
+        serves: ws.agentServes || "",
+        agentId: ws.agentId,
+        text,
+        created_at: Date.now(),
+      };
+      replies.push(reply);
+      p.replies = replies;
+      writeBoard(board);
+      ack(ws, m, { type: "reply_ok", post_id: p.id, reply_id: reply.id });
+      notifyPostEvent(p, "post_reply", { post_id: p.id, reply: publicReply(reply) });
+    } else if (m.type === "delete_reply") {
+      // Phase 2: delete-own reply only (no edit).
+      if (!ws.agentId) {
+        sendError(ws, "HELLO_REQUIRED", null, m);
+        return;
+      }
+      if (quarantine.has(ws.agentId)) {
+        sendError(ws, "QUARANTINED", null, m);
+        return;
+      }
+      const board = readBoard();
+      const p = board.posts.find((x) => x.id === String(m.post_id || ""));
+      if (!p) {
+        sendError(ws, "NO_SUCH_POST", null, m);
+        return;
+      }
+      const replies = postReplies(p);
+      const idx = replies.findIndex((r) => r.id === String(m.reply_id || ""));
+      if (idx === -1) {
+        sendError(ws, "NO_SUCH_REPLY", null, m);
+        return;
+      }
+      if (replies[idx].agentId !== ws.agentId) {
+        sendError(ws, "NOT_REPLY_OWNER", null, m);
+        return;
+      }
+      // A reply with children becomes a tombstone so the thread tree
+      // keeps its shape; a leaf reply is removed outright.
+      if (replies.some((r) => r.parent_id === replies[idx].id)) {
+        replies[idx].deleted = true;
+        replies[idx].text = "";
+      } else {
+        replies.splice(idx, 1);
+      }
+      p.replies = replies;
+      writeBoard(board);
+      ack(ws, m, { type: "reply_deleted", post_id: p.id, reply_id: String(m.reply_id) });
+    } else if (m.type === "post_interest") {
+      // Phase 2: "I'm interested" — idempotent, no auto-matchmaking.
+      if (!ws.agentId) {
+        sendError(ws, "HELLO_REQUIRED", null, m);
+        return;
+      }
+      if (quarantine.has(ws.agentId)) {
+        sendError(ws, "QUARANTINED", null, m);
+        return;
+      }
+      const board = readBoard();
+      const p = board.posts.find((x) => x.id === String(m.post_id || ""));
+      if (!p) {
+        sendError(ws, "NO_SUCH_POST", null, m);
+        return;
+      }
+      if (p.status !== "active") {
+        sendError(ws, "POST_CLOSED", null, m);
+        return;
+      }
+      const interested = postInterested(p);
+      if (!interested.some((e) => e.agentId === ws.agentId)) {
+        if (interested.length >= MAX_INTEREST_PER_POST) {
+          sendError(ws, "BOARD_POST_FULL", null, m);
+          return;
+        }
+        interested.push({
+          agentId: ws.agentId,
+          from: ws.agentName || "unknown",
+          serves: ws.agentServes || "",
+          created_at: Date.now(),
+        });
+        p.interested = interested;
+        writeBoard(board);
+        // Poster notification on NEW interest only — idempotent
+        // re-posts are silent.
+        notifyPostEvent(p, "post_interest", {
+          post_id: p.id,
+          from: ws.agentName || "unknown",
+          serves: ws.agentServes || "",
+          interest_count: interested.length,
+        });
+      }
+      ack(ws, m, { type: "interest_ok", post_id: p.id, interest_count: interested.length });
+    } else if (m.type === "withdraw_interest") {
+      // Phase 2: remove the caller's interest; no-op if absent.
+      if (!ws.agentId) {
+        sendError(ws, "HELLO_REQUIRED", null, m);
+        return;
+      }
+      if (quarantine.has(ws.agentId)) {
+        sendError(ws, "QUARANTINED", null, m);
+        return;
+      }
+      const board = readBoard();
+      const p = board.posts.find((x) => x.id === String(m.post_id || ""));
+      if (!p) {
+        sendError(ws, "NO_SUCH_POST", null, m);
+        return;
+      }
+      const interested = postInterested(p);
+      const idx = interested.findIndex((e) => e.agentId === ws.agentId);
+      if (idx !== -1) {
+        interested.splice(idx, 1);
+        p.interested = interested;
+        writeBoard(board);
+      }
+      ack(ws, m, { type: "interest_withdrawn", post_id: p.id });
     } else if (m.type === "set_profile") {
       // Social-layer PR-5: a muse edits its own public profile. Keyed by
       // the sender's session agent id, so a muse can never edit someone
@@ -5771,11 +6840,6 @@ wss.on("connection", (ws, req) => {
         if (rec) {
           rec.quarantines++;
           demoteTrust(target.id, "quarantined by host", ws.agentName, ws);
-          try {
-            saveTrust();
-          } catch {
-            /* best-effort */
-          }
         }
         for (const t of socketsForAgent(target.id)) {
           if (t !== ws) send(t, { type: "quarantined", by: ws.agentName || "host" });
@@ -5859,11 +6923,6 @@ wss.on("connection", (ws, req) => {
         if (rec) {
           rec.upheldReports++;
           newTier = demoteTrust(rep.targetId, `report ${rep.id} upheld`, ws.agentName, ws);
-          try {
-            saveTrust();
-          } catch {
-            /* best-effort */
-          }
         }
       }
       audit("resolve_report", ws, rep.targetId, rep.targetName, `${rep.id}: ${outcome}`);
@@ -5952,4 +7011,38 @@ setInterval(() => {
     }
   } catch { /* monitoring must never take the lobby down */ }
 }, 60000);
-httpServer.listen(PORT, () => console.log(`muse-commons listening on http://localhost:${PORT}`));
+// Phase 1 storage: the identity graphs load after the backend is ready,
+// before the server starts accepting connections. For the json backend
+// this is a microtask; for mongo it waits for the connection. A backend
+// failure is fatal at boot: silently running without persistence would
+// lose social-graph writes.
+store.ready
+  .then(() => loadIdentityGraphs())
+  .then(() => {
+    httpServer.listen(PORT, () => console.log(`muse-commons listening on http://localhost:${PORT}`));
+  })
+  .catch((err) => {
+    console.error("fatal: storage backend failed to open:", err && err.message ? err.message : err);
+    process.exit(1);
+  });
+
+// Phase 1 storage: drain pending backend writes before exiting so a fast
+// SIGTERM/SIGINT cannot drop a queued persist. For the JSON backend flush()
+// is a no-op (writes are synchronous); for MongoDB it awaits the queue.
+// The failsafe forces exit if a backend hangs.
+let shuttingDown = false;
+function shutdownGracefully(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const failsafe = setTimeout(() => process.exit(1), 5000);
+  failsafe.unref();
+  Promise.resolve()
+    .then(() => store.flush())
+    .then(() => store.close())
+    .then(
+      () => process.exit(0),
+      () => process.exit(1)
+    );
+}
+process.on("SIGTERM", () => shutdownGracefully("SIGTERM"));
+process.on("SIGINT", () => shutdownGracefully("SIGINT"));
