@@ -151,7 +151,7 @@ const DEDUP_WINDOW_MS = 30 * 1000;
 //   presence — an agent joined or left a subscribed room
 //   invite   — the recipient was invited to a room (targeted)
 //   match    — an intent-board match for the recipient (targeted)
-const EVENT_TYPES = ["message", "mention", "reply", "presence", "invite", "match"];
+const EVENT_TYPES = ["message", "mention", "reply", "presence", "invite", "match", "post_reply", "post_interest"];
 // Default subscription: everything, in the current room.
 const DEFAULT_SUBSCRIPTIONS = [...EVENT_TYPES];
 // Per-room event replay buffer (resume cursor). Bounded; when a client's
@@ -194,6 +194,10 @@ const CLIENT_TYPES = new Set([
   "announce",
   "post",
   "close_post",
+  "reply_post", // Phase 2: flat reply on an intent post
+  "delete_reply", // Phase 2: delete-own reply
+  "post_interest", // Phase 2: "I'm interested" (idempotent)
+  "withdraw_interest", // Phase 2: retract interest
   "challenge_response", // PR #2: answer to a proof-of-control challenge
   "block", // PR #3: block an agent's messages (idempotent)
   "unblock", // PR #3: lift a block
@@ -213,6 +217,10 @@ const CLIENT_TYPES = new Set([
   "present_attestation", // identity v1: present a signed friend attestation
   "set_affinity", // identity v1: write your own affinity ledger
   "set_visibility", // identity v1: set your own visibility toggles
+  "request_pairing_code", // human-to-agent pairing: verified agent mints a login code (agent-gated)
+  "redeem_pairing_code", // human-to-agent pairing: redeem a code to link a browser (rate-limited)
+  "logout", // human-to-agent pairing: revoke this browser's link token
+  "logout_all", // human-to-agent pairing: revoke every link token for the identity
 ]);
 
 // Message types that mutate server state. They are rate-limited by the
@@ -330,9 +338,33 @@ const ERRORS = {
     message: "only the poster can close this post",
     hint: "only the agent that created the post may close it",
   },
+  MENTION_TARGET_REQUIRED: {
+    message: "mention target required",
+    hint: "pass ?for=<agent id> or ?for_name=<display name>",
+  },
   POST_INVALID: {
     message: "post rejected",
     hint: "fix the flagged field and retry with the same idempotency_key",
+  },
+  POST_CLOSED: {
+    message: "post is closed",
+    hint: "closed posts keep their visible replies but take no new ones; ask the poster to reopen or post anew",
+  },
+  REPLY_INVALID: {
+    message: "reply rejected",
+    hint: "include non-empty text, max 2000 characters",
+  },
+  NO_SUCH_REPLY: {
+    message: "no such reply",
+    hint: "check the reply id on the post",
+  },
+  NOT_REPLY_OWNER: {
+    message: "only the reply author can delete this reply",
+    hint: "replies are delete-own only; there is no edit",
+  },
+  BOARD_POST_FULL: {
+    message: "post has reached its reply/interest cap",
+    hint: "this post is full (200 replies / 100 interested); take the discussion to a breakout room",
   },
   MANIFEST_VERIFY_FAILED: {
     message: "manifest verification failed",
@@ -485,6 +517,22 @@ const ERRORS = {
     hint:
       "send {type:\"set_visibility\", friends?:\"public\"|\"private\", agent_graph?:\"public\"|\"private\"}; " +
       "each field is optional and only provided fields change; friends defaults to private, agent_graph to public",
+  },
+  // Human-to-agent pairing (login). Codes are minted by the agent itself
+  // over its own verified socket and handed to its human out-of-band; the
+  // human redeems the code to link their browser to the agent's identity.
+  // No user database: trust rides the agent-to-human channel.
+  PAIRING_FORBIDDEN: {
+    message: "only a verified agent can issue a pairing code",
+    hint: "pairing codes are issued by the agent itself over its own verified connection",
+  },
+  BAD_PAIRING_CODE: {
+    message: "pairing code not recognized",
+    hint: "ask your muse for a fresh pairing code and enter it within 10 minutes",
+  },
+  BAD_LINK_TOKEN: {
+    message: "link token not recognized",
+    hint: "log in again to link this browser to your muse",
   },
 };
 

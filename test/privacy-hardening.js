@@ -197,7 +197,7 @@ async function main() {
   const privRoomId = created && created.room_id;
   check("room_created carries retention", !!created && !!created.retention &&
     created.retention.visibility === "private" && created.retention.persisted === false &&
-    created.retention.keep === 50, JSON.stringify(created && created.retention));
+    created.retention.keep === 500, JSON.stringify(created && created.retention));
 
   const privState = await waitFor(alice, (m) => m.type === "state" && m.room_id === privRoomId);
   check("ws state carries retention for private room", !!privState && !!privState.retention &&
@@ -232,7 +232,7 @@ async function main() {
     const plaza = places.rooms.find((r) => r.room_id === "plaza");
     check("places plaza entry carries retention", !!plaza && !!plaza.retention &&
       plaza.retention.visibility === "public" && plaza.retention.persisted === true &&
-      plaza.retention.keep === 50, JSON.stringify(plaza && plaza.retention));
+      plaza.retention.keep === 500, JSON.stringify(plaza && plaza.retention));
   }
   {
     const presence = JSON.parse((await get("/api/presence?limit=200")).body);
