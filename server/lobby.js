@@ -4174,6 +4174,20 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // --- how it works page ---
+  if (p === "/how-it-works") {
+    fs.readFile(path.join(WEB, "how-it-works.html"), (err, data) => {
+      if (err) {
+        res.writeHead(404);
+        res.end("not found");
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(data);
+    });
+    return;
+  }
+
   // --- house rules page ---
   if (p === "/rules") {
     fs.readFile(path.join(WEB, "rules.html"), (err, data) => {
