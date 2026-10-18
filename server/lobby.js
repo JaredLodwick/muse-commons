@@ -2671,6 +2671,171 @@ function replayMissed(ws, room, lastSeq) {
 }
 
 // --- agents (per room) ---
+// --- plaza furniture collision (plaza room only) ---
+// The plaza renders as a 3D restaurant (web/plaza3d.js); its furniture
+// footprints are mirrored here in server coordinates (1000x620) so the
+// movement sim walks AROUND the furniture instead of through it. KEEP
+// IN SYNC with the furniture placement in web/plaza3d.js: service
+// counter + pastry case at the back, banquettes right and back-left,
+// communal table left, olive-tree planter with benches at the center,
+// four round tables, potted palms in the corners.
+const PLAZA_RECTS = [
+  [320, 75, 680, 135], // service counter
+  [700, 85, 760, 125], // pastry case
+  [70, 45, 290, 170], // back-left banquette + its tables and chairs
+  [825, 140, 950, 360], // right banquette, back
+  [825, 390, 950, 590], // right banquette, front
+  [15, 210, 165, 470], // communal table + chairs
+  [440, 270, 560, 390], // olive-tree planter + surrounding benches
+];
+const PLAZA_CIRCLES = [
+  [220, 230, 78], [780, 230, 78], // round tables, chairs included
+  [230, 480, 78], [770, 480, 78],
+  [50, 50, 26], [950, 60, 26], // potted palms
+  [50, 570, 26], [950, 575, 26],
+  [420, 590, 26], [580, 590, 26],
+];
+const PLAZA_CLEAR = 30; // obstacle inflation: agent body radius + margin
+const GRID_CELL = 20;
+const GRID_W = Math.ceil(ROOM.w / GRID_CELL);
+const GRID_H = Math.ceil(ROOM.h / GRID_CELL);
+let plazaGridCache = null;
+
+function plazaPointBlocked(x, y, clear = PLAZA_CLEAR) {
+  for (const [x0, y0, x1, y1] of PLAZA_RECTS) {
+    if (x > x0 - clear && x < x1 + clear && y > y0 - clear && y < y1 + clear) return true;
+  }
+  for (const [cx, cy, r] of PLAZA_CIRCLES) {
+    const dx = x - cx, dy = y - cy, rr = r + clear;
+    if (dx * dx + dy * dy < rr * rr) return true;
+  }
+  return false;
+}
+
+function plazaGrid() {
+  if (plazaGridCache) return plazaGridCache;
+  const g = new Uint8Array(GRID_W * GRID_H);
+  for (let cy = 0; cy < GRID_H; cy++) {
+    for (let cx = 0; cx < GRID_W; cx++) {
+      g[cy * GRID_W + cx] = plazaPointBlocked(
+        cx * GRID_CELL + GRID_CELL / 2,
+        cy * GRID_CELL + GRID_CELL / 2
+      ) ? 1 : 0;
+    }
+  }
+  plazaGridCache = g;
+  return g;
+}
+
+// The point itself when it is already on open floor; otherwise the
+// closest free grid-cell center (expanding-ring search).
+function plazaSnapFree(x, y) {
+  if (!plazaPointBlocked(x, y)) return { x, y };
+  const g = plazaGrid();
+  const ccx = Math.min(GRID_W - 1, Math.max(0, Math.floor(x / GRID_CELL)));
+  const ccy = Math.min(GRID_H - 1, Math.max(0, Math.floor(y / GRID_CELL)));
+  for (let r = 1; r < Math.max(GRID_W, GRID_H); r++) {
+    let best = null, bestD = Infinity;
+    for (let cy = ccy - r; cy <= ccy + r; cy++) {
+      for (let cx = ccx - r; cx <= ccx + r; cx++) {
+        if (cx < 0 || cy < 0 || cx >= GRID_W || cy >= GRID_H) continue;
+        if (Math.max(Math.abs(cx - ccx), Math.abs(cy - ccy)) !== r) continue;
+        if (g[cy * GRID_W + cx]) continue;
+        const px = cx * GRID_CELL + GRID_CELL / 2;
+        const py = cy * GRID_CELL + GRID_CELL / 2;
+        const d = (px - x) * (px - x) + (py - y) * (py - y);
+        if (d < bestD) { bestD = d; best = { x: px, y: py }; }
+      }
+    }
+    if (best) return best;
+  }
+  return { x, y };
+}
+
+function plazaSegmentBlocked(x0, y0, x1, y1) {
+  const d = Math.hypot(x1 - x0, y1 - y0);
+  const steps = Math.max(1, Math.ceil(d / 10));
+  for (let i = 1; i < steps; i++) {
+    const k = i / steps;
+    if (plazaPointBlocked(x0 + (x1 - x0) * k, y0 + (y1 - y0) * k)) return true;
+  }
+  return false;
+}
+
+// A* over the plaza grid plus line-of-sight smoothing. Returns the
+// waypoints to walk and the (possibly snapped) final destination.
+function findPlazaPath(x0, y0, x1, y1) {
+  const start = plazaSnapFree(x0, y0);
+  const dest = plazaSnapFree(x1, y1);
+  if (!plazaSegmentBlocked(start.x, start.y, dest.x, dest.y)) {
+    return { points: [dest], dest };
+  }
+  const g = plazaGrid();
+  const cellOf = (x, y) =>
+    Math.min(GRID_H - 1, Math.max(0, Math.floor(y / GRID_CELL))) * GRID_W +
+    Math.min(GRID_W - 1, Math.max(0, Math.floor(x / GRID_CELL)));
+  const si = cellOf(start.x, start.y);
+  const ei = cellOf(dest.x, dest.y);
+  const came = new Int32Array(GRID_W * GRID_H).fill(-1);
+  const gs = new Float32Array(GRID_W * GRID_H).fill(Infinity);
+  const closed = new Uint8Array(GRID_W * GRID_H);
+  gs[si] = 0;
+  const open = [si];
+  const hOf = (i) => Math.hypot((i % GRID_W) - (ei % GRID_W), Math.floor(i / GRID_W) - Math.floor(ei / GRID_W));
+  let found = false;
+  while (open.length) {
+    // Small grid: a linear-scan min-f extract is fast enough.
+    let bi = 0;
+    for (let i = 1; i < open.length; i++) {
+      if (gs[open[i]] + hOf(open[i]) < gs[open[bi]] + hOf(open[bi])) bi = i;
+    }
+    const cur = open.splice(bi, 1)[0];
+    if (cur === ei) { found = true; break; }
+    if (closed[cur]) continue;
+    closed[cur] = 1;
+    const cx = cur % GRID_W, cy = Math.floor(cur / GRID_W);
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
+        const ni = ny * GRID_W + nx;
+        if (g[ni] || closed[ni]) continue;
+        if (dx && dy && (g[cy * GRID_W + nx] || g[ny * GRID_W + cx])) continue; // no corner cutting
+        const cost = gs[cur] + (dx && dy ? 1.414 : 1);
+        if (cost < gs[ni]) {
+          gs[ni] = cost;
+          came[ni] = cur;
+          open.push(ni);
+        }
+      }
+    }
+  }
+  if (!found) return { points: [dest], dest };
+  const cells = [];
+  for (let cur = ei; cur !== -1; cur = came[cur]) cells.push(cur);
+  cells.reverse();
+  const pts = cells.map((i) => ({
+    x: (i % GRID_W) * GRID_CELL + GRID_CELL / 2,
+    y: Math.floor(i / GRID_W) * GRID_CELL + GRID_CELL / 2,
+  }));
+  pts[pts.length - 1] = dest;
+  // String-pulling: drop every waypoint reachable in a straight line.
+  const out = [];
+  let from = { x: x0, y: y0 };
+  let idx = 0;
+  while (idx < pts.length) {
+    let furthest = idx;
+    for (let j = pts.length - 1; j > idx; j--) {
+      if (!plazaSegmentBlocked(from.x, from.y, pts[j].x, pts[j].y)) { furthest = j; break; }
+    }
+    out.push(pts[furthest]);
+    from = pts[furthest];
+    idx = furthest + 1;
+  }
+  return { points: out, dest };
+}
+
 function ensureAgent(room, id, info = {}) {
   let a = room.agents.get(id);
   if (!a) {
@@ -2690,10 +2855,20 @@ function ensureAgent(room, id, info = {}) {
       talkingUntil: 0,
       convoId: null,
       convoUntil: 0,
+      pathFor: null,
+      pathPts: null,
+      pathDest: null,
+      pathI: 0,
       bubble: null,
       bubbleUntil: 0,
       lastBeat: Date.now(),
     };
+    if (room.id === "plaza") {
+      // Never spawn inside the furniture.
+      const s = plazaSnapFree(a.x, a.y);
+      a.x = s.x;
+      a.y = s.y;
+    }
     room.agents.set(id, a);
   } else {
     if (info.name) a.name = info.name;
@@ -4164,13 +4339,40 @@ function tick() {
         }
       }
       if (now > a.bubbleUntil) a.bubble = null;
-      const dx = a.tx - a.x;
-      const dy = a.ty - a.y;
+      // Movement. In the plaza, agents follow a path around the
+      // furniture (findPlazaPath); everywhere else they walk straight
+      // at their target, as before. Arrival is measured against the
+      // final destination (the snapped target, in the plaza).
+      let mvX = a.tx, mvY = a.ty, finX = a.tx, finY = a.ty;
+      if (room.id === "plaza") {
+        const key = a.tx + "," + a.ty;
+        if (a.pathFor !== key) {
+          const res = findPlazaPath(a.x, a.y, a.tx, a.ty);
+          a.pathPts = res.points;
+          a.pathDest = res.dest;
+          a.pathI = 0;
+          a.pathFor = key;
+        }
+        finX = a.pathDest.x;
+        finY = a.pathDest.y;
+        mvX = finX;
+        mvY = finY;
+        while (a.pathPts && a.pathI < a.pathPts.length) {
+          const p = a.pathPts[a.pathI];
+          if (Math.hypot(p.x - a.x, p.y - a.y) > 8) { mvX = p.x; mvY = p.y; break; }
+          a.pathI++;
+        }
+      }
+      const dx = finX - a.x;
+      const dy = finY - a.y;
       const d = Math.hypot(dx, dy);
       if (d > 4) {
-        const step = Math.min(d, SPEED * dt);
-        a.x += (dx / d) * step;
-        a.y += (dy / d) * step;
+        const mdx = mvX - a.x;
+        const mdy = mvY - a.y;
+        const md = Math.hypot(mdx, mdy) || 1;
+        const step = Math.min(md, SPEED * dt);
+        a.x += (mdx / md) * step;
+        a.y += (mdy / md) * step;
       } else if (!a.talking && !a.convoId && Math.random() < 0.01) {
         const t = newTarget();
         a.tx = t.x;

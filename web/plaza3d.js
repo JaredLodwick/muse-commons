@@ -60,8 +60,8 @@ function cyl(rt, rb, h, mat, x = 0, y = 0, z = 0, seg = 20) {
 const THEMES = {
   light: {
     bg: 0xe9dcc4, fog: 0xe9dcc4,
-    hemiSky: 0xfff4e0, hemiGround: 0xb08d5f, hemiInt: 0.85,
-    sun: 0xffe7c4, sunInt: 1.6, amb: 0xfff2e0, ambInt: 0.35,
+    hemiSky: 0xfff4e0, hemiGround: 0xb08d5f, hemiInt: 0.9,
+    sun: 0xffe3b8, sunInt: 1.85, amb: 0xfff2e0, ambInt: 0.32,
     floor: 0xede3d2, wall: 0xf2e7d2, trim: 0xb08d5f,
     archIn: 0xe6cba6, curb: 0xd9c3a3, rug: 0xc99a7a,
   },
@@ -84,7 +84,7 @@ export function createPlazaView(container, opts = {}) {
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.05;
+  renderer.toneMappingExposure = 1.12;
   renderer.domElement.className = "p3d-canvas";
   container.appendChild(renderer.domElement);
 
@@ -178,25 +178,49 @@ export function createPlazaView(container, opts = {}) {
   const room = new THREE.Group();
   scene.add(room);
 
-  // Floor: warm stone tiles from a procedural canvas texture.
-  const floorTex = makeCanvas(512, 320, (c, w, h) => {
-    c.fillStyle = "#efe4d1";
+  // Floor: warm travertine tiles from a procedural canvas texture -
+  // per-tile tone variation, stone speckle, faint veins, beveled grout.
+  const floorTex = makeCanvas(1024, 640, (c, w, h) => {
+    c.fillStyle = "#d8c6a6";
     c.fillRect(0, 0, w, h);
-    const tw = 64, th = 64;
-    for (let y = 0; y < h / th; y++) {
-      for (let x = 0; x < w / tw; x++) {
-        const v = ((x * 7 + y * 13) % 5) * 2;
-        c.fillStyle = `rgb(${236 - v},${224 - v},${204 - v})`;
-        c.fillRect(x * tw + 1, y * th + 1, tw - 2, th - 2);
+    const tw = 128, th = 128;
+    let seed = 7;
+    const rnd = () => {
+      seed = (seed * 16807) % 2147483647;
+      return seed / 2147483647;
+    };
+    for (let ty = 0; ty < h / th; ty++) {
+      for (let tx = 0; tx < w / tw; tx++) {
+        const v = rnd() * 14 - 7;
+        const warm = rnd() * 6;
+        c.fillStyle = `rgb(${238 + v + warm},${226 + v},${205 + v - warm})`;
+        c.fillRect(tx * tw + 2, ty * th + 2, tw - 4, th - 4);
+        // Stone speckle.
+        for (let s = 0; s < 260; s++) {
+          const sx = tx * tw + rnd() * tw;
+          const sy = ty * th + rnd() * th;
+          c.fillStyle = rnd() > 0.5 ? "rgba(160,135,100,.13)" : "rgba(255,250,238,.14)";
+          c.fillRect(sx, sy, 1.6, 1.6);
+        }
+        // A couple of faint travertine veins per tile.
+        c.strokeStyle = "rgba(170,145,110,.16)";
+        c.lineWidth = 1.4;
+        for (let vn = 0; vn < 2; vn++) {
+          const vy = ty * th + rnd() * th;
+          c.beginPath();
+          c.moveTo(tx * tw, vy);
+          c.bezierCurveTo(
+            tx * tw + tw * 0.3, vy + rnd() * 10 - 5,
+            tx * tw + tw * 0.7, vy + rnd() * 10 - 5,
+            tx * tw + tw, vy + rnd() * 8 - 4
+          );
+          c.stroke();
+        }
+        // Bevel highlight along the tile's top-left edges.
+        c.fillStyle = "rgba(255,252,244,.35)";
+        c.fillRect(tx * tw + 2, ty * th + 2, tw - 4, 2);
+        c.fillRect(tx * tw + 2, ty * th + 2, 2, th - 4);
       }
-    }
-    c.strokeStyle = "rgba(140,115,85,.5)";
-    c.lineWidth = 2;
-    for (let x = 0; x <= w; x += tw) {
-      c.beginPath(); c.moveTo(x, 0); c.lineTo(x, h); c.stroke();
-    }
-    for (let y = 0; y <= h; y += th) {
-      c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke();
     }
   });
   floorTex.wrapS = floorTex.wrapT = THREE.RepeatWrapping;
@@ -212,20 +236,31 @@ export function createPlazaView(container, opts = {}) {
   room.add(skirt);
 
   // Central rug with a stitched border.
-  const rugTex = makeCanvas(256, 256, (c, w, h) => {
+  const rugTex = makeCanvas(512, 512, (c, w, h) => {
     c.fillStyle = "#c99a7a";
     c.fillRect(0, 0, w, h);
+    // Woven diamond lattice across the field.
+    c.strokeStyle = "rgba(138,90,52,.28)";
+    c.lineWidth = 2;
+    const step = 42;
+    for (let x = -h; x < w + h; x += step) {
+      c.beginPath(); c.moveTo(x, 0); c.lineTo(x + h, h); c.stroke();
+      c.beginPath(); c.moveTo(x + h, 0); c.lineTo(x, h); c.stroke();
+    }
     c.strokeStyle = "#8a5a34";
-    c.lineWidth = 8;
-    c.strokeRect(14, 14, w - 28, h - 28);
+    c.lineWidth = 10;
+    c.strokeRect(16, 16, w - 32, h - 32);
+    c.strokeStyle = "rgba(245,230,210,.55)";
+    c.lineWidth = 3;
+    c.strokeRect(34, 34, w - 68, h - 68);
     c.strokeStyle = "rgba(138,90,52,.5)";
     c.lineWidth = 3;
-    c.strokeRect(30, 30, w - 60, h - 60);
+    c.strokeRect(48, 48, w - 96, h - 96);
     c.fillStyle = "rgba(138,90,52,.8)";
     for (let i = 0; i < 12; i++) {
       const a = (i / 12) * Math.PI * 2;
       c.beginPath();
-      c.arc(w / 2 + Math.cos(a) * 88, h / 2 + Math.sin(a) * 88, 4, 0, 7);
+      c.arc(w / 2 + Math.cos(a) * 168, h / 2 + Math.sin(a) * 168, 6, 0, 7);
       c.fill();
     }
   });
@@ -239,9 +274,34 @@ export function createPlazaView(container, opts = {}) {
   room.add(rug);
 
   // Walls: tall back + sides, low dollhouse curb at the front.
-  const wallMat = themeMat("wall", { roughness: 0.95 });
+  // Subtle plaster texture (near-white, so the theme color tints it).
+  const plasterTex = makeCanvas(512, 512, (c, w, h) => {
+    c.fillStyle = "#f6f1e7";
+    c.fillRect(0, 0, w, h);
+    let seed = 31;
+    const rnd = () => {
+      seed = (seed * 16807) % 2147483647;
+      return seed / 2147483647;
+    };
+    for (let i = 0; i < 90; i++) {
+      const x = rnd() * w, y = rnd() * h, r = 30 + rnd() * 90;
+      const grad = c.createRadialGradient(x, y, 0, x, y, r);
+      const tone = rnd() > 0.5 ? "214,198,170" : "255,252,246";
+      grad.addColorStop(0, `rgba(${tone},.10)`);
+      grad.addColorStop(1, `rgba(${tone},0)`);
+      c.fillStyle = grad;
+      c.beginPath(); c.arc(x, y, r, 0, 7); c.fill();
+    }
+    for (let s = 0; s < 2600; s++) {
+      c.fillStyle = rnd() > 0.5 ? "rgba(170,150,120,.05)" : "rgba(255,255,255,.06)";
+      c.fillRect(rnd() * w, rnd() * h, 1.5, 1.5);
+    }
+  });
+  plasterTex.wrapS = plasterTex.wrapT = THREE.RepeatWrapping;
+  plasterTex.repeat.set(3, 1);
+  const wallMat = themeMat("wall", { map: plasterTex, roughness: 0.95 });
   const trimMat = themeMat("trim", { roughness: 0.8 });
-  const archInMat = themeMat("archIn", { roughness: 0.95 });
+  const archInMat = themeMat("archIn", { map: plasterTex, roughness: 0.95 });
   const backWall = box(ROOM_W + 2 * WALL_T, WALL_H, WALL_T, wallMat, 0, WALL_H / 2, -HZ - WALL_T / 2);
   const leftWall = box(WALL_T, WALL_H, ROOM_H, wallMat, -HX - WALL_T / 2, WALL_H / 2, 0);
   const rightWall = box(WALL_T, WALL_H, ROOM_H, wallMat, HX + WALL_T / 2, WALL_H / 2, 0);
@@ -288,17 +348,29 @@ export function createPlazaView(container, opts = {}) {
     color: 0xfff6e2, emissive: 0xffedb8, emissiveIntensity: 0.9, roughness: 0.4,
   });
   themeables.push({ mat: paneMat, key: "__pane" }); // handled below in applyThemeExtra
+  // Arch-topped window pane: rectangle crowned by a semicircle.
+  const winShape = new THREE.Shape();
+  winShape.moveTo(-0.85, -1.2);
+  winShape.lineTo(0.85, -1.2);
+  winShape.lineTo(0.85, 0.35);
+  winShape.absarc(0, 0.35, 0.85, 0, Math.PI, false);
+  winShape.lineTo(-0.85, -1.2);
+  const winGeo = new THREE.ShapeGeometry(winShape, 20);
   for (const wz of [-3.4, 0.2, 3.8]) {
     const g = new THREE.Group();
-    const pane = new THREE.Mesh(new THREE.PlaneGeometry(1.7, 2.4), paneMat);
+    const pane = new THREE.Mesh(winGeo, paneMat);
     pane.rotation.y = Math.PI / 2;
     pane.position.y = 2.3;
     g.add(pane);
     const fm = trimMat;
-    g.add(box(0.12, 2.6, 0.14, fm, 0, 2.3, -0.92));
-    g.add(box(0.12, 2.6, 0.14, fm, 0, 2.3, 0.92));
-    g.add(box(0.12, 0.14, 1.98, fm, 0, 3.62, 0));
-    g.add(box(0.12, 0.14, 1.98, fm, 0, 0.98, 0));
+    g.add(box(0.12, 1.6, 0.14, fm, 0, 1.85, -0.92));
+    g.add(box(0.12, 1.6, 0.14, fm, 0, 1.85, 0.92));
+    const archTrim = new THREE.Mesh(new THREE.TorusGeometry(0.88, 0.08, 8, 22, Math.PI), fm);
+    archTrim.rotation.y = Math.PI / 2;
+    archTrim.position.set(0, 2.65, 0);
+    archTrim.castShadow = true;
+    g.add(archTrim);
+    g.add(box(0.12, 0.14, 1.98, fm, 0, 1.03, 0));
     g.add(box(0.1, 2.4, 0.07, fm, 0, 2.3, 0));
     g.add(box(0.1, 0.07, 1.7, fm, 0, 2.3, 0));
     g.position.set(-HX + 0.04, 0, wz);
@@ -317,6 +389,8 @@ export function createPlazaView(container, opts = {}) {
   // Garland swags along the back wall top: leaf blobs on a sagging curve.
   const leafMats = [std(0x4e8a5c), std(0x5fa06a), std(0x3e7a4e)];
   const leafGeo = new THREE.IcosahedronGeometry(0.16, 0);
+  const berryMat = std(0xd9704e, { roughness: 0.6 });
+  const berryGeo = new THREE.SphereGeometry(0.05, 8, 8);
   function garland(x0, x1, y, z, sag = 0.5) {
     const n = Math.max(6, Math.round((x1 - x0) / 0.35));
     for (let i = 0; i <= n; i++) {
@@ -325,24 +399,56 @@ export function createPlazaView(container, opts = {}) {
       const yy = y - Math.sin(k * Math.PI) * sag;
       const leaf = new THREE.Mesh(leafGeo, leafMats[i % 3]);
       leaf.position.set(x, yy + (i % 2) * 0.08, z);
+      leaf.scale.setScalar(0.85 + (i % 3) * 0.15);
       leaf.castShadow = true;
       room.add(leaf);
+      if (i % 4 === 2) {
+        const berry = new THREE.Mesh(berryGeo, berryMat);
+        berry.position.set(x + 0.06, yy - 0.1, z + 0.1);
+        room.add(berry);
+      }
     }
   }
   garland(-HX + 0.6, -2.2, WALL_H - 0.5, -HZ + 0.25);
   garland(2.2, HX - 0.6, WALL_H - 0.5, -HZ + 0.25);
 
-  // Wall sconces on the right wall: warm glowing orbs in alcoves.
+  // Arched display niches on the right wall: a recessed arch, a shelf
+  // with a tiny plant or candle, and a warm glowing orb above.
   const sconceMat = new THREE.MeshStandardMaterial({
     color: 0xffe9c4, emissive: 0xffc98a, emissiveIntensity: 1.2, roughness: 0.5,
   });
-  for (const sz of [-4.2, -1.4, 1.4, 4.2]) {
-    const alcove = box(0.18, 1.1, 0.7, archInMat, HX - 0.02, 2.5, sz, false);
-    room.add(alcove);
-    const orb = new THREE.Mesh(new THREE.SphereGeometry(0.13, 12, 12), sconceMat);
-    orb.position.set(HX - 0.18, 2.5, sz);
+  const nicheLeafMat = std(0x5fa06a);
+  [-4.2, -1.4, 1.4, 4.2].forEach((sz, ni) => {
+    const panel = new THREE.Mesh(new THREE.PlaneGeometry(0.95, 1.9), archInMat);
+    panel.rotation.y = -Math.PI / 2;
+    panel.position.set(HX - 0.02, 2.45, sz);
+    panel.receiveShadow = true;
+    room.add(panel);
+    const archTrim = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.06, 8, 20, Math.PI), trimMat);
+    archTrim.rotation.y = Math.PI / 2;
+    archTrim.position.set(HX - 0.06, 2.95, sz);
+    room.add(archTrim);
+    room.add(box(0.1, 1.5, 0.1, trimMat, HX - 0.05, 2.2, sz - 0.5, false));
+    room.add(box(0.1, 1.5, 0.1, trimMat, HX - 0.05, 2.2, sz + 0.5, false));
+    room.add(box(0.3, 0.05, 0.9, trimMat, HX - 0.16, 1.85, sz, false));
+    if (ni % 2 === 0) {
+      room.add(cyl(0.07, 0.055, 0.13, std(0xb4653f), HX - 0.16, 1.94, sz, 8));
+      for (let lf = 0; lf < 3; lf++) {
+        const leaf = new THREE.Mesh(new THREE.SphereGeometry(0.11, 8, 6), nicheLeafMat);
+        leaf.position.set(HX - 0.16 + (lf - 1) * 0.07, 2.1 + (lf % 2) * 0.05, sz + (lf - 1) * 0.08);
+        leaf.castShadow = true;
+        room.add(leaf);
+      }
+    } else {
+      room.add(cyl(0.045, 0.045, 0.15, std(0xf3e8d2), HX - 0.16, 1.95, sz, 8));
+      const flame = new THREE.Mesh(new THREE.SphereGeometry(0.032, 8, 8), sconceMat);
+      flame.position.set(HX - 0.16, 2.06, sz);
+      room.add(flame);
+    }
+    const orb = new THREE.Mesh(new THREE.SphereGeometry(0.1, 12, 12), sconceMat);
+    orb.position.set(HX - 0.2, 2.72, sz);
     room.add(orb);
-  }
+  });
 
   applyThemeExtra = (name) => {
     const dark = name === "dark";
@@ -364,10 +470,37 @@ export function createPlazaView(container, opts = {}) {
   });
   slatTex.wrapS = THREE.RepeatWrapping;
   slatTex.repeat.set(4, 1);
+  const marbleTex = makeCanvas(256, 128, (c, w, h) => {
+    c.fillStyle = "#f7f2e8";
+    c.fillRect(0, 0, w, h);
+    let seed = 11;
+    const rnd = () => {
+      seed = (seed * 16807) % 2147483647;
+      return seed / 2147483647;
+    };
+    for (let i = 0; i < 7; i++) {
+      c.strokeStyle = `rgba(150,140,125,${0.1 + rnd() * 0.12})`;
+      c.lineWidth = 1 + rnd() * 1.6;
+      const y0 = rnd() * h;
+      c.beginPath();
+      c.moveTo(0, y0);
+      c.bezierCurveTo(w * 0.3, y0 + rnd() * 22 - 11, w * 0.7, y0 + rnd() * 22 - 11, w, y0 + rnd() * 14 - 7);
+      c.stroke();
+    }
+    for (let s = 0; s < 500; s++) {
+      c.fillStyle = "rgba(170,160,145,.08)";
+      c.fillRect(rnd() * w, rnd() * h, 1.4, 1.4);
+    }
+  });
   const counter = new THREE.Group();
   const counterBody = box(7, 1.05, 1.1, std(0xffffff, { map: slatTex, roughness: 0.85 }), 0, 0.525, 0);
   counter.add(counterBody);
-  counter.add(box(7.3, 0.1, 1.4, std(0xf7f3ea, { roughness: 0.4 }), 0, 1.1, 0));
+  counter.add(box(7.3, 0.1, 1.4, std(0xffffff, { map: marbleTex, roughness: 0.32 }), 0, 1.1, 0));
+  // Brass foot rail along the counter front.
+  const brassMat = std(0xc9a24a, { metalness: 0.85, roughness: 0.35 });
+  const rail = cyl(0.035, 0.035, 6.6, brassMat, 0, 0.78, 0.66, 10);
+  rail.rotation.z = Math.PI / 2;
+  counter.add(rail);
   counter.add(box(7.3, 0.08, 1.4, trimMat, 0, 0.04, 0, false));
   // Countertop dressing: vase flowers + cups + register.
   const vaseMat = std(0x8a9a7a);
@@ -380,7 +513,24 @@ export function createPlazaView(container, opts = {}) {
   for (const cx of [-1.5, 1.2]) {
     counter.add(cyl(0.09, 0.07, 0.14, std(0xfbf7ee), cx, 1.22, -0.2, 10));
   }
-  counter.add(box(0.4, 0.3, 0.35, std(0x3a3330), 0.7, 1.3, -0.1));
+  // Espresso machine: steel body, two group heads, drip tray.
+  const steelMat = std(0x9aa0a4, { metalness: 0.7, roughness: 0.4 });
+  counter.add(box(0.58, 0.34, 0.42, steelMat, 0.7, 1.32, -0.12));
+  counter.add(box(0.5, 0.05, 0.34, std(0x3a3330), 0.7, 1.17, -0.1));
+  for (const gx of [0.56, 0.84]) {
+    counter.add(cyl(0.045, 0.045, 0.09, steelMat, gx, 1.13, 0.02, 8));
+  }
+  counter.add(box(0.58, 0.06, 0.42, brassMat, 0.7, 1.52, -0.12, false));
+  // Cake dome on a stand at the counter's left end.
+  counter.add(cyl(0.17, 0.13, 0.06, brassMat, -2.05, 1.18, 0.12, 14));
+  const dome = new THREE.Mesh(
+    new THREE.SphereGeometry(0.18, 14, 8, 0, Math.PI * 2, 0, Math.PI / 2),
+    new THREE.MeshStandardMaterial({ color: 0xdcecff, transparent: true, opacity: 0.28, roughness: 0.08 })
+  );
+  dome.position.set(-2.05, 1.21, 0.12);
+  counter.add(dome);
+  const cake = cyl(0.13, 0.13, 0.09, std(0xe8b7c2), -2.05, 1.24, 0.12, 12);
+  counter.add(cake);
   counter.position.set(0, 0, -4.1);
   room.add(counter);
 
@@ -436,20 +586,53 @@ export function createPlazaView(container, opts = {}) {
   room.add(box(1.1, 1.1, 0.7, std(0xb0764e), 4.6, 0.55, -4.1));
 
   // Dining furniture: round tables, chairs, banquettes, place settings.
-  const tableTopMat = std(0xc9a06b, { roughness: 0.7 });
-  const chairMat = std(0xb98f5e, { roughness: 0.8 });
-  const cushionMat = std(0xe8a37f, { roughness: 0.9 });
-  const plateMat = std(0xfbf7ee, { roughness: 0.35 });
+  const woodTex = makeCanvas(256, 256, (c, w, h) => {
+    c.fillStyle = "#c9a06b";
+    c.fillRect(0, 0, w, h);
+    let seed = 23;
+    const rnd = () => {
+      seed = (seed * 16807) % 2147483647;
+      return seed / 2147483647;
+    };
+    for (let i = 0; i < 34; i++) {
+      const y0 = rnd() * h;
+      c.strokeStyle = `rgba(120,84,44,${0.08 + rnd() * 0.14})`;
+      c.lineWidth = 0.8 + rnd() * 2;
+      c.beginPath();
+      c.moveTo(0, y0);
+      c.bezierCurveTo(w * 0.3, y0 + rnd() * 7 - 3.5, w * 0.7, y0 + rnd() * 7 - 3.5, w, y0 + rnd() * 5 - 2.5);
+      c.stroke();
+    }
+    for (let i = 0; i < 5; i++) {
+      const x = rnd() * w, y = rnd() * h;
+      c.strokeStyle = "rgba(110,76,40,.25)";
+      c.lineWidth = 1.2;
+      c.beginPath(); c.arc(x, y, 3 + rnd() * 5, 0, 7); c.stroke();
+    }
+  });
+  woodTex.wrapS = woodTex.wrapT = THREE.RepeatWrapping;
+  const tableTopMat = std(0xffffff, { map: woodTex, roughness: 0.62 });
+  const chairMat = std(0xb98f5e, { roughness: 0.8, side: THREE.DoubleSide });
+  const cushionMat = std(0xe8a37f, { roughness: 1 });
+  const plateMat = std(0xfbf7ee, { roughness: 0.28 });
   const tableGeoTop = new THREE.CylinderGeometry(0.85, 0.85, 0.09, 22);
   const tableGeoLeg = new THREE.CylinderGeometry(0.09, 0.13, 0.72, 10);
   const plateGeo = new THREE.CylinderGeometry(0.16, 0.13, 0.035, 14);
   const cupGeo = new THREE.CylinderGeometry(0.05, 0.04, 0.09, 8);
+  const matGeo = new THREE.CylinderGeometry(0.23, 0.23, 0.014, 14);
+  const placematMat = std(0xb59a72, { roughness: 1 });
+  const napkinMat = std(0xffffff, { roughness: 0.9 });
+  // Curved rattan shell for chair backs (open half-cylinder).
+  const chairBackGeo = new THREE.CylinderGeometry(0.34, 0.34, 0.58, 12, 1, true, Math.PI / 2, Math.PI);
 
   function chair(x, z, yaw) {
     const g = new THREE.Group();
     g.add(box(0.5, 0.07, 0.5, chairMat, 0, 0.46, 0));
     g.add(box(0.44, 0.08, 0.44, cushionMat, 0, 0.53, 0));
-    g.add(box(0.5, 0.62, 0.07, chairMat, 0, 0.85, -0.24));
+    const back = new THREE.Mesh(chairBackGeo, chairMat);
+    back.position.set(0, 0.86, 0.06);
+    back.castShadow = true;
+    g.add(back);
     for (const [lx, lz] of [[-0.2, -0.2], [0.2, -0.2], [-0.2, 0.2], [0.2, 0.2]]) {
       g.add(cyl(0.03, 0.03, 0.46, chairMat, lx, 0.23, lz, 6));
     }
@@ -471,9 +654,15 @@ export function createPlazaView(container, opts = {}) {
     for (let i = 0; i < seats; i++) {
       const a = yawOff + (i / seats) * Math.PI * 2;
       const px = Math.cos(a) * 0.55, pz = Math.sin(a) * 0.55;
+      const pmat = new THREE.Mesh(matGeo, placematMat);
+      pmat.position.set(px, 0.812, pz);
+      g.add(pmat);
       const plate = new THREE.Mesh(plateGeo, plateMat);
       plate.position.set(px, 0.83, pz);
       g.add(plate);
+      const napkin = box(0.13, 0.016, 0.09, napkinMat, px, 0.856, pz, false);
+      napkin.rotation.y = a * 1.7;
+      g.add(napkin);
       const cup = new THREE.Mesh(cupGeo, plateMat);
       cup.position.set(px * 1.25, 0.86, pz * 1.25);
       g.add(cup);
@@ -512,6 +701,9 @@ export function createPlazaView(container, opts = {}) {
       top.castShadow = true;
       g.add(top);
       g.add(box(0.12, 0.7, 0.12, chairMat, tx, 0.37, 1.05));
+      const pmat2 = new THREE.Mesh(matGeo, placematMat);
+      pmat2.position.set(tx, 0.79, 1.0);
+      g.add(pmat2);
       const plate = new THREE.Mesh(plateGeo, plateMat);
       plate.position.set(tx, 0.8, 1.0);
       g.add(plate);
@@ -536,6 +728,9 @@ export function createPlazaView(container, opts = {}) {
     for (let i = 0; i < 4; i++) {
       const pz = -1.7 + i * 1.13;
       for (const side of [-1, 1]) {
+        const pmat3 = new THREE.Mesh(matGeo, placematMat);
+        pmat3.position.set(side * 0.35, 0.812, pz);
+        g.add(pmat3);
         const plate = new THREE.Mesh(plateGeo, plateMat);
         plate.position.set(side * 0.35, 0.83, pz);
         g.add(plate);
@@ -548,22 +743,52 @@ export function createPlazaView(container, opts = {}) {
   }
   room.add(communalTable(-8.2, 0.6));
 
-  // Central olive tree in its planter, ringed by a curved banquette.
+  // Central olive tree in its planter, ringed by coral benches.
   const tree = new THREE.Group();
-  tree.add(box(1.7, 0.55, 1.7, std(0xb0764e), 0, 0.275, 0));
+  const planterMat = std(0xb0764e, { roughness: 0.85 });
+  tree.add(box(1.7, 0.55, 1.7, planterMat, 0, 0.275, 0));
   tree.add(box(1.5, 0.2, 1.5, cushionMat, 0, 0.62, 0));
-  const trunk = cyl(0.14, 0.2, 1.6, std(0x7a5a3a), 0, 1.4, 0, 10);
+  // Bench seats hugging all four sides of the planter.
+  for (const [bx, bz, rot] of [[0, -1.04, 0], [0, 1.04, 0], [-1.04, 0, Math.PI / 2], [1.04, 0, Math.PI / 2]]) {
+    const bench = new THREE.Group();
+    bench.add(box(1.7, 0.34, 0.38, planterMat, 0, 0.17, 0));
+    bench.add(box(1.66, 0.14, 0.42, cushionMat, 0, 0.41, 0));
+    bench.position.set(bx, 0, bz);
+    bench.rotation.y = rot;
+    tree.add(bench);
+  }
+  const trunkMat = std(0x7a5a3a, { roughness: 1 });
+  const trunk = cyl(0.14, 0.21, 1.6, trunkMat, 0, 1.4, 0, 10);
   trunk.rotation.z = 0.06;
   tree.add(trunk);
-  const crownMats = [std(0x5e8a5a), std(0x6fa06a), std(0x527a4e)];
+  const branch = cyl(0.06, 0.1, 1.1, trunkMat, 0.42, 2.15, 0.15, 8);
+  branch.rotation.z = -0.7;
+  tree.add(branch);
+  const crownMats = [std(0x5e8a5a), std(0x6fa06a), std(0x527a4e), std(0x7fae72)];
   const crownGeo = new THREE.IcosahedronGeometry(0.75, 1);
-  const crownSpots = [[0, 2.9, 0, 1.15], [0.75, 2.4, 0.3, 0.8], [-0.7, 2.5, -0.25, 0.85], [0.1, 2.3, -0.7, 0.7], [-0.15, 2.4, 0.75, 0.75]];
+  const crownSpots = [
+    [0, 2.95, 0, 1.2], [0.8, 2.45, 0.3, 0.85], [-0.75, 2.55, -0.25, 0.9],
+    [0.1, 2.35, -0.75, 0.75], [-0.2, 2.45, 0.8, 0.8], [0.55, 2.8, -0.55, 0.7],
+    [-0.5, 2.85, 0.55, 0.72], [0.05, 3.3, 0.1, 0.8],
+  ];
   crownSpots.forEach(([cx, cy, cz, s], i) => {
-    const blob = new THREE.Mesh(crownGeo, crownMats[i % 3]);
+    const blob = new THREE.Mesh(crownGeo, crownMats[i % 4]);
     blob.position.set(cx, cy, cz);
-    blob.scale.setScalar(s);
+    blob.scale.set(s, s * 0.82, s);
+    blob.rotation.set(i * 1.3, i * 2.1, i * 0.7);
     blob.castShadow = true;
     tree.add(blob);
+  });
+  // Tiny olives tucked under the crown.
+  const oliveMat = std(0x3a4030, { roughness: 0.5 });
+  const oliveGeo = new THREE.SphereGeometry(0.05, 8, 8);
+  [[0.6, 2.2, 0.5], [-0.55, 2.3, 0.35], [0.2, 2.1, -0.6], [-0.3, 2.15, -0.5],
+   [0.75, 2.5, -0.2], [-0.8, 2.4, -0.05], [0.35, 2.25, 0.75], [-0.15, 2.05, 0.6],
+   [0.5, 2.6, 0.65], [-0.65, 2.7, 0.45], [0.9, 2.3, 0.15], [-0.45, 2.5, -0.65],
+  ].forEach(([ox, oy, oz]) => {
+    const olive = new THREE.Mesh(oliveGeo, oliveMat);
+    olive.position.set(ox, oy, oz);
+    tree.add(olive);
   });
   tree.position.set(0, 0, 0.4);
   room.add(tree);
