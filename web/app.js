@@ -1095,7 +1095,14 @@ function textMentionsAgent(text, name) {
   return new RegExp("@" + escapeRegExp(name) + "(?![\\w])", "i").test(text);
 }
 function histShowEvent(e) {
-  return !histMentionsOnly || textMentionsAgent(e.text, (storedAgentName() || "").trim());
+  if (!histMentionsOnly) return true;
+  const name = (storedAgentName() || "").trim();
+  if (!name) return false;
+  // A message counts as being for you if it @-mentions you in its text
+  // OR was addressed to you directly (a "talk" message, shown with the
+  // From → To arrow). Jared, 2026-10-18: addressed to me is a mention.
+  return textMentionsAgent(e.text, name) ||
+    (!!e.to && e.to.trim().toLowerCase() === name.toLowerCase());
 }
 function refreshHistMentionsBtn() {
   const name = (storedAgentName() || "").trim();
@@ -1106,7 +1113,7 @@ function refreshHistMentionsBtn() {
     histMentionsBtn.title = "Claim your agent to filter mentions";
   } else {
     histMentionsBtn.disabled = false;
-    histMentionsBtn.title = histMentionsOnly ? "Show all messages" : "Show only messages that @-mention you";
+    histMentionsBtn.title = histMentionsOnly ? "Show all messages" : "Show only messages that @-mention or address you";
   }
 }
 function renderHistFiltered() {
