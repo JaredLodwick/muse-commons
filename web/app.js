@@ -36,6 +36,7 @@ function setTheme(t) {
   try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
   PAL = canvasPal();
   buildRoomStatic();
+  if (plazaView) plazaView.setTheme(t);
   buildVignette();
 }
 document.getElementById("theme-toggle").onclick = () => {
@@ -638,17 +639,17 @@ const endDrag = (e) => {
 canvas.addEventListener("pointerup", endDrag);
 canvas.addEventListener("pointercancel", endDrag);
 
-const zoomIn = () => { cam.zoom = Math.min(ZMAX, cam.zoom * 1.25); clampCam(); };
-const zoomOut = () => { cam.zoom = Math.max(zMin(), cam.zoom / 1.25); clampCam(); };
+const zoomIn = () => { if (plaza3dActive()) { plazaView.zoomIn(); return; } cam.zoom = Math.min(ZMAX, cam.zoom * 1.25); clampCam(); };
+const zoomOut = () => { if (plaza3dActive()) { plazaView.zoomOut(); return; } cam.zoom = Math.max(zMin(), cam.zoom / 1.25); clampCam(); };
 document.getElementById("zin").onclick = zoomIn;
 document.getElementById("zout").onclick = zoomOut;
-document.getElementById("zfit").onclick = () => fitView();
+document.getElementById("zfit").onclick = () => { if (plaza3dActive()) plazaView.fit(); else fitView(); };
 window.addEventListener("keydown", (e) => {
   const tag = (e.target && e.target.tagName) || "";
   if (tag === "INPUT" || tag === "TEXTAREA") return;
   if (e.key === "+" || e.key === "=") zoomIn();
   else if (e.key === "-" || e.key === "_") zoomOut();
-  else if (e.key === "0") fitView();
+  else if (e.key === "0") { if (plaza3dActive()) plazaView.fit(); else fitView(); }
   else if (e.key === "Escape") closePanel();
 });
 
@@ -684,7 +685,7 @@ function arrangeSnapshotRing() {
 
 // Render loop: draws every frame so pan/zoom/resize stay live.
 function frame(t) {
-  draw(t);
+  if (!plaza3dActive()) draw(t);
   requestAnimationFrame(frame);
 }
 
@@ -705,6 +706,8 @@ _ws.onmessage = (ev) => {
   if (m.type === "state") {
     if (m.room_id !== currentRoom) return; // scoped per room by the server
     agents = m.agents; // canvas always needs the fresh positions
+    syncPlazaView(); // 3D plaza: shows/hides the view, pushes agents
+    pushAgentsTo3d();
     if (SNAP) {
       // Deterministic static layout: ring around the focus agent, one
       // frame, then signal readiness. No sidebar re-renders, no fit.
@@ -735,6 +738,7 @@ _ws.onmessage = (ev) => {
       const byId = new Map(agents.map((a) => [a.id, a]));
       for (const a of m.agents_changed) byId.set(a.id, a);
       agents = [...byId.values()];
+      pushAgentsTo3d();
     }
     if (m.rooms) setDirectoryRooms(m.rooms);
     if (m.topic !== undefined) { currentTopic = m.topic; myRooms.set(m.room_id, m.topic); }
@@ -833,6 +837,7 @@ function switchRoom(roomId, topic) {
   loadChatter();
   loadPresence();
   ws.send(JSON.stringify(helloPayload(roomId)));
+  syncPlazaView(); // leaving/entering the plaza swaps the 2D/3D view
 }
 
 function renderTabs() {
@@ -3186,6 +3191,54 @@ function drawBubble(a, cy, t) {
 
 // start the render loop (defined above in the camera section) —
 // snapshot mode draws exactly one frame per state instead.
+// --- 3D plaza view (plaza3d.js): the plaza renders as an isometric 3D
+// restaurant with little Muse characters; every other room keeps the 2D
+// canvas. The module lazy-loads on first plaza view; any import/WebGL
+// failure falls back to 2D silently. Snapshot mode stays 2D (headless).
+let plazaView = null;
+let plazaLoadFailed = false;
+let plazaLoading = false;
+function plaza3dWanted() {
+  return !SNAP && currentRoom === "plaza" && !plazaLoadFailed;
+}
+function plaza3dActive() {
+  return plaza3dWanted() && !!plazaView;
+}
+async function ensurePlaza3d() {
+  if (plazaView || plazaLoadFailed || plazaLoading || SNAP) return plazaView;
+  plazaLoading = true;
+  try {
+    const mod = await import("./plaza3d.js");
+    const el = document.getElementById("room3d");
+    plazaView = mod.createPlazaView(el, {
+      theme: currentTheme(),
+      onAgentClick: (name) => openAgentPanel(name),
+    });
+    plazaView.setAgents(agents);
+    syncPlazaView();
+  } catch (e) {
+    plazaLoadFailed = true;
+    syncPlazaView();
+  } finally {
+    plazaLoading = false;
+  }
+  return plazaView;
+}
+function syncPlazaView() {
+  const want = plaza3dWanted();
+  if (want && !plazaView && !plazaLoading) ensurePlaza3d();
+  const active = want && !!plazaView;
+  document.getElementById("room3d").hidden = !active;
+  canvas.style.visibility = active ? "hidden" : "";
+  if (plazaView) plazaView.setVisible(active);
+  if (active) {
+    plazaView.setAgents(agents);
+  }
+}
+function pushAgentsTo3d() {
+  if (plazaView && plaza3dWanted()) plazaView.setAgents(agents);
+}
+
 if (!SNAP) requestAnimationFrame(frame);
 
 // boot: land in the claimed agent's current room when known, otherwise the

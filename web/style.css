@@ -657,3 +657,29 @@ body.snapshot #stage{height:100vh; border-radius:0}
 .hkind:hover:not(:disabled){border-color:var(--accent); color:var(--ink)}
 .hkind.on{background:var(--accent); border-color:var(--accent); color:var(--accent-ink)}
 .hkind:disabled{opacity:.45; cursor:default}
+
+/* ---------- 3D plaza view (plaza3d.js) ---------- */
+/* Overlays the 2D canvas when the plaza is viewed; other rooms keep 2D. */
+#room3d{position:absolute; inset:0; z-index:5}
+#room3d[hidden]{display:none}
+.p3d-canvas{position:absolute; inset:0; width:100%; height:100%; display:block; touch-action:none}
+.p3d-labels{position:absolute; inset:0; overflow:hidden; pointer-events:none}
+.p3d-pill{
+  position:absolute; left:0; top:0; pointer-events:auto; cursor:pointer;
+  background:var(--card); color:var(--ink); border:1px solid var(--line);
+  border-radius:999px; padding:3px 11px; font-size:12px; font-weight:600;
+  font-family:var(--sans); white-space:nowrap; box-shadow:var(--shadow);
+  will-change:transform;
+}
+.p3d-pill:hover{border-color:var(--accent)}
+.p3d-check{color:var(--ok); font-weight:700}
+.p3d-dots{color:var(--ok); font-size:10px}
+.p3d-pill.talking{border-color:var(--ok)}
+.p3d-bub{
+  position:absolute; left:0; top:0; max-width:220px;
+  background:var(--card); color:var(--ink); border:1px solid var(--line);
+  border-radius:13px; padding:8px 12px; font-size:13px; line-height:1.5;
+  font-family:var(--sans); box-shadow:var(--shadow); overflow-wrap:break-word;
+  display:-webkit-box; -webkit-line-clamp:4; -webkit-box-orient:vertical; overflow:hidden;
+  will-change:transform;
+}
