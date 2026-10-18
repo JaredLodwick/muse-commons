@@ -2558,7 +2558,7 @@ function canvasPal() {
     pillBg: "rgba(9,12,21,.80)", pillLine: "rgba(255,255,255,.14)", pillText: "#f2f5fb",
     bubbleBg: "rgba(13,17,29,.96)", bubbleLine: "rgba(255,255,255,.16)",
     bubbleText: "#f2f5fb", bubbleShadow: "rgba(0,0,0,.5)",
-    ok: "#34d399", ring: "rgba(240,244,255,.85)", shadow: "rgba(0,0,0,.38)",
+    ok: "#34d399", convo: "#e08a5a", ring: "rgba(240,244,255,.85)", shadow: "rgba(0,0,0,.38)",
     vig0: "rgba(4,3,7,0)", vig1: "rgba(4,3,7,.48)",
     doorFrame: "#6b4a2c", doorIn: "#241a10", doorLabel: "#f2e8d6", doorEdge: "rgba(242,232,214,.22)",
     wallCut: "#100c18",
@@ -2584,7 +2584,7 @@ function canvasPal() {
     pillBg: "rgba(252,249,242,.94)", pillLine: "rgba(43,33,24,.16)", pillText: "#2B2118",
     bubbleBg: "rgba(252,249,242,.98)", bubbleLine: "rgba(43,33,24,.14)",
     bubbleText: "#2B2118", bubbleShadow: "rgba(80,58,32,.30)",
-    ok: "#5C7A4E", ring: "rgba(43,33,24,.7)", shadow: "rgba(80,58,32,.30)",
+    ok: "#5C7A4E", convo: "#C2704E", ring: "rgba(43,33,24,.7)", shadow: "rgba(80,58,32,.30)",
     vig0: "rgba(120,90,60,0)", vig1: "rgba(120,90,60,.20)",
     doorFrame: "#B07A48", doorIn: "#6B4A2C", doorLabel: "#FFF8EC", doorEdge: "rgba(255,248,236,.45)",
     wallCut: "#8a6f4d",
@@ -2847,6 +2847,9 @@ function draw(t) {
   }
   ctx.globalAlpha = 1;
 
+  // conversation perimeters go under the avatars
+  drawConvoRings(t);
+
   // avatars sorted by y so lower ones overlap correctly (scratch array: no alloc)
   sortScratch.length = 0;
   for (const a of agents) sortScratch.push(a);
@@ -3001,6 +3004,42 @@ function drawNamePill(a, x, cy) {
   ctx.fillStyle = PAL.pillText;
   ctx.fillText(a.name, tx, sy + 0.5);
   ctx.restore();
+}
+
+// Conversation perimeters: one soft ring around each group of agents
+// currently in a conversation together (the server assigns a.convo).
+// Drawn in world space, under the avatars: a faint warm wash inside, and
+// a dashed rim whose dash slowly travels, echoing the talking pulse.
+function drawConvoRings(t) {
+  const groups = new Map();
+  for (const a of agents) {
+    if (!a.convo) continue;
+    let g = groups.get(a.convo);
+    if (!g) { g = []; groups.set(a.convo, g); }
+    g.push(a);
+  }
+  if (!groups.size) return;
+  const cc = PAL.convo || "#C2704E";
+  for (const members of groups.values()) {
+    if (members.length < 2) continue;
+    let cx = 0, cy = 0;
+    for (const m of members) { cx += m.x; cy += m.y; }
+    cx /= members.length; cy /= members.length;
+    let r = 0;
+    for (const m of members) r = Math.max(r, Math.hypot(m.x - cx, m.y - cy));
+    r += 50 + Math.sin(t / 900 + cx) * 2; // padding, plus a gentle breath
+    ctx.save();
+    ctx.globalAlpha = 0.055;
+    ctx.fillStyle = cc;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 6.2832); ctx.fill();
+    ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = cc;
+    ctx.lineWidth = 1.6;
+    ctx.setLineDash([7, 9]);
+    ctx.lineDashOffset = -t / 55;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 6.2832); ctx.stroke();
+    ctx.restore();
+  }
 }
 
 function drawAgent(a, t) {

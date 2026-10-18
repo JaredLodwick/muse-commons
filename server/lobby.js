@@ -216,6 +216,7 @@ const SPEED = 55; // px per second
 const HEARTBEAT_TIMEOUT_MS = parseInt(process.env.HEARTBEAT_TIMEOUT_MS || "", 10) || 45000; // tests may override
 const TALK_MS = 14000;
 const BUBBLE_MS = 8000;
+const CONVO_HOLD_MS = 60000; // a conversation cluster holds this long after its last directed message
 const TRANSCRIPT_KEEP = 500; // rolling in-memory + on-disk per-room message cap
 const ROOM_EMPTY_TIMEOUT_MS = 10 * 60 * 1000; // dissolve empty breakouts after 10 min
 // OOM guard (2026-10-01): cap unsent per-socket data. A stalled client that
@@ -2687,6 +2688,8 @@ function ensureAgent(room, id, info = {}) {
       ty: t.y,
       talking: null,
       talkingUntil: 0,
+      convoId: null,
+      convoUntil: 0,
       bubble: null,
       bubbleUntil: 0,
       lastBeat: Date.now(),
@@ -2743,19 +2746,112 @@ function addTranscript(room, ev, agent) {
   }
 }
 
+// --- conversation groups (talk clusters) ---
+// A conversation is a set of agents standing together because they are
+// talking to each other. It starts when one agent talks to another,
+// grows when a member talks to an outsider (or an outsider talks to a
+// member), and dissolves after CONVO_HOLD_MS of directed silence or
+// when fewer than two members remain in the room. Members keep their
+// places while the conversation is active: the cluster has one anchor
+// and stable slots, instead of everyone re-walking to a fresh midpoint
+// on every message. (Jared, 2026-10-18: keep talk, make it group-sized.)
+function convosOf(room) {
+  if (!room._convos) room._convos = new Map();
+  return room._convos;
+}
+
+function layoutConvo(room, convo) {
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  convo.members = convo.members.filter((id) => room.agents.has(id));
+  const members = convo.members
+    .map((id) => room.agents.get(id))
+    .filter(Boolean);
+  const n = members.length;
+  members.forEach((m, i) => {
+    let sx, sy;
+    if (n === 2) {
+      // the classic pair: side by side at the anchor
+      sx = convo.anchor.x + (i === 0 ? -48 : 48);
+      sy = convo.anchor.y;
+    } else {
+      const r = Math.min(96, 52 + 9 * n);
+      const ang = -Math.PI / 2 + (i * 2 * Math.PI) / n;
+      sx = convo.anchor.x + Math.cos(ang) * r;
+      sy = convo.anchor.y + Math.sin(ang) * r * 0.82; // slight squash: top-down view
+    }
+    m.tx = clamp(sx, 60, ROOM.w - 60);
+    m.ty = clamp(sy, 80, ROOM.h - 60);
+  });
+}
+
+function leaveConvo(room, a) {
+  if (!a.convoId) return;
+  const convos = convosOf(room);
+  const convo = convos.get(a.convoId);
+  a.convoId = null;
+  a.convoUntil = 0;
+  if (!convo) return;
+  convo.members = convo.members.filter((id) => id !== a.id);
+  const present = convo.members.filter((id) => room.agents.has(id));
+  if (present.length < 2) {
+    // a conversation of one is no conversation: release whoever is left
+    for (const id of convo.members) {
+      const m = room.agents.get(id);
+      if (m && m.convoId === convo.id) {
+        m.convoId = null;
+        m.convoUntil = 0;
+        const t = newTarget();
+        m.tx = t.x;
+        m.ty = t.y;
+      }
+    }
+    convos.delete(convo.id);
+  } else {
+    layoutConvo(room, convo);
+  }
+}
+
+function joinConvo(room, a, b, now) {
+  const convos = convosOf(room);
+  let convo = null;
+  if (a.convoId && convos.has(a.convoId)) convo = convos.get(a.convoId);
+  else if (b.convoId && convos.has(b.convoId)) convo = convos.get(b.convoId);
+  // An agent is in at most one conversation: whoever is somewhere else
+  // leaves that conversation first (the speaker's conversation wins).
+  if (a.convoId && (!convo || a.convoId !== convo.id)) leaveConvo(room, a);
+  if (b.convoId && (!convo || b.convoId !== convo.id)) leaveConvo(room, b);
+  if (!convo) {
+    convo = {
+      id: "cv-" + now.toString(36) + "-" + Math.floor(Math.random() * 1e6).toString(36),
+      anchor: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+      members: [],
+      lastActive: now,
+    };
+    convos.set(convo.id, convo);
+  }
+  for (const m of [a, b]) {
+    if (!convo.members.includes(m.id)) convo.members.push(m.id);
+    m.convoId = convo.id;
+  }
+  convo.lastActive = now;
+  // Everyone in the conversation stays refreshed while it is active,
+  // not just the two who just spoke.
+  for (const id of convo.members) {
+    const m = room.agents.get(id);
+    if (m) m.convoUntil = now + CONVO_HOLD_MS;
+  }
+  layoutConvo(room, convo);
+  return convo;
+}
+
 function startTalk(room, fromName, toName, text, fromId) {
   if (!fromName || !toName || fromName === toName) return;
   const a = ensureAgent(room, fromId || agentIdOf(fromName), { name: fromName });
   const b = ensureAgent(room, entryIdForName(room, toName), { name: toName });
   const now = Date.now();
-  // walk toward each other, stopping side by side
-  const mx = (a.x + b.x) / 2;
-  const my = (a.y + b.y) / 2;
-  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-  a.tx = clamp(mx - 48, 60, ROOM.w - 60);
-  a.ty = clamp(my, 80, ROOM.h - 60);
-  b.tx = clamp(mx + 48, 60, ROOM.w - 60);
-  b.ty = clamp(my, 80, ROOM.h - 60);
+  // Join (or start) a conversation cluster: the pair walks together
+  // once, then keeps its places while the conversation stays active.
+  joinConvo(room, a, b, now);
   a.talking = b.id;
   b.talking = a.id;
   a.talkingUntil = now + TALK_MS;
@@ -3121,6 +3217,7 @@ function purgeAgentId(id) {
   for (const room of rooms.values()) {
     const a = room.agents.get(id);
     if (a) {
+      leaveConvo(room, a);
       room.agents.delete(id);
       logPresence("leave", room, {
         name: a.name,
@@ -3893,6 +3990,7 @@ function serializeAgent(a) {
     x: Math.round(a.x),
     y: Math.round(a.y),
     talking: !!a.talking,
+    convo: a.convoId || null, // conversation cluster id, when in one
     bubble: a.bubble,
     quarantined: quarantine.has(a.id), // PR #3: visible moderation state
   };
@@ -4031,6 +4129,7 @@ function tick() {
         if (a.admitted) {
           logPresence("leave", room, { name: a.name, serves: a.serves, verified: a.verified, trust: a.trust });
         }
+        leaveConvo(room, a);
         room.agents.delete(aid);
         // Drop this agent's stalled sockets so they can't hold buffers open.
         for (const s of socketsForAgent(aid)) {
@@ -4042,9 +4141,27 @@ function tick() {
       }
       if (a.talking && now > a.talkingUntil) {
         a.talking = null;
-        const t = newTarget();
-        a.tx = t.x;
-        a.ty = t.y;
+        // An agent in a conversation cluster keeps its place when the
+        // talking pulse ends; only a free agent walks off.
+        if (!a.convoId) {
+          const t = newTarget();
+          a.tx = t.x;
+          a.ty = t.y;
+        }
+      }
+      if (a.convoId) {
+        const convo = convosOf(room).get(a.convoId);
+        const present = convo
+          ? convo.members.filter((id) => room.agents.has(id)).length
+          : 0;
+        if (!convo || present < 2 || now > a.convoUntil) {
+          leaveConvo(room, a);
+          if (!a.talking) {
+            const t = newTarget();
+            a.tx = t.x;
+            a.ty = t.y;
+          }
+        }
       }
       if (now > a.bubbleUntil) a.bubble = null;
       const dx = a.tx - a.x;
@@ -4054,7 +4171,7 @@ function tick() {
         const step = Math.min(d, SPEED * dt);
         a.x += (dx / d) * step;
         a.y += (dy / d) * step;
-      } else if (!a.talking && Math.random() < 0.01) {
+      } else if (!a.talking && !a.convoId && Math.random() < 0.01) {
         const t = newTarget();
         a.tx = t.x;
         a.ty = t.y;
