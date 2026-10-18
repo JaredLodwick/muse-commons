@@ -95,30 +95,31 @@ export function createPlazaView(container, opts = {}) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(THEMES[themeName].bg);
 
-  // Fixed dollhouse angle: high front elevation looking at the back wall.
-  const FRUSTUM = 15;
-  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 120);
-  const camOffset = new THREE.Vector3(0, 20, 13.5).normalize();
-  const camDist = 30;
+  // Perspective dollhouse camera: a mild lens from the front, raised
+  // and nudged right of center, so the side walls read in perspective
+  // (the left wall's windows visible) like a photo of a real room,
+  // instead of the flat edge-on walls an orthographic camera gives.
+  const FOV = 32;
+  const camera = new THREE.PerspectiveCamera(FOV, 1, 0.1, 220);
+  const camOffset = new THREE.Vector3(3.4, 20, 14).normalize();
+  let camDist = 36; // recomputed by fitDistance() for the room + aspect
   const camTarget = new THREE.Vector3(0, 0, -0.2);
   let camZoom = 1;
   function updateCamera() {
-    camera.position.copy(camTarget).addScaledVector(camOffset, camDist);
+    camera.position.copy(camTarget).addScaledVector(camOffset, camDist / camZoom);
     camera.lookAt(camTarget);
-    camera.zoom = camZoom;
     camera.updateProjectionMatrix();
   }
 
-  function fitZoom() {
+  function fitDistance() {
     const w = Math.max(1, container.clientWidth);
     const h = Math.max(1, container.clientHeight);
     const aspect = w / h;
-    camera.left = (-FRUSTUM * aspect) / 2;
-    camera.right = (FRUSTUM * aspect) / 2;
-    camera.top = FRUSTUM / 2;
-    camera.bottom = -FRUSTUM / 2;
-    // Fit the room (23 wide incl. walls, ~16 tall on screen with wall height).
-    return Math.min((FRUSTUM * aspect) / 23.5, FRUSTUM / 16);
+    camera.aspect = aspect;
+    const tanV = Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+    const tanH = tanV * aspect;
+    // Fit the room: ~23.5 wide including walls, ~16.5 of screen height.
+    return Math.max(23.5 / 2 / tanH, 16.5 / 2 / tanV) * 1.03;
   }
 
   // Lights: warm sun through the windows + hemisphere fill + ambient +
@@ -148,6 +149,35 @@ export function createPlazaView(container, opts = {}) {
     scene.add(pl);
     tableLights.push(pl);
   }
+
+  // Post-processing: a gentle bloom so the windows, orbs, and candles
+  // glow the way they do in a sunlit photo. The passes are the vendored
+  // three r160 example modules under web/addons (the bare "three"
+  // specifier they import resolves through the page importmap) and
+  // they load lazily; any failure leaves plain rendering in place.
+  let composer = null;
+  (async () => {
+    try {
+      const [ec, rp, ubp, op] = await Promise.all([
+        import("./addons/postprocessing/EffectComposer.js"),
+        import("./addons/postprocessing/RenderPass.js"),
+        import("./addons/postprocessing/UnrealBloomPass.js"),
+        import("./addons/postprocessing/OutputPass.js"),
+      ]);
+      const c = new ec.EffectComposer(renderer);
+      c.addPass(new rp.RenderPass(scene, camera));
+      c.addPass(new ubp.UnrealBloomPass(
+        new THREE.Vector2(Math.max(1, container.clientWidth), Math.max(1, container.clientHeight)),
+        0.38, 0.65, 0.82
+      ));
+      c.addPass(new op.OutputPass());
+      c.setPixelRatio(renderer.getPixelRatio());
+      c.setSize(Math.max(1, container.clientWidth), Math.max(1, container.clientHeight));
+      composer = c;
+    } catch (e) {
+      composer = null;
+    }
+  })();
 
   // Themeable materials registry: {mat, key} recoloured on theme change.
   const themeables = [];
@@ -343,9 +373,19 @@ export function createPlazaView(container, opts = {}) {
   }
   room.add(archNiche(-6.4), archNiche(6.4));
 
+  // Soft radial glow texture for the pools of sun on the floor.
+  const glowTex = makeCanvas(128, 128, (c, w, h) => {
+    const g = c.createRadialGradient(64, 64, 4, 64, 64, 62);
+    g.addColorStop(0, "rgba(255,226,174,0.85)");
+    g.addColorStop(0.55, "rgba(255,226,174,0.32)");
+    g.addColorStop(1, "rgba(255,226,174,0)");
+    c.fillStyle = g;
+    c.fillRect(0, 0, w, h);
+  });
+
   // Windows on the left wall: warm glowing panes with muntins.
   const paneMat = new THREE.MeshStandardMaterial({
-    color: 0xfff6e2, emissive: 0xffedb8, emissiveIntensity: 0.9, roughness: 0.4,
+    color: 0xfff6e2, emissive: 0xffedb8, emissiveIntensity: 1.15, roughness: 0.4,
   });
   themeables.push({ mat: paneMat, key: "__pane" }); // handled below in applyThemeExtra
   // Arch-topped window pane: rectangle crowned by a semicircle.
@@ -375,10 +415,10 @@ export function createPlazaView(container, opts = {}) {
     g.add(box(0.1, 0.07, 1.7, fm, 0, 2.3, 0));
     g.position.set(-HX + 0.04, 0, wz);
     room.add(g);
-    // Sun patch on the floor beneath each window.
+    // Sun patch on the floor beneath each window: a soft-edged pool.
     const patch = new THREE.Mesh(
-      new THREE.PlaneGeometry(2.6, 1.8),
-      new THREE.MeshBasicMaterial({ color: 0xffe2ae, transparent: true, opacity: 0.28 })
+      new THREE.PlaneGeometry(3.4, 2.4),
+      new THREE.MeshBasicMaterial({ map: glowTex, transparent: true, opacity: 0.55, depthWrite: false })
     );
     patch.rotation.x = -Math.PI / 2;
     patch.rotation.z = 0.25;
@@ -452,7 +492,7 @@ export function createPlazaView(container, opts = {}) {
 
   applyThemeExtra = (name) => {
     const dark = name === "dark";
-    paneMat.emissiveIntensity = dark ? 0.35 : 0.9;
+    paneMat.emissiveIntensity = dark ? 0.35 : 1.15;
     sconceMat.emissiveIntensity = dark ? 0.9 : 1.2;
   };
   applyThemeExtra(themeName);
@@ -1103,11 +1143,10 @@ export function createPlazaView(container, opts = {}) {
   }
 
   // Camera controls: wheel zoom to cursor, drag pan, fit. Fixed angle.
-  const ZMAX = 3, ZMIN_ABS = 0.35;
-  let zMinLive = 1;
+  const ZMAX = 3;
   function clampCam() {
-    camZoom = Math.min(ZMAX, Math.max(zMinLive, camZoom));
-    if (camZoom <= zMinLive * 1.001) {
+    camZoom = Math.min(ZMAX, Math.max(1, camZoom));
+    if (camZoom <= 1.001) {
       camTarget.set(0, 0, -0.2);
       updateCamera();
       return;
@@ -1118,14 +1157,14 @@ export function createPlazaView(container, opts = {}) {
     updateCamera();
   }
   function fit() {
-    zMinLive = Math.max(ZMIN_ABS, Math.min(ZMAX, fitZoom()));
-    camZoom = zMinLive;
+    camDist = fitDistance();
+    camZoom = 1;
     camTarget.set(0, 0, -0.2);
     updateCamera();
   }
   renderer.domElement.addEventListener("wheel", (e) => {
     e.preventDefault();
-    camZoom = Math.min(ZMAX, Math.max(zMinLive, camZoom * Math.exp(-e.deltaY * 0.0015)));
+    camZoom = Math.min(ZMAX, Math.max(1, camZoom * Math.exp(-e.deltaY * 0.0015)));
     clampCam();
   }, { passive: false });
   let drag = null;
@@ -1139,10 +1178,11 @@ export function createPlazaView(container, opts = {}) {
       return;
     }
     if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 8) drag.moved = true;
-    // Screen drag -> ground-plane pan, scaled by the ortho frustum.
-    const frustumW = (camera.right - camera.left) / camZoom;
-    const frustumH = (camera.top - camera.bottom) / camZoom;
+    // Screen drag -> ground-plane pan, scaled by the frustum size at
+    // the target's depth.
     const r = renderer.domElement.getBoundingClientRect();
+    const frustumH = 2 * (camDist / camZoom) * Math.tan(THREE.MathUtils.degToRad(FOV / 2));
+    const frustumW = frustumH * (r.width / Math.max(1, r.height));
     camTarget.x = drag.tx - ((e.clientX - drag.x) / r.width) * frustumW;
     // Camera looks down at an angle: vertical drag moves mostly along z.
     camTarget.z = drag.tz - ((e.clientY - drag.y) / r.height) * frustumH * 0.75;
@@ -1162,7 +1202,8 @@ export function createPlazaView(container, opts = {}) {
     const w = Math.max(1, container.clientWidth);
     const h = Math.max(1, container.clientHeight);
     renderer.setSize(w, h, false);
-    zMinLive = Math.max(ZMIN_ABS, Math.min(ZMAX, fitZoom()));
+    camDist = fitDistance();
+    if (composer) composer.setSize(w, h);
     clampCam();
   }
   const resizeObserver = new ResizeObserver(resize);
@@ -1240,7 +1281,8 @@ export function createPlazaView(container, opts = {}) {
       for (const pl of tableLights) pl.intensity = 12 * fl;
     }
     updateLabels();
-    renderer.render(scene, camera);
+    if (composer) composer.render();
+    else renderer.render(scene, camera);
     rafId = requestAnimationFrame(frame);
   }
   function setVisible(v) {
@@ -1279,7 +1321,7 @@ export function createPlazaView(container, opts = {}) {
       clampCam();
     },
     zoomOut: () => {
-      camZoom = Math.max(zMinLive, camZoom / 1.25);
+      camZoom = Math.max(1, camZoom / 1.25);
       clampCam();
     },
     fit,
