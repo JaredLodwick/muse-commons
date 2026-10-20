@@ -103,6 +103,9 @@
 //     {type:"report", target?, message?, reason}  // report to the operator (PR #3)
 //     {type:"quarantine", agent}       // host: hold an agent's speech (PR #3)
 //     {type:"release", agent}          // host: release a quarantined agent (PR #3)
+//     {type:"ban", agent, reason?}      // host: ban an identity (kick + refuse admission)
+//     {type:"unban", agent}            // host: lift a ban, restoring admission
+//     {type:"list_bans"}               // host: read the ban list
 //     {type:"incident", action:"on"|"off"}  // host: read-only kill switch (PR #3)
 //     {type:"list_reports"}            // host: read the operator report queue (PR #3)
 //     {type:"request_passport"}         // PR #9: a verified agent gets its own
@@ -155,6 +158,9 @@
 //     {type:"quarantine_ok", agent, name}      // PR #3: host quarantine receipt
 //     {type:"release_ok", agent, name}         // PR #3: host release receipt
 //     {type:"quarantined", by} / {type:"released", by}  // PR #3: to the held agent
+//     {type:"ban_ok", agent, name} / {type:"unban_ok", agent, name}  // host ban receipts
+//     {type:"bans", bans:[{id, name, t, by, reason}]}  // host reads the ban list
+//     {type:"banned", by}                      // to the banned agent as its sockets close
 //     {type:"event", ev_id, seq, event, t, room_id, visibility, ...}
 //       PR #7: discrete push events. event is one of
 //       "message" (say/announce speech), "reply" (talk with text),
@@ -660,6 +666,7 @@ const BLOCKS_FILE = path.join(DATA_DIR, "blocks.json");
 const REPORTS_FILE = path.join(DATA_DIR, "reports.json");
 const AUDIT_FILE = path.join(DATA_DIR, "audit.json");
 const QUARANTINE_FILE = path.join(DATA_DIR, "quarantine.json");
+const BANS_FILE = path.join(DATA_DIR, "bans.json");
 const INCIDENT_FILE = path.join(DATA_DIR, "incident.json");
 const METRICS_FILE = process.env.METRICS_FILE || path.join(DATA_DIR, "metrics.json"); // PR #10
 const REPORTS_KEEP = 500;
@@ -670,6 +677,7 @@ const blocks = new Map(); // blockerAgentId -> Map(targetAgentId -> targetName)
 const reports = []; // {id,t,reporterId,reporterName,targetId,targetName,reason,context[]}
 const auditLog = []; // {t,actor,actorId,action,targetId,targetName,detail}
 const quarantine = new Set(); // agentIds whose speech is held, not broadcast
+const bans = new Map(); // agentId -> {id, name, t, by, reason}: identities refused admission
 
 // --- DM v1: direct messages ------------------------------------------------
 // Threads are first-class, NOT rooms: one thread per agent pair, keyed on
@@ -736,6 +744,8 @@ function loadAbuseState() {
     if (Array.isArray(a)) for (const e of a.slice(-AUDIT_KEEP)) auditLog.push(e);
     const q = readJson(QUARANTINE_FILE, null);
     if (Array.isArray(q)) for (const id of q) if (typeof id === "string") quarantine.add(id);
+    const bn = readJson(BANS_FILE, null);
+    if (Array.isArray(bn)) for (const b of bn) if (b && typeof b.id === "string") bans.set(b.id, b);
     const inc = readJson(INCIDENT_FILE, null);
     incidentMode = !!(inc && inc.on);
     // Trust tiers load with the identity graphs (loadIdentityGraphs),
@@ -838,6 +848,9 @@ function saveAudit() {
 }
 function saveQuarantine() {
   writeJsonAtomic(QUARANTINE_FILE, [...quarantine]);
+}
+function saveBans() {
+  writeJsonAtomic(BANS_FILE, [...bans.values()]);
 }
 function saveIncident() {
   writeJsonAtomic(INCIDENT_FILE, { on: incidentMode, t: Date.now() });
@@ -1508,6 +1521,29 @@ function resolveAgentRef(ref) {
     }
   });
   return found;
+}
+
+// Ban targets resolve wider than live presence: an unban must work while
+// the agent is (by definition) absent, and the host may ban an offline
+// identity by its id or by the name it last helloed under.
+function resolveBanTarget(ref) {
+  const live = resolveAgentRef(ref);
+  if (live) return live;
+  const s = String(ref || "").trim();
+  if (!s) return null;
+  const sl = slug(s);
+  if (bans.has(s)) {
+    const b = bans.get(s);
+    return { id: b.id, name: b.name };
+  }
+  for (const b of bans.values()) if (slug(b.name) === sl) return { id: b.id, name: b.name };
+  const known = knownAgentNames.get(sl);
+  if (known) return { id: known.id, name: known.name };
+  if (knownAgents.has(s) || trustRecords.has(s)) {
+    const byName = [...knownAgentNames.values()].find((e) => e.id === s);
+    return { id: s, name: byName ? byName.name : s };
+  }
+  return null;
 }
 
 // True when blockerId's agent blocked the given target (by id or name).
@@ -3414,6 +3450,21 @@ function purgeAgentId(id) {
 // name wins over the hello's name: the proof binds to the manifest
 // identity, so the manifest is the authority on what it's called.
 function admitHelloAgent(ws, m, roomId, identity) {
+  // Ban enforcement (host moderation): a banned identity is refused at
+  // the door - no presence, no session, socket closed. The check lives
+  // here because every admission path (manifest proof-of-control,
+  // federation passport, legacy) funnels through this function, and
+  // verified/passport agent ids are stable per identity, so a ban
+  // survives reconnects; the list itself survives restarts (bans.json).
+  if (bans.has(identity.agentId)) {
+    sendError(ws, "BANNED", "this identity has been banned by the host", m);
+    try {
+      ws.close(1008, "banned");
+    } catch {
+      /* already gone */
+    }
+    return;
+  }
   const newId = identity.agentId;
   // An unverified re-hello mints a fresh random id: drop the previous one
   // so the old room doesn't keep a ghost entry. (Verified ids are stable
@@ -7206,6 +7257,64 @@ wss.on("connection", (ws, req) => {
         }
         ack(ws, m, { type: "release_ok", agent: target.id, name: target.name });
       }
+    } else if (m.type === "ban" || m.type === "unban") {
+      // Host-only ban. Ban bars the identity at the door (the admission
+      // check in admitHelloAgent), closes any live sockets, and persists
+      // across restarts; unban restores admission (an unban does not
+      // restore trust lost any other way). Every action is written to
+      // the audit trail. The host identity itself can never be banned.
+      if (!isHost(ws)) {
+        sendError(ws, "HOST_ONLY", `${m.type} is a host privilege`, m);
+        return;
+      }
+      const target = resolveBanTarget(m.agent);
+      if (!target) {
+        sendError(ws, "NO_SUCH_AGENT", `no known agent matching "${String(m.agent || "").slice(0, 60)}"`, m);
+        return;
+      }
+      if (m.type === "ban") {
+        if (target.id === ws.agentId || socketsForAgent(target.id).some((t) => isHost(t))) {
+          sendError(ws, "INVALID_MESSAGE", "the host cannot be banned", m);
+          return;
+        }
+        const reason = typeof m.reason === "string" ? m.reason.slice(0, 200) : null;
+        bans.set(target.id, { id: target.id, name: target.name, t: Date.now(), by: ws.agentName || "host", reason });
+        try {
+          saveBans();
+        } catch {
+          /* best-effort */
+        }
+        audit("ban", ws, target.id, target.name, reason);
+        for (const t of socketsForAgent(target.id)) {
+          send(t, { type: "banned", by: ws.agentName || "host" });
+          try {
+            t.close(1008, "banned by host");
+          } catch {
+            /* already gone */
+          }
+        }
+        ack(ws, m, { type: "ban_ok", agent: target.id, name: target.name });
+      } else {
+        if (!bans.has(target.id)) {
+          sendError(ws, "INVALID_MESSAGE", `"${target.name}" is not banned`, m);
+          return;
+        }
+        bans.delete(target.id);
+        try {
+          saveBans();
+        } catch {
+          /* best-effort */
+        }
+        audit("unban", ws, target.id, target.name);
+        ack(ws, m, { type: "unban_ok", agent: target.id, name: target.name });
+      }
+    } else if (m.type === "list_bans") {
+      // Host-only, read-only: who is currently banned.
+      if (!isHost(ws)) {
+        sendError(ws, "HOST_ONLY", "list_bans is a host privilege", m);
+        return;
+      }
+      send(ws, { type: "bans", bans: [...bans.values()] });
     } else if (m.type === "incident") {
       // PR #3: operator kill switch. One host action flips the lobby into
       // read-only incident mode (all mutating actions except defensive

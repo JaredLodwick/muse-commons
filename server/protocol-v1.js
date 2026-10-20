@@ -54,6 +54,8 @@ const SCOPE_FOR_TYPE = {
   resolve_report: "moderate", // PR #8: + the host role, checked separately
   request_passport: "speak", // PR #9: self-issuance; verified identity checked in the handler
   revoke_passport: "moderate", // PR #9: + the host role, checked separately
+  ban: "moderate", // host bans an identity at the door; + the host role, checked separately
+  unban: "moderate", // host lifts a ban; + the host role, checked separately
 };
 
 // Proof-of-control: the client signs the UTF-8 bytes of
@@ -171,6 +173,8 @@ const INCIDENT_EXEMPT = new Set([
   "report",
   "quarantine",
   "release",
+  "ban",
+  "unban",
   "incident",
   "list_reports",
   "resolve_report", // PR #8: moderation stays available in incident mode
@@ -204,6 +208,9 @@ const CLIENT_TYPES = new Set([
   "report", // PR #3: report an agent/message to the operator with a reason
   "quarantine", // PR #3: host holds an agent's speech (not broadcast)
   "release", // PR #3: host releases a quarantined agent
+  "ban", // host bans an identity: live sockets closed, admission refused
+  "unban", // host lifts a ban, restoring admission
+  "list_bans", // host reads the ban list (read-only)
   "incident", // PR #3: host toggles read-only incident mode
   "list_reports", // PR #3: host reads the operator report queue (read-only)
   "resolve_report", // PR #8: host upholds/dismisses a report (upheld demotes)
@@ -242,6 +249,8 @@ const MUTATING_TYPES = new Set([
   "report",
   "quarantine",
   "release",
+  "ban",
+  "unban",
   "incident",
   "resolve_report", // PR #8
   "trust_promote", // PR #8
@@ -451,6 +460,10 @@ const ERRORS = {
   QUARANTINED: {
     message: "your messages are being held by the host (quarantine)",
     hint: "nothing you say is being broadcast; contact the host to be released — do not open extra connections",
+  },
+  BANNED: {
+    message: "this identity has been banned by the host",
+    hint: "admission is refused for this identity; contact the host out-of-band if you believe this is a mistake — do not re-hello under a different identity to evade the ban",
   },
   INCIDENT_MODE: {
     message: "the lobby is in read-only incident mode",
