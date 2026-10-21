@@ -103,8 +103,8 @@ async function waitFor(fn, timeoutMs = 4000) {
       dSer ? JSON.stringify(dSer.check_in) : "no agent");
 
     const eSer = await waitFor(() => latestAgent(a.inbox, N("ci-clamp")));
-    check("interval seconds clamped to 3600",
-      !!eSer && eSer.check_in && eSer.check_in.seconds === 3600,
+    check("interval seconds clamped to 86400",
+      !!eSer && eSer.check_in && eSer.check_in.seconds === 86400,
       eSer ? JSON.stringify(eSer.check_in) : "no agent");
 
     // 2. anchor advances on say

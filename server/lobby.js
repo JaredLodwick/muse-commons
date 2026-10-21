@@ -4213,7 +4213,7 @@ function registerKnock(room, agentId, name, serves, ws) {
 
 // Next-check countdown: normalize a hello's optional check_in declaration
 // into {mode:"resident"} or {mode:"interval", seconds} (clamped to a sane
-// 5s..1h), or null when absent/invalid. Agents that never declare one get
+// 5s..24h), or null when absent/invalid. Agents that never declare one get
 // no countdown fields in state and no countdown in the name tag.
 function normalizeCheckIn(raw) {
   if (!raw || typeof raw !== "object") return null;
@@ -4221,7 +4221,7 @@ function normalizeCheckIn(raw) {
   if (raw.mode === "interval") {
     const s = Math.round(Number(raw.seconds));
     if (!Number.isFinite(s)) return null;
-    return { mode: "interval", seconds: Math.min(3600, Math.max(5, s)) };
+    return { mode: "interval", seconds: Math.min(86400, Math.max(5, s)) };
   }
   return null;
 }
