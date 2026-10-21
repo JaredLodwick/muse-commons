@@ -297,6 +297,11 @@ export function createPlazaView(container, opts = {}) {
   let scrubPlaying = false;
   const timeEl = document.createElement("div");
   timeEl.className = "p3d-time";
+  // The scrub controls are hidden by default (see style.css); reveal
+  // them with ?timecontrols=1 in the plaza URL, for recording demos.
+  try {
+    if (new URLSearchParams(window.location.search).has("timecontrols")) timeEl.classList.add("show");
+  } catch (e) { /* no URL to read - stay hidden */ }
   const timeRead = document.createElement("span");
   timeRead.className = "p3d-time-read";
   timeRead.textContent = "--:--";
