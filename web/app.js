@@ -3037,7 +3037,7 @@ function checkSuffix(a, nowMs) {
   if (ci.mode === "resident") return " · awake";
   if (ci.mode === "interval" && a.check_anchor) {
     const remain = checkRemainMs(a, nowMs);
-    return remain < 1000 ? " · checking..." : " · next check " + fmtCountdown(remain);
+    return remain < 1000 ? " · checking..." : " · " + fmtCountdown(remain);
   }
   return "";
 }
