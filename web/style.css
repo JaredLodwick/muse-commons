@@ -673,6 +673,7 @@ body.snapshot #stage{height:100vh; border-radius:0}
 }
 .p3d-pill:hover{border-color:var(--accent)}
 .p3d-check{color:var(--ok); font-weight:700}
+.p3d-cd{opacity:.62; font-weight:500; font-size:11px}
 .p3d-dots{color:var(--ok); font-size:10px}
 .p3d-pill.talking{border-color:var(--ok)}
 .p3d-bub{

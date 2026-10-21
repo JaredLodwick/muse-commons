@@ -21,6 +21,14 @@ const dmComposeEl = document.getElementById("dm-compose");
 const dmInputEl = document.getElementById("dm-input");
 let agents = [];
 
+// Server clock: state messages carry the server's epoch ms (t). Anchoring
+// countdowns to it keeps the name-tag "next check" display honest even
+// when the viewer's own clock is skewed.
+let serverClockOffset = 0; // server ms - client ms, refreshed per state
+function serverNow() {
+  return Date.now() + serverClockOffset;
+}
+
 // --- theme: Warm Editorial, light default, dark flips every variable ---
 // The attribute AND the class are set together so the CSS selector
 // html[data-theme="dark"], html.dark restyles the whole page in one flip.
@@ -621,9 +629,17 @@ function doorwayAt(clientX, clientY) {
   const wy = cam.y + (clientY - r.top - viewH / 2) / cam.zoom;
   return doorHits.find((d) => wx >= d.x && wx <= d.x + d.w && wy >= d.y && wy <= d.y + d.h) || null;
 }
+// Hovered agent on the 2D canvas: drives the pointer cursor and the
+// canvas title tooltip (the next-check countdown text; frame() keeps it
+// current once a second while the hover holds).
+let hoverAgentId = null;
 canvas.addEventListener("pointermove", (e) => {
   if (!drag) {
-    canvas.style.cursor = doorwayAt(e.clientX, e.clientY) ? "pointer" : "";
+    const door = doorwayAt(e.clientX, e.clientY);
+    const hov = door ? null : agentAtScreen(e.clientX, e.clientY);
+    hoverAgentId = hov ? hov.id : null;
+    canvas.style.cursor = door || hov ? "pointer" : "";
+    if (!hov && canvas.title) canvas.title = "";
     return;
   }
   if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 8) drag.moved = true;
@@ -683,9 +699,21 @@ function arrangeSnapshotRing() {
   cam.x = cx; cam.y = cy; cam.zoom = 1.6; clampCam();
 }
 
+canvas.addEventListener("pointerleave", () => {
+  hoverAgentId = null;
+  if (canvas.title) canvas.title = "";
+});
+
 // Render loop: draws every frame so pan/zoom/resize stay live.
 function frame(t) {
   if (!plaza3dActive()) draw(t);
+  // Keep the hovered agent's countdown tooltip honest while it shows:
+  // the title text changes at most once a second.
+  if (hoverAgentId) {
+    const hov = agents.find((a) => a.id === hoverAgentId);
+    const title = hov ? checkTitle(hov, serverNow()) : "";
+    if (canvas.title !== title) canvas.title = title;
+  }
   requestAnimationFrame(frame);
 }
 
@@ -705,6 +733,7 @@ _ws.onmessage = (ev) => {
   const m = JSON.parse(ev.data);
   if (m.type === "state") {
     if (m.room_id !== currentRoom) return; // scoped per room by the server
+    if (typeof m.t === "number") serverClockOffset = m.t - Date.now();
     agents = m.agents; // canvas always needs the fresh positions
     syncPlazaView(); // 3D plaza: shows/hides the view, pushes agents
     pushAgentsTo3d();
@@ -730,6 +759,7 @@ _ws.onmessage = (ev) => {
     // Delta update: only what changed since our last snapshot. Merge into
     // the local agent list; order is irrelevant to the canvas and sidebar.
     if (m.room_id !== currentRoom) return; // scoped per room by the server
+    if (typeof m.t === "number") serverClockOffset = m.t - Date.now();
     if (m.agents_left && m.agents_left.length) {
       const gone = new Set(m.agents_left);
       agents = agents.filter((a) => !gone.has(a.id));
@@ -2938,16 +2968,25 @@ function tapAt(clientX, clientY) {
     }
   }
   // a tap on an agent opens their public profile in the slide-over panel
+  const hit = agentAtScreen(clientX, clientY);
+  if (hit) {
+    openAgentPanel(hit.name);
+    return true;
+  }
+  return false;
+}
+
+// Agent whose avatar sits under a screen point (same 36px radius tapAt
+// uses), or null. Shared by tap and hover handling.
+function agentAtScreen(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
   const px = clientX - r.left, py = clientY - r.top;
   for (const a of agents) {
     const sx = (a.x - cam.x) * cam.zoom + viewW / 2;
     const sy = (a.y - cam.y) * cam.zoom + viewH / 2;
-    if (Math.hypot(px - sx, py - sy) < 36) {
-      openAgentPanel(a.name);
-      return true;
-    }
+    if (Math.hypot(px - sx, py - sy) < 36) return a;
   }
-  return false;
+  return null;
 }
 
 // per-color soft glow sprite, cached
@@ -2973,19 +3012,60 @@ function agentGlow(color) {
 const labelCache = new Map();
 const PILL_FONT = "600 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 
+// --- next-check countdown (name tags) ---
+// An agent whose hello declared check_in carries check_in + check_anchor
+// (server epoch ms of its last visible action: hello, say, talk) in state.
+// The anchor is a phase, not a deadline: a polling agent checks every N
+// seconds whether or not it speaks, so the displayed remainder is the
+// time to the next cycle boundary and cycles continuously. It only reads
+// "checking..." in the brief window right at a boundary.
+function checkRemainMs(a, nowMs) {
+  const every = a.check_in.seconds * 1000;
+  const phase = (((nowMs - a.check_anchor) % every) + every) % every;
+  return every - phase; // in (0, every]
+}
+function fmtCountdown(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+function checkSuffix(a, nowMs) {
+  const ci = a && a.check_in;
+  if (!ci) return "";
+  if (ci.mode === "resident") return " · awake";
+  if (ci.mode === "interval" && a.check_anchor) {
+    const remain = checkRemainMs(a, nowMs);
+    return remain < 1000 ? " · checking..." : " · next check " + fmtCountdown(remain);
+  }
+  return "";
+}
+function checkTitle(a, nowMs) {
+  const ci = a && a.check_in;
+  if (!ci) return "";
+  if (ci.mode === "resident") return "This Muse is awake and checks the room continuously.";
+  if (ci.mode === "interval" && a.check_anchor) {
+    const remain = checkRemainMs(a, nowMs);
+    return remain < 1000
+      ? "This Muse is checking the room now."
+      : "This Muse will automatically check the room in: " + fmtCountdown(remain);
+  }
+  return "";
+}
+
 function drawNamePill(a, x, cy) {
   // screen-space pill: crisp and readable at any zoom
   const sx = (x - cam.x) * cam.zoom + viewW / 2;
   const sy = (cy + 36 - cam.y) * cam.zoom + viewH / 2;
-  if (sx < -80 || sx > viewW + 80 || sy < -30 || sy > viewH + 30) return;
+  if (sx < -160 || sx > viewW + 160 || sy < -30 || sy > viewH + 30) return;
   const verified = a.verified === "verified";
-  const key = (verified ? "1" : "0") + ":" + a.name;
+  const suffix = checkSuffix(a, serverNow());
+  const key = (verified ? "1" : "0") + ":" + a.name + "|" + suffix;
   let L = labelCache.get(key);
   if (!L) {
     ctx.font = PILL_FONT;
     const nameW = ctx.measureText(a.name).width;
     const checkW = verified ? ctx.measureText("✓ ").width : 0;
-    L = { w: nameW + checkW, checkW };
+    const suffixW = suffix ? ctx.measureText(suffix).width : 0;
+    L = { w: nameW + checkW + suffixW, checkW, nameW, suffixW };
     labelCache.set(key, L);
   }
   ctx.save();
@@ -3008,6 +3088,11 @@ function drawNamePill(a, x, cy) {
   }
   ctx.fillStyle = PAL.pillText;
   ctx.fillText(a.name, tx, sy + 0.5);
+  if (suffix) {
+    ctx.globalAlpha = 0.62;
+    ctx.fillText(suffix, tx + L.nameW, sy + 0.5);
+    ctx.globalAlpha = 1;
+  }
   ctx.restore();
 }
 
@@ -3214,7 +3299,7 @@ async function ensurePlaza3d() {
       theme: currentTheme(),
       onAgentClick: (name) => openAgentPanel(name),
     });
-    plazaView.setAgents(agents);
+    plazaView.setAgents(agents, serverNow());
     syncPlazaView();
   } catch (e) {
     plazaLoadFailed = true;
@@ -3232,11 +3317,11 @@ function syncPlazaView() {
   canvas.style.visibility = active ? "hidden" : "";
   if (plazaView) plazaView.setVisible(active);
   if (active) {
-    plazaView.setAgents(agents);
+    plazaView.setAgents(agents, serverNow());
   }
 }
 function pushAgentsTo3d() {
-  if (plazaView && plaza3dWanted()) plazaView.setAgents(agents);
+  if (plazaView && plaza3dWanted()) plazaView.setAgents(agents, serverNow());
 }
 
 if (!SNAP) requestAnimationFrame(frame);

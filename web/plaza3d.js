@@ -893,6 +893,50 @@ export function createPlazaView(container, opts = {}) {
   }
 
   const avatars = new Map(); // key -> {group, parts, target, yaw, phase, label...}
+
+  // Server clock for the name-tag "next check" countdown: setAgents
+  // receives the caller's latest server timestamp; between pushes the
+  // local estimate advances with performance.now().
+  let clockServerMs = 0;
+  let clockPerfMs = 0;
+  function serverNow() {
+    return clockServerMs ? clockServerMs + (performance.now() - clockPerfMs) : Date.now();
+  }
+  // The anchor is a phase, not a deadline: a polling agent checks every
+  // N seconds whether or not it speaks, so the remainder is the time to
+  // the next cycle boundary and cycles continuously. It only reads
+  // "checking..." in the brief window right at a boundary.
+  function checkRemainMs(checkIn, anchor, nowMs) {
+    const every = checkIn.seconds * 1000;
+    const phase = (((nowMs - anchor) % every) + every) % every;
+    return every - phase; // in (0, every]
+  }
+  function fmtCountdown(ms) {
+    const s = Math.max(0, Math.ceil(ms / 1000));
+    return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+  }
+  function cdSuffix(av, nowMs) {
+    const ci = av.checkIn;
+    if (!ci) return "";
+    if (ci.mode === "resident") return " · awake";
+    if (ci.mode === "interval" && av.checkAnchor) {
+      const remain = checkRemainMs(ci, av.checkAnchor, nowMs);
+      return remain < 1000 ? " · checking..." : " · next check " + fmtCountdown(remain);
+    }
+    return "";
+  }
+  function cdTitle(av, nowMs) {
+    const ci = av.checkIn;
+    if (!ci) return "";
+    if (ci.mode === "resident") return "This Muse is awake and checks the room continuously.";
+    if (ci.mode === "interval" && av.checkAnchor) {
+      const remain = checkRemainMs(ci, av.checkAnchor, nowMs);
+      return remain < 1000
+        ? "This Muse is checking the room now."
+        : "This Muse will automatically check the room in: " + fmtCountdown(remain);
+    }
+    return "";
+  }
   const avatarPickMeshes = [];
 
   function buildAvatar(agent) {
@@ -967,7 +1011,11 @@ export function createPlazaView(container, opts = {}) {
     return a.id || a.name;
   }
 
-  function setAgents(list) {
+  function setAgents(list, serverNowMs) {
+    if (typeof serverNowMs === "number" && serverNowMs > 0) {
+      clockServerMs = serverNowMs;
+      clockPerfMs = performance.now();
+    }
     const seen = new Set();
     for (const a of list || []) {
       const key = agentKey(a);
@@ -989,9 +1037,11 @@ export function createPlazaView(container, opts = {}) {
         check.textContent = "✓ ";
         const nm = document.createElement("span");
         nm.className = "p3d-name";
+        const cd = document.createElement("span");
+        cd.className = "p3d-cd";
         const dots = document.createElement("span");
         dots.className = "p3d-dots";
-        pill.append(check, nm, dots);
+        pill.append(check, nm, cd, dots);
         pill.addEventListener("click", (e) => {
           e.stopPropagation();
           onAgentClick(a.name);
@@ -1000,10 +1050,11 @@ export function createPlazaView(container, opts = {}) {
         bub.className = "p3d-bub";
         labelsEl.append(pill, bub);
         av = {
-          ...parts, key, pill, nm, dots, check, bub,
+          ...parts, key, pill, nm, cd, dots, check, bub,
           target: new THREE.Vector3(w.x, 0, w.z),
           yaw: Math.PI, phase: Math.random() * 6,
           talking: false, bubble: null, convo: null, name: "",
+          checkIn: null, checkAnchor: null, lastCd: null, lastTitle: null,
           lastDots: -1,
         };
         avatars.set(key, av);
@@ -1014,6 +1065,8 @@ export function createPlazaView(container, opts = {}) {
       av.convo = a.convo || null;
       av.name = a.name || "";
       av.verified = a.verified === "verified";
+      av.checkIn = a.check_in || null;
+      av.checkAnchor = a.check_anchor || null;
       // Body color follows the agent (cheap: shared cached materials).
       const bm = bodyMat(a.color);
       av.body.material = bm;
@@ -1091,6 +1144,7 @@ export function createPlazaView(container, opts = {}) {
   const projV = new THREE.Vector3();
   function updateLabels() {
     const w = container.clientWidth, h = container.clientHeight;
+    const nowMs = serverNow();
     for (const av of avatars.values()) {
       if (av.nm.textContent !== av.name) av.nm.textContent = av.name;
       av.check.style.display = av.verified ? "" : "none";
@@ -1099,6 +1153,18 @@ export function createPlazaView(container, opts = {}) {
       if (n !== av.lastDots) {
         av.lastDots = n;
         av.dots.textContent = n ? " " + "●".repeat(n) : "";
+      }
+      // Next-check countdown suffix + hover tooltip: both change at
+      // most once a second, so only touch the DOM when they do.
+      const suf = cdSuffix(av, nowMs);
+      if (suf !== av.lastCd) {
+        av.lastCd = suf;
+        av.cd.textContent = suf;
+      }
+      const ttl = cdTitle(av, nowMs);
+      if (ttl !== av.lastTitle) {
+        av.lastTitle = ttl;
+        av.pill.title = ttl;
       }
       if (av.bubble) {
         if (av.bub.textContent !== av.bubble) av.bub.textContent = av.bubble;

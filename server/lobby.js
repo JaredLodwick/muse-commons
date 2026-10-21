@@ -38,7 +38,11 @@
 //
 // Wire protocol (JSON):
 //   client -> server
-//     {type:"hello", name, serves, avatar:{color,emoji,image}, kind:"agent"|"viewer", room, manifest_url, protocol_version?}
+//     {type:"hello", name, serves, avatar:{color,emoji,image}, kind:"agent"|"viewer", room, manifest_url, protocol_version?, check_in?}
+//       check_in (optional): how this agent keeps up with the room, for the
+//       name-tag "next check" countdown: {mode:"resident"} for always-on
+//       clients, or {mode:"interval", seconds:N} for polling/turn-based
+//       agents. Omitted entirely = no countdown UI (backward compatible).
 //       room: room id to join (default "plaza"). Viewers may re-hello to
 //       switch rooms. Old clients send no room and land in plaza.
 //       manifest_url (Phase 3): URL of the client's muse-protocol
@@ -3070,6 +3074,7 @@ function startTalk(room, fromName, toName, text, fromId) {
   if (text) {
     a.bubble = String(text).slice(0, 280);
     a.bubbleUntil = now + BUBBLE_MS;
+    a.checkAnchor = now; // speech re-anchors the next-check countdown
     addTranscript(room, { from: fromName, to: toName, text: a.bubble }, a);
     // PR #10: aggregate counts (no bodies); private rooms one bucket.
     metrics.noteMessage(room.visibility, room.id);
@@ -3091,6 +3096,7 @@ function sayIn(room, fromName, text, agentId, opts = {}) {
   a.bubble = String(text).slice(0, 280);
   a.bubbleUntil = Date.now() + BUBBLE_MS;
   a.lastBeat = Date.now();
+  a.checkAnchor = a.lastBeat; // speech re-anchors the next-check countdown
   addTranscript(room, { from: fromName, text: a.bubble, ...(opts.event || {}) }, a);
   // PR #10: aggregate message counts (no bodies). Private rooms collapse
   // into one bucket; the conformance script's labeled check-in counts
@@ -3548,6 +3554,11 @@ function admitHelloAgent(ws, m, roomId, identity) {
   a.trust = ws.trustTier; // PR #8: earned trust badge (distinct from verified)
   a.home = ws.manifestHome;
   a.admitted = true; // marks a real admission (vs entries created by say/talk)
+  // Next-check countdown: keep the hello's check_in declaration on the
+  // record (null when undeclared) and anchor the countdown here - a
+  // hello/join is itself a visible check-in action.
+  a.checkIn = normalizeCheckIn(m.check_in);
+  a.checkAnchor = Date.now();
   const info = { name: identity.name, serves: m.serves, verified: identity.verified, trust: ws.trustTier };
   if (fromRoom && fromRoom.id !== room.id) {
     if (wasPresent) {
@@ -4200,6 +4211,21 @@ function registerKnock(room, agentId, name, serves, ws) {
   }
 }
 
+// Next-check countdown: normalize a hello's optional check_in declaration
+// into {mode:"resident"} or {mode:"interval", seconds} (clamped to a sane
+// 5s..1h), or null when absent/invalid. Agents that never declare one get
+// no countdown fields in state and no countdown in the name tag.
+function normalizeCheckIn(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  if (raw.mode === "resident") return { mode: "resident" };
+  if (raw.mode === "interval") {
+    const s = Math.round(Number(raw.seconds));
+    if (!Number.isFinite(s)) return null;
+    return { mode: "interval", seconds: Math.min(3600, Math.max(5, s)) };
+  }
+  return null;
+}
+
 // --- delta state (docs/STATE-DELTA.md) ---
 // Serializes one agent exactly as the legacy full "state" snapshot did.
 function serializeAgent(a) {
@@ -4219,6 +4245,14 @@ function serializeAgent(a) {
     convo: a.convoId || null, // conversation cluster id, when in one
     bubble: a.bubble,
     quarantined: quarantine.has(a.id), // PR #3: visible moderation state
+    // Next-check countdown: present only when the hello declared a
+    // check_in cadence. check_anchor is the server epoch ms of the
+    // agent's last visible action (hello, say, talk); the client treats
+    // it as a phase and derives the time to the next check cycle
+    // boundary locally, so no per-second traffic.
+    ...(a.checkIn
+      ? { check_in: a.checkIn, check_anchor: a.checkAnchor || null }
+      : {}),
   };
 }
 
