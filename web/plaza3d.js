@@ -55,28 +55,129 @@ function cyl(rt, rb, h, mat, x = 0, y = 0, z = 0, seg = 20) {
   return m;
 }
 
-// Warm restaurant palette, light + dark variants. Themeable materials hold
-// a {light, dark} pair and are recolored by applyTheme().
-const THEMES = {
-  light: {
-    bg: 0xe9dcc4, fog: 0xe9dcc4,
-    hemiSky: 0xfff4e0, hemiGround: 0xb08d5f, hemiInt: 0.9,
-    sun: 0xffe3b8, sunInt: 1.85, amb: 0xfff2e0, ambInt: 0.32,
-    floor: 0xede3d2, wall: 0xf2e7d2, trim: 0xb08d5f,
-    archIn: 0xe6cba6, curb: 0xd9c3a3, rug: 0xc99a7a,
-  },
-  dark: {
-    bg: 0x141019, fog: 0x141019,
-    hemiSky: 0x4a4468, hemiGround: 0x2a2118, hemiInt: 0.7,
-    sun: 0xd9b98a, sunInt: 0.7, amb: 0x8a7a66, ambInt: 0.3,
-    floor: 0x4a4038, wall: 0x3a3048, trim: 0x6a563e,
-    archIn: 0x52405a, curb: 0x3c342c, rug: 0x6a4a52,
-  },
+// Warm restaurant palette. These material colors never change: the
+// scene's light and dark come from the time of day (see plazaTimeOfDay
+// below), never from the UI theme - the light/dark switcher in the
+// page chrome restyles only the UI, not the 3D scene.
+const PALETTE = {
+  bg: 0xe9dcc4,
+  floor: 0xede3d2, wall: 0xf2e7d2, trim: 0xb08d5f,
+  archIn: 0xe6cba6, curb: 0xd9c3a3, rug: 0xc99a7a,
 };
+
+// --- Time of day ------------------------------------------------------
+// The plaza sky runs on Commons time: the server's local time,
+// Pacific. plazaTimeOfDay is a pure function of the hour so tests
+// can exercise it headless:
+// keyframed, smoothly lerped colors and intensities, a sun that arcs
+// east to west from the 06:00 sunrise to the 18:00 sunset, and a moon
+// that takes over the same directional light at night.
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+const smooth01 = (v) => {
+  const t = clamp01(v);
+  return t * t * (3 - 2 * t);
+};
+const lerpN = (a, b, t) => a + (b - a) * t;
+function lerpHex(a, b, t) {
+  const r = Math.round(lerpN((a >> 16) & 255, (b >> 16) & 255, t));
+  const g = Math.round(lerpN((a >> 8) & 255, (b >> 8) & 255, t));
+  const bl = Math.round(lerpN(a & 255, b & 255, t));
+  return (r << 16) | (g << 8) | bl;
+}
+// Piecewise-linear color ramp over [[x, hex], ...] stops, clamped at
+// the ends.
+function rampHex(stops, x) {
+  if (x <= stops[0][0]) return stops[0][1];
+  for (let i = 1; i < stops.length; i++) {
+    if (x <= stops[i][0]) {
+      const [x0, c0] = stops[i - 1];
+      const [x1, c1] = stops[i];
+      return lerpHex(c0, c1, (x - x0) / (x1 - x0));
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+
+// Sky background by sun elevation (deg): deep blue night, a purple
+// pre-dawn, the warm orange band at the horizon, pale morning, then
+// the warm day background.
+const SKY_RAMP = [
+  [-45, 0x10182c], [-8, 0x131c31], [-2, 0x38304f],
+  [2.5, 0xdd7f4a], [9, 0xeed3ac], [20, 0xe9dcc4],
+];
+// Sun color by elevation (deg): orange at the horizon, whitening
+// toward noon.
+const SUN_RAMP = [
+  [-4, 0xff7a2e], [2, 0xff9040], [10, 0xffab5e], [24, 0xffd9a3], [38, 0xfff0d4],
+];
+const MOON_COLOR = 0x8fb4ff;
+
+// The Commons' home timezone. Like a physical room keeping its local
+// time, the room runs on Pacific time: the host is set to
+// America/Los_Angeles, and Commons time is that zone's reading of the
+// server clock. One named place, so the choice is deliberate - and if
+// a future state payload ever advertises a timezone, this is where
+// the client would learn it instead.
+const COMMONS_TZ = "America/Los_Angeles";
+const COMMONS_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: COMMONS_TZ, hourCycle: "h23",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+});
+
+export function plazaTimeOfDay(hour) {
+  const h = ((hour % 24) + 24) % 24;
+  // Sun elevation: +1 at solar noon, -1 at midnight; 45 deg at peak.
+  const elevNorm = Math.cos((2 * Math.PI * (h - 12)) / 24);
+  const elevationDeg = elevNorm * 45;
+  // Twilight blend across roughly -6..+9 deg of elevation.
+  const dayFactor = smooth01((elevationDeg + 6) / 15);
+  // Sun arc: east (+x) at 06:00, high at noon, west (-x) at 18:00.
+  const sa = (Math.PI * (h - 6)) / 12;
+  const sunPos = [Math.cos(sa) * 17, Math.sin(sa) * 15 + 2, 8.5];
+  const sunInt = elevNorm > 0 ? 1.6 * smooth01(elevNorm / 0.7) : 0;
+  const sunColor = rampHex(SUN_RAMP, elevationDeg);
+  // Moon arc over the night span 18:00 -> 06:00, same east-west sweep.
+  const hn = (h + 24 - 18) % 24;
+  const ma = (Math.PI * hn) / 12;
+  const moonPos = [Math.cos(ma) * 14, Math.sin(ma) * 12 + 2, 6];
+  const moonInt = elevNorm < 0 ? 0.3 * smooth01(-elevNorm / 0.75) : 0;
+  // The one directional light blends sun <-> moon through twilight, so
+  // shadows keep sweeping instead of jumping at the crossover.
+  const dir = {
+    pos: [
+      lerpN(moonPos[0], sunPos[0], dayFactor),
+      lerpN(moonPos[1], sunPos[1], dayFactor),
+      lerpN(moonPos[2], sunPos[2], dayFactor),
+    ],
+    color: lerpHex(MOON_COLOR, sunColor, dayFactor),
+    intensity: lerpN(moonInt, sunInt, dayFactor),
+  };
+  return {
+    hour: h,
+    elevationDeg,
+    dayFactor,
+    sun: { pos: sunPos, color: sunColor, intensity: sunInt },
+    moon: { pos: moonPos, color: MOON_COLOR, intensity: moonInt },
+    dir,
+    bg: rampHex(SKY_RAMP, elevationDeg),
+    hemiSky: lerpHex(0x2f3c63, 0xfff4e0, dayFactor),
+    hemiGround: lerpHex(0x1e1a26, 0xb08d5f, dayFactor),
+    hemiInt: 0.3 + 0.55 * dayFactor,
+    ambColor: lerpHex(0x54679c, 0xfff2e0, dayFactor),
+    ambInt: 0.16 + 0.19 * dayFactor,
+    // Interior pools stay warm and burn a little brighter at night.
+    poolInt: 12 + 3 * (1 - dayFactor),
+    // Window panes glow by day and go quiet at night; the niche orbs
+    // do the opposite.
+    paneInt: 1.15 - 0.75 * (1 - dayFactor),
+    sconceInt: 1.2 + 0.25 * (1 - dayFactor),
+  };
+}
 
 export function createPlazaView(container, opts = {}) {
   const onAgentClick = opts.onAgentClick || (() => {});
-  let themeName = opts.theme === "dark" ? "dark" : "light";
+  // opts.theme is accepted for compatibility but deliberately unused:
+  // the scene's colors come from the time of day alone.
 
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -93,7 +194,7 @@ export function createPlazaView(container, opts = {}) {
   container.appendChild(labelsEl);
 
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(THEMES[themeName].bg);
+  scene.background = new THREE.Color(PALETTE.bg);
 
   // Perspective dollhouse camera: a mild lens from the front, raised
   // and nudged right of center, so the side walls read in perspective
@@ -179,31 +280,114 @@ export function createPlazaView(container, opts = {}) {
     }
   })();
 
-  // Themeable materials registry: {mat, key} recoloured on theme change.
-  const themeables = [];
+  // Materials are created straight from the fixed palette; nothing
+  // recolors them afterwards.
   function themeMat(key, opts = {}) {
-    const m = std(THEMES[themeName][key], opts);
-    themeables.push({ mat: m, key });
-    return m;
+    return std(PALETTE[key], opts);
   }
-  function applyTheme(name) {
-    themeName = name === "dark" ? "dark" : "light";
-    const T = THEMES[themeName];
-    scene.background.set(T.bg);
-    hemi.color.set(T.hemiSky);
-    hemi.groundColor.set(T.hemiGround);
-    hemi.intensity = T.hemiInt;
-    amb.color.set(T.amb);
-    amb.intensity = T.ambInt;
-    sun.color.set(T.sun);
-    sun.intensity = T.sunInt;
-    for (const { mat, key } of themeables) {
-      if (T[key] !== undefined) mat.color.set(T[key]);
+
+  // --- Time-of-day lighting ------------------------------------------
+  // The sky follows Commons time (Pacific) through the pure
+  // plazaTimeOfDay() function, driven by the same server clock the
+  // name-tag countdowns use (serverNow, below). The scrub cluster
+  // rendered here lets a human preview the full 24h cycle; a preview
+  // never touches that real clock, so the countdowns are unaffected.
+  let poolBase = 12; // table pool intensity from the current sky state
+  let scrubMin = null; // minutes-of-day override; null = live time
+  let scrubPlaying = false;
+  const timeEl = document.createElement("div");
+  timeEl.className = "p3d-time";
+  const timeRead = document.createElement("span");
+  timeRead.className = "p3d-time-read";
+  timeRead.textContent = "--:--";
+  const playBtn = document.createElement("button");
+  playBtn.type = "button";
+  playBtn.className = "p3d-time-btn";
+  playBtn.textContent = "▶";
+  const scrub = document.createElement("input");
+  scrub.type = "range";
+  scrub.min = "0";
+  scrub.max = "1439";
+  scrub.step = "1";
+  scrub.className = "p3d-time-range";
+  scrub.title = "Scrub the time of day";
+  const liveBtn = document.createElement("button");
+  liveBtn.type = "button";
+  liveBtn.className = "p3d-time-btn";
+  liveBtn.textContent = "Live";
+  liveBtn.title = "Back to live Commons time";
+  liveBtn.hidden = true;
+  timeEl.append(timeRead, playBtn, scrub, liveBtn);
+  container.appendChild(timeEl);
+
+  function commonsMinutes() {
+    // Server epoch -> wall-clock minutes in the Commons' home
+    // timezone. Intl carries the DST rules, so the reading is right
+    // on both sides of a transition.
+    const parts = COMMONS_FMT.formatToParts(new Date(serverNow()));
+    let hh = 0, mm = 0, ss = 0;
+    for (const p of parts) {
+      if (p.type === "hour") hh = Number(p.value) % 24;
+      else if (p.type === "minute") mm = Number(p.value);
+      else if (p.type === "second") ss = Number(p.value);
     }
-    if (typeof applyThemeExtra === "function") applyThemeExtra(themeName);
+    return hh * 60 + mm + ss / 60;
   }
-  // Calms emissive surfaces in dark mode; assigned after those exist.
-  let applyThemeExtra = null;
+  function sceneMinutes() {
+    return scrubMin != null ? scrubMin : commonsMinutes();
+  }
+  function fmtClock(min) {
+    const m = ((Math.floor(min) % 1440) + 1440) % 1440;
+    return String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0");
+  }
+  function syncTimeControl() {
+    timeRead.textContent = fmtClock(sceneMinutes());
+    timeRead.title = scrubMin != null
+      ? "Previewing - not live Commons time"
+      : "Commons time (Pacific)";
+    if (scrubMin != null) scrub.value = String(Math.floor(scrubMin));
+    liveBtn.hidden = scrubMin == null;
+    playBtn.textContent = scrubPlaying ? "❚❚" : "▶";
+    playBtn.title = scrubPlaying
+      ? "Pause the day cycle"
+      : "Play the day cycle - one hour per second";
+  }
+  function applySceneTime() {
+    const st = plazaTimeOfDay(sceneMinutes() / 60);
+    scene.background.setHex(st.bg);
+    hemi.color.setHex(st.hemiSky);
+    hemi.groundColor.setHex(st.hemiGround);
+    hemi.intensity = st.hemiInt;
+    amb.color.setHex(st.ambColor);
+    amb.intensity = st.ambInt;
+    sun.position.set(st.dir.pos[0], st.dir.pos[1], st.dir.pos[2]);
+    sun.color.setHex(st.dir.color);
+    sun.intensity = st.dir.intensity;
+    poolBase = st.poolInt;
+    if (REDUCED_MOTION) {
+      for (const pl of tableLights) pl.intensity = poolBase;
+    }
+    // paneMat / sconceMat are built further down; they exist by the
+    // time this is first called (end of construction).
+    paneMat.emissiveIntensity = st.paneInt;
+    sconceMat.emissiveIntensity = st.sconceInt;
+    syncTimeControl();
+  }
+  playBtn.addEventListener("click", () => {
+    if (scrubMin == null) scrubMin = commonsMinutes();
+    scrubPlaying = !scrubPlaying;
+    applySceneTime();
+  });
+  scrub.addEventListener("input", () => {
+    scrubMin = Number(scrub.value);
+    scrubPlaying = false;
+    applySceneTime();
+  });
+  liveBtn.addEventListener("click", () => {
+    scrubMin = null;
+    scrubPlaying = false;
+    applySceneTime();
+  });
 
   const room = new THREE.Group();
   scene.add(room);
@@ -387,7 +571,6 @@ export function createPlazaView(container, opts = {}) {
   const paneMat = new THREE.MeshStandardMaterial({
     color: 0xfff6e2, emissive: 0xffedb8, emissiveIntensity: 1.15, roughness: 0.4,
   });
-  themeables.push({ mat: paneMat, key: "__pane" }); // handled below in applyThemeExtra
   // Arch-topped window pane: rectangle crowned by a semicircle.
   const winShape = new THREE.Shape();
   winShape.moveTo(-0.85, -1.2);
@@ -489,13 +672,6 @@ export function createPlazaView(container, opts = {}) {
     orb.position.set(HX - 0.2, 2.72, sz);
     room.add(orb);
   });
-
-  applyThemeExtra = (name) => {
-    const dark = name === "dark";
-    paneMat.emissiveIntensity = dark ? 0.35 : 1.15;
-    sconceMat.emissiveIntensity = dark ? 0.9 : 1.2;
-  };
-  applyThemeExtra(themeName);
 
   // Service counter against the back wall: slatted wood front + stone top.
   const slatTex = makeCanvas(256, 128, (c, w, h) => {
@@ -1338,6 +1514,7 @@ export function createPlazaView(container, opts = {}) {
   const clock = new THREE.Clock();
   let visible = true;
   let rafId = 0;
+  let timeAcc = 1; // seconds since the last sky update; 1 forces a first pass
   function frame() {
     rafId = 0;
     if (!visible) return;
@@ -1345,9 +1522,20 @@ export function createPlazaView(container, opts = {}) {
     const t = clock.elapsedTime;
     updateAvatars(dt);
     updateConvoRings();
+    // Sky: recomputed at most once a second (cheap math), plus
+    // immediately whenever the scrub override moves.
+    timeAcc += dt;
+    if (scrubPlaying && scrubMin != null) {
+      scrubMin = (scrubMin + dt * 60) % 1440; // 1 scene-hour per real second
+      timeAcc = 1;
+    }
+    if (timeAcc >= 1) {
+      timeAcc = 0;
+      applySceneTime();
+    }
     if (!REDUCED_MOTION) {
       const fl = 0.9 + 0.06 * Math.sin(t * 2.1) + 0.04 * Math.sin(t * 5.7);
-      for (const pl of tableLights) pl.intensity = 12 * fl;
+      for (const pl of tableLights) pl.intensity = poolBase * fl;
     }
     updateLabels();
     if (composer) composer.render();
@@ -1376,12 +1564,15 @@ export function createPlazaView(container, opts = {}) {
 
   resize();
   fit();
-  applyTheme(themeName);
+  applySceneTime();
   rafId = requestAnimationFrame(frame);
 
   return {
     setAgents,
-    setTheme: (name) => applyTheme(name),
+    // The UI light/dark switcher restyles the page chrome only; the
+    // scene takes its colors from the time of day, so this is a no-op
+    // kept for the caller's API compatibility.
+    setTheme: () => {},
     setVisible,
     resize,
     dispose,

@@ -684,3 +684,21 @@ body.snapshot #stage{height:100vh; border-radius:0}
   display:-webkit-box; -webkit-line-clamp:4; -webkit-box-orient:vertical; overflow:hidden;
   will-change:transform;
 }
+/* Time-of-day scrub cluster (plaza3d.js): Commons time readout, a
+   24h cycle slider, play/pause, and a back-to-live button. */
+.p3d-time{
+  position:absolute; left:12px; bottom:12px; z-index:6;
+  display:flex; align-items:center; gap:8px;
+  background:var(--card); color:var(--ink); border:1px solid var(--line);
+  border-radius:999px; padding:5px 10px; font-family:var(--sans);
+  font-size:12px; box-shadow:var(--shadow);
+}
+.p3d-time-read{font-weight:700; font-variant-numeric:tabular-nums; min-width:40px; text-align:center}
+.p3d-time-btn{
+  border:1px solid var(--line); background:transparent; color:var(--ink);
+  border-radius:999px; padding:2px 9px; cursor:pointer;
+  font-family:var(--sans); font-size:12px; line-height:1.4;
+}
+.p3d-time-btn:hover{border-color:var(--accent)}
+.p3d-time-btn[hidden]{display:none}
+.p3d-time-range{width:130px; accent-color:var(--accent); cursor:pointer}
