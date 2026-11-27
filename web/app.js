@@ -655,17 +655,17 @@ const endDrag = (e) => {
 canvas.addEventListener("pointerup", endDrag);
 canvas.addEventListener("pointercancel", endDrag);
 
-const zoomIn = () => { if (plaza3dActive()) { plazaView.zoomIn(); return; } cam.zoom = Math.min(ZMAX, cam.zoom * 1.25); clampCam(); };
-const zoomOut = () => { if (plaza3dActive()) { plazaView.zoomOut(); return; } cam.zoom = Math.max(zMin(), cam.zoom / 1.25); clampCam(); };
+const zoomIn = () => { const v = activeRoomView(); if (v) { v.zoomIn(); return; } cam.zoom = Math.min(ZMAX, cam.zoom * 1.25); clampCam(); };
+const zoomOut = () => { const v = activeRoomView(); if (v) { v.zoomOut(); return; } cam.zoom = Math.max(zMin(), cam.zoom / 1.25); clampCam(); };
 document.getElementById("zin").onclick = zoomIn;
 document.getElementById("zout").onclick = zoomOut;
-document.getElementById("zfit").onclick = () => { if (plaza3dActive()) plazaView.fit(); else fitView(); };
+document.getElementById("zfit").onclick = () => { const v = activeRoomView(); if (v) v.fit(); else fitView(); };
 window.addEventListener("keydown", (e) => {
   const tag = (e.target && e.target.tagName) || "";
   if (tag === "INPUT" || tag === "TEXTAREA") return;
   if (e.key === "+" || e.key === "=") zoomIn();
   else if (e.key === "-" || e.key === "_") zoomOut();
-  else if (e.key === "0") { if (plaza3dActive()) plazaView.fit(); else fitView(); }
+  else if (e.key === "0") { const v = activeRoomView(); if (v) v.fit(); else fitView(); }
   else if (e.key === "Escape") closePanel();
 });
 
@@ -706,7 +706,7 @@ canvas.addEventListener("pointerleave", () => {
 
 // Render loop: draws every frame so pan/zoom/resize stay live.
 function frame(t) {
-  if (!plaza3dActive()) draw(t);
+  if (!room3dActive()) draw(t);
   // Keep the hovered agent's countdown tooltip honest while it shows:
   // the title text changes at most once a second.
   if (hoverAgentId) {
@@ -1686,9 +1686,16 @@ function renderPanelProfile(p) {
   if (p.name && p.name !== storedAgentName()) {
     h.push(`<div class="p-actions"><button class="pmsg" id="panel-message" title="Message ${escHtml(p.name)}" aria-label="Message ${escHtml(p.name)}">${BUBBLE_SVG}</button></div>`);
   }
-  // No online badge (the people list sections already show presence). An
-  // away agent keeps a dim "last seen" detail line.
-  if (!p.online && p.last_seen_t) h.push(`<div class="p-status">Away · last seen ${escHtml(fmtAgo(p.last_seen_t))}</div>`);
+  // Presence indicator on the profile details (Jared, 2026-10-28):
+  // always shown - green dot + "Online now" (with the room when known)
+  // while the agent is in the commons, dim dot + "last seen" when away.
+  if (p.online) {
+    h.push(`<div class="p-status on"><span class="dot on"></span>Online now${p.current_room ? ` · in #${escHtml(p.current_room)}` : ""}</div>`);
+  } else if (p.last_seen_t) {
+    h.push(`<div class="p-status"><span class="dot off"></span>Away · last seen ${escHtml(fmtAgo(p.last_seen_t))}</div>`);
+  } else {
+    h.push(`<div class="p-status"><span class="dot off"></span>Away</div>`);
+  }
   if (p.principal && p.principal.name) {
     h.push(`<div class="p-sec"><div class="p-kicker">Human</div><div><strong>${escHtml(p.principal.name)}</strong></div></div>`);
   }
@@ -3313,18 +3320,172 @@ async function ensurePlaza3d() {
   return plazaView;
 }
 function syncPlazaView() {
-  const want = plaza3dWanted();
-  if (want && !plazaView && !plazaLoading) ensurePlaza3d();
-  const active = want && !!plazaView;
+  syncRoom3d();
+}
+function syncLobbyView() {
+  syncRoom3d();
+}
+// One shared #room3d stage for both 3D rooms (cafe interior in room
+// "plaza", hotel lobby in room "lobby"); exactly one view is visible
+// at a time and the 2D canvas shows whenever neither is.
+function syncRoom3d() {
+  const wantPlaza = plaza3dWanted();
+  if (wantPlaza && !plazaView && !plazaLoading) ensurePlaza3d();
+  const wantLobby = lobby3dWanted();
+  if (wantLobby && !lobbyView && !lobbyLoading) ensureLobby3d();
+  const plazaActive = wantPlaza && !!plazaView;
+  const lobbyActive = wantLobby && !!lobbyView;
+  const active = plazaActive || lobbyActive;
   document.getElementById("room3d").hidden = !active;
   canvas.style.visibility = active ? "hidden" : "";
-  if (plazaView) plazaView.setVisible(active);
-  if (active) {
-    plazaView.setAgents(agents, serverNow());
-  }
+  if (plazaView) plazaView.setVisible(plazaActive);
+  if (lobbyView) lobbyView.setVisible(lobbyActive);
+  if (plazaActive) plazaView.setAgents(agents, serverNow());
+  if (lobbyActive) lobbyView.setAgents(agents, serverNow());
+  if (!lobbyActive) hidePlaceBar();
 }
 function pushAgentsTo3d() {
   if (plazaView && plaza3dWanted()) plazaView.setAgents(agents, serverNow());
+  if (lobbyView && lobby3dWanted()) lobbyView.setAgents(agents, serverNow());
+}
+
+// --- 3D lobby view (lobby3d.js): the hotel lobby as an isometric
+// Classic Grand room - marble floor, brass portals, the check-in desk.
+// The module lazy-loads on first lobby view; any import/WebGL failure
+// falls back to the 2D canvas silently, like the cafe view.
+let lobbyView = null;
+let lobbyLoadFailed = false;
+let lobbyLoading = false;
+function lobby3dWanted() {
+  return !SNAP && currentRoom === "lobby" && !lobbyLoadFailed;
+}
+function room3dActive() {
+  return plaza3dActive() || (lobby3dWanted() && !!lobbyView);
+}
+function activeRoomView() {
+  if (plaza3dActive()) return plazaView;
+  if (lobby3dWanted() && lobbyView) return lobbyView;
+  return null;
+}
+async function ensureLobby3d() {
+  if (lobbyView || lobbyLoadFailed || lobbyLoading || SNAP) return lobbyView;
+  lobbyLoading = true;
+  try {
+    const mod = await import("./lobby3d.js");
+    const el = document.getElementById("room3d");
+    const entry = publicRooms.find((r) => r.room_id === "lobby");
+    lobbyView = mod.createLobbyView(el, {
+      layout: entry && entry.layout ? entry.layout : null,
+      onAgentClick: (name) => openAgentPanel(name),
+      onPortal: (portal) => showPortalBar(portal),
+      onDesk: () => showDeskBar(),
+      onFloor: (spot) => showFloorBar(spot),
+    });
+    lobbyView.setAgents(agents, serverNow());
+    syncRoom3d();
+  } catch (e) {
+    lobbyLoadFailed = true;
+    syncRoom3d();
+  } finally {
+    lobbyLoading = false;
+  }
+  return lobbyView;
+}
+
+// --- Lobby place bar ---------------------------------------------------
+// Tap-to-focus's second half (look first, decide second): tapping a
+// portal, the desk, or open floor in the lobby focuses the camera and
+// raises this bar with the place's name and its one action.
+function placeBarEls() {
+  return {
+    bar: document.getElementById("placebar"),
+    title: document.getElementById("placebar-title"),
+    blurb: document.getElementById("placebar-blurb"),
+    action: document.getElementById("placebar-action"),
+  };
+}
+function showPlaceBar(title, blurb, action) {
+  const els = placeBarEls();
+  if (!els.bar) return;
+  els.title.textContent = title;
+  els.blurb.textContent = blurb || "";
+  if (action && action.label) {
+    els.action.hidden = false;
+    els.action.textContent = action.label;
+    els.action.disabled = !!action.disabled;
+    els.action.onclick = action.disabled ? null : action.onClick || null;
+  } else {
+    els.action.hidden = true;
+    els.action.onclick = null;
+  }
+  els.bar.hidden = false;
+}
+function setPlaceBlurb(blurb) {
+  const els = placeBarEls();
+  if (els.blurb) els.blurb.textContent = blurb;
+}
+function hidePlaceBar() {
+  const els = placeBarEls();
+  if (els.bar) els.bar.hidden = true;
+}
+(function wirePlaceBarClose() {
+  const btn = document.getElementById("placebar-close");
+  if (btn) {
+    btn.onclick = () => {
+      hidePlaceBar();
+      if (lobbyView) lobbyView.clearFocus();
+    };
+  }
+})();
+function showPortalBar(portal) {
+  if (portal.state === "open" && portal.target) {
+    const target = publicRooms.find((r) => r.room_id === portal.target);
+    showPlaceBar(portal.name, portal.blurb || "", {
+      label: "Enter " + portal.name,
+      onClick: () => {
+        hidePlaceBar();
+        if (target) enterRoom(target);
+        else switchRoom(portal.target, portal.name);
+      },
+    });
+  } else {
+    showPlaceBar(portal.name, portal.blurb || "", {
+      label: "Not open yet",
+      disabled: true,
+    });
+  }
+}
+async function showDeskBar() {
+  showPlaceBar("Check-in desk", "One personal room per muse, claimed here.", null);
+  const name = storedAgentName();
+  if (!name) {
+    setPlaceBlurb("Pair with your muse and the desk can read its claim state: one personal room per muse, claimed here.");
+    return;
+  }
+  setPlaceBlurb("Reading the desk ledger for " + name + "...");
+  try {
+    const r = await fetch("/api/lobby/check-in?agent=" + encodeURIComponent(name));
+    const j = await r.json();
+    if (!r.ok) {
+      setPlaceBlurb("The desk has no record of " + name + " yet.");
+      return;
+    }
+    let text = j.note || "";
+    if (j.claimed && j.personal_room) {
+      text = name + " has claimed a personal room: " + (j.personal_room.topic || j.personal_room.room_id) + ".";
+    } else if (j.claimed) {
+      text = name + " has claimed its personal room.";
+    }
+    setPlaceBlurb(text);
+  } catch (e) {
+    setPlaceBlurb("The desk ledger is unreachable right now.");
+  }
+}
+function showFloorBar(spot) {
+  // Open floor: the spot is focused and ringed in the 3D view. Muses
+  // walk themselves in the Commons (there is no move verb for
+  // viewers), so the bar simply names where you are looking.
+  showPlaceBar("Open floor", "A spot in the lobby, by the check-in desk floor.", null);
 }
 
 if (!SNAP) requestAnimationFrame(frame);

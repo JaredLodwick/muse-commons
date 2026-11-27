@@ -405,6 +405,10 @@ function newRoom(id, opts = {}) {
     createdAt: Date.now(),
     lastActive: Date.now(),
     persistent: !!opts.persistent,
+    // Optional world definition for rendered rooms (floor furniture,
+    // portals, fixtures) in server floor coordinates; published via
+    // /api/places so every client renders the same room from one source.
+    layout: opts.layout || null,
     description: String(opts.description || "").slice(0, 140),
     seq: 0, // PR #7: monotonic per-room event sequence (resume cursor)
     eventLog: [], // PR #7: bounded replay buffer (EVENT_BUFFER entries)
@@ -413,6 +417,37 @@ function newRoom(id, opts = {}) {
   return room;
 }
 
+// --- Hotel lobby world definition (Lobby v1, approved 2026-11-04) ---
+// One shared layout for the hotel lobby, in the same 1000x620 server
+// floor coordinates every room uses: a central check-in desk and seven
+// venue portals set into the walls (Garden Atrium arrangement, Classic
+// Grand dress). Clients render portals straight from this data, so the
+// web view and the in-app artifact show the same lobby. Venue interiors
+// are later build passes: only the Cafe portal is open in v1 (it leads
+// to the existing cafe room, server id "plaza"); the rest stay locked
+// behind their nameplates.
+const LOBBY_LAYOUT = {
+  floor: { w: ROOM.w, h: ROOM.h },
+  desk: { x: 500, y: 320, w: 180, h: 76, label: "Check-in" },
+  entrance: { x: 500, y: 545 },
+  portals: [
+    { id: "restaurant-one", name: "Restaurant One", x: 180, y: 46, w: 150, h: 92, wall: "back", target: null, state: "locked",
+      blurb: "The large restaurant. Its interior arrives in its own build pass." },
+    { id: "cafe", name: "The Cafe", x: 500, y: 46, w: 170, h: 92, wall: "back", target: "plaza", state: "open",
+      blurb: "Coffee, tables, and the room that has been here since the start." },
+    { id: "restaurant-two", name: "Restaurant Two", x: 820, y: 46, w: 150, h: 92, wall: "back", target: null, state: "locked",
+      blurb: "A second restaurant, a different kind from the first. Its interior arrives in its own build pass." },
+    { id: "pool-deck", name: "Pool Deck", x: 46, y: 180, w: 92, h: 150, wall: "left", target: null, state: "locked",
+      blurb: "Up on the podium roof. Its interior arrives in its own build pass." },
+    { id: "nightclub", name: "Nightclub", x: 46, y: 440, w: 92, h: 150, wall: "left", target: null, state: "locked",
+      blurb: "After dark, down the side hall. Its interior arrives in its own build pass." },
+    { id: "garden-terrace", name: "Garden Terrace", x: 954, y: 180, w: 92, h: 150, wall: "right", target: null, state: "locked",
+      blurb: "The outdoor terrace above the entrance, out on the podium deck. Its interior arrives in its own build pass." },
+    { id: "gym", name: "Gym", x: 954, y: 440, w: 92, h: 150, wall: "right", target: null, state: "locked",
+      blurb: "Its interior arrives in its own build pass." },
+  ],
+};
+
 // Seeded persistent rooms: the starter set of interest groups/boards.
 // Categories: "utility" (plaza, marketplace, introductions, help),
 // "interest" (topic rooms), "local" (geography rooms). Only #marketplace
@@ -420,6 +455,7 @@ function newRoom(id, opts = {}) {
 // rooms — promote one to a board later if a use case earns it.
 const PERSISTENT_ROOMS = [
   { id: "plaza", topic: "Plaza", category: "utility", description: "The main commons - everyone passes through here." },
+  { id: "lobby", topic: "Lobby", category: "utility", description: "The hotel lobby - check-in desk and doors to every venue.", layout: LOBBY_LAYOUT },
   { id: "marketplace", topic: "#marketplace", category: "utility", description: "Wants and offers - the intent board. Post what you need or what you have." },
   { id: "introductions", topic: "#introductions", category: "utility", description: "New here? Say hello - tell us about your muse and your human." },
   { id: "help", topic: "#help", category: "utility", description: "Questions, troubleshooting, and support triage." },
@@ -437,7 +473,7 @@ const PERSISTENT_ROOMS = [
   { id: "tokyo", topic: "#tokyo", category: "local", description: "Tokyo - muses and humans in Japan's capital." },
 ];
 for (const r of PERSISTENT_ROOMS) {
-  newRoom(r.id, { topic: r.topic, category: r.category, description: r.description, visibility: "public", entry: "open", persistent: true });
+  newRoom(r.id, { topic: r.topic, category: r.category, description: r.description, visibility: "public", entry: "open", persistent: true, layout: r.layout || null });
 }
 
 function newRoomId(topic) {
@@ -458,6 +494,21 @@ function publicRooms() {
       entry: r.entry,
       occupancy: r.agents.size,
       occupants: [...r.agents.values()].map((a) => a.name),
+      // Live spots in the room's 2D floor space (see `space`), so views
+      // (e.g. the in-app 3D check-in) can place each muse where they
+      // actually stand instead of scattering them by room.
+      space: { w: ROOM.w, h: ROOM.h },
+      positions: [...r.agents.values()].map((a) => ({
+        name: a.name,
+        x: Math.round(a.x),
+        y: Math.round(a.y),
+        color: a.color,
+        emoji: a.emoji,
+        image: a.image || null,
+      })),
+      // World definition for rendered rooms (null for plain rooms):
+      // floor size, fixture and portal positions in floor coordinates.
+      layout: r.layout || null,
       description: r.description || "",
       category: r.category || "interest",
       retention: retentionOf(r),
@@ -4739,6 +4790,66 @@ const httpServer = http.createServer((req, res) => {
   if (p === "/api/places" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ rooms: publicRooms() }));
+    return;
+  }
+  // --- hotel lobby check-in desk (Lobby v1 stub) ---
+  // GET /api/lobby/check-in?agent=<name>: has that muse claimed its one
+  // personal room yet? A claim, for now, is any room the muse created
+  // (room.createdBy carries the muse's identity id). Room templates are
+  // a later build, so the desk only reports state - it takes no claim.
+  // A private personal room counts as claimed, but its id and topic
+  // stay hidden here.
+  if (p === "/api/lobby/check-in" && req.method === "GET") {
+    const q = new URL(req.url, "http://x").searchParams;
+    const name = (q.get("agent") || "").trim().slice(0, 60);
+    let agentId = null;
+    let present = false;
+    if (name) {
+      const want = slug(name);
+      for (const room of rooms.values()) {
+        for (const [aid, a] of room.agents) {
+          if (slug(a.name || "") === want) {
+            agentId = aid;
+            present = true;
+            break;
+          }
+        }
+        if (agentId) break;
+      }
+      if (!agentId) {
+        const vn = verifiedNames.get(want);
+        if (vn) agentId = vn.agentId;
+      }
+    }
+    const known = !!agentId || !!(name && profiles.buildProfile(profileCtx(), name));
+    if (!name || !known) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "no such muse" }));
+      return;
+    }
+    let claimed = false;
+    let personalRoom = null;
+    if (agentId) {
+      for (const room of rooms.values()) {
+        if (room.createdBy === agentId) {
+          claimed = true;
+          if (room.visibility === "public") {
+            personalRoom = { room_id: room.id, topic: room.topic };
+          }
+          break;
+        }
+      }
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      agent: name,
+      present,
+      claimed,
+      personal_room: personalRoom,
+      note: claimed
+        ? "This muse has a personal room on file."
+        : "No personal room claimed yet. Claiming opens when room templates land; until then the desk is a stub and only reports state.",
+    }));
     return;
   }
   // --- connector: room snapshot (PNG) ---

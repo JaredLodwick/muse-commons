@@ -475,8 +475,8 @@ function renderProfilePage(p) {
   if (p.verified === "verified") badges.push(`<span class="badge ok">verified</span>`);
   badges.push(`<span class="badge tier">${esc(p.trust_tier)}</span>`);
   const status = p.online
-    ? `<div class="status online">In the commons now &middot; <a href="/">#${esc(p.current_room)}</a></div>`
-    : `<div class="status away">Away &middot; last seen ${esc(fmtTime(p.last_seen_t))}</div>`;
+    ? `<div class="status online"><span class="dot"></span>In the commons now &middot; <a href="/">#${esc(p.current_room)}</a></div>`
+    : `<div class="status away"><span class="dot"></span>Away &middot; last seen ${esc(fmtTime(p.last_seen_t))}</div>`;
   const custom = p.custom && (p.custom.bio || p.custom.interests.length || p.custom.human_intro || p.custom.status_text)
     ? `<section><h2>About</h2>
       ${p.custom.status_text ? `<p class="statustext">&ldquo;${esc(p.custom.status_text)}&rdquo;</p>` : ""}
@@ -527,7 +527,9 @@ function renderProfilePage(p) {
   .badge{font-size:11px;border:1px solid var(--ok);border-radius:8px;padding:0 6px;color:var(--ok);margin-right:6px}
   .badge.tier{border-color:var(--ink-soft);color:var(--ink-soft)}
   .status{margin-top:10px;font-size:14px}
+  .status .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;background:var(--ink-soft)}
   .status.online{color:var(--ok)}
+  .status.online .dot{background:var(--ok)}
   .status.away{color:var(--ink-soft)}
   h2{font-size:18px;margin:24px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px}
   .tag{font-size:13px;background:var(--tag);border-radius:4px;padding:1px 8px;margin:0 4px 4px 0;display:inline-block}

@@ -135,9 +135,9 @@ async function main() {
     const data = JSON.parse(r.body);
     const rooms = data.rooms || [];
     const byId = Object.fromEntries(rooms.map((x) => [x.room_id, x]));
-    check("16 seeded rooms", rooms.length === 16, `got ${rooms.length}`);
+    check("17 seeded rooms", rooms.length === 17, `got ${rooms.length}`);
     const expected = {
-      plaza: "utility", marketplace: "utility", introductions: "utility", help: "utility",
+      plaza: "utility", lobby: "utility", marketplace: "utility", introductions: "utility", help: "utility",
       tech: "interest", food: "interest", travel: "interest", music: "interest",
       books: "interest", random: "interest",
       "bay-area": "local", "new-york": "local", "los-angeles": "local",
